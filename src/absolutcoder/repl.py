@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -15,7 +16,8 @@ from absolutcoder.agent import build_agent
 from absolutcoder.agent_files import load_roster
 from absolutcoder.attachments import build_user_content
 from absolutcoder.config import Config, config_path, resolve_model, save_config
-from absolutcoder.git_policy import TurnFlags, protect_context_file
+from absolutcoder.git_policy import PolicyDenied, TurnFlags, protect_context_file
+from absolutcoder.loops import VerifyOutcome, parse_interval, run_interval_loop, run_until_verified
 from absolutcoder.models import ModelFactory, ProviderMissing, missing_keys
 from absolutcoder.render import StreamRenderer
 from absolutcoder.sessions import (
@@ -29,7 +31,9 @@ from absolutcoder.sessions import (
 from absolutcoder.shell import GuardedShellBackend, ShellNotFound
 from absolutcoder.webtools import make_web_tools
 
-_COMMANDS = "Commands: /model, /subagent, /auto, /resume, /attach, /agents, /exit"
+_COMMANDS = "Commands: /model, /subagent, /auto, /resume, /attach, /agents, /verify, /loop, /exit"
+_LOOP_USAGE = "Usage: /loop <N>(s|m|h) <prompt>"
+_FAILURE_TAIL_LINES = 15
 
 
 class Repl:
@@ -44,6 +48,7 @@ class Repl:
         model_factory: ModelFactory | None = None,
         input_fn=None,
         console: Console | None = None,
+        sleep_fn=time.sleep,
     ) -> None:
         self.repo = Path(repo).resolve()
         self.config = replace(
@@ -56,7 +61,10 @@ class Repl:
         self.model_factory = model_factory
         self.input_fn = input_fn or input
         self.console = console or Console()
+        self.sleep_fn = sleep_fn
         self.pending_attachments: list[Path] = []
+        self.last_turn_interrupted = False
+        self._task_stopped = False
         protect_context_file(self.repo)
         self.backend = GuardedShellBackend(
             root_dir=self.repo, virtual_mode=True, inherit_env=True, shell=self.config.shell
@@ -114,18 +122,21 @@ class Repl:
         if stripped.startswith("/"):
             self._slash(stripped)
             return
-        self.run_turn(stripped)
+        self.run_task(stripped)
 
-    def run_turn(self, text: str, paths: list[Path] | None = None):
+    def run_turn(self, text: str, paths: list[Path] | None = None, *, flags: TurnFlags | None = None):
         """Run one user turn on the current thread and return the graph state.
 
         A tool or stream failure is printed and swallowed. The thread, agent,
         and checkpointer stay in place so the caller can prompt again.
+        ``flags`` default to what ``text`` asks for; a follow-up turn that
+        carries command output passes the user's own flags instead.
         """
 
+        self.last_turn_interrupted = False
         attachments = list(self.pending_attachments if paths is None else paths)
         self.pending_attachments.clear()
-        self.backend.flags = TurnFlags.from_message(text)
+        self.backend.flags = TurnFlags.from_message(text) if flags is None else flags
         start = len(self.backend.vet_log)
         config = {"configurable": {"thread_id": self.thread_id}}
         self._renderer = None
@@ -135,6 +146,7 @@ class Repl:
         except GraphBubbleUp:
             raise
         except KeyboardInterrupt:
+            self.last_turn_interrupted = True
             if self._renderer is None:
                 self.console.print("interrupted", markup=False, highlight=False)
             else:
@@ -147,6 +159,91 @@ class Repl:
             return None
         finally:
             self.turn_vet_log = self.backend.vet_log[start:]
+
+    def run_task(self, text: str, paths: list[Path] | None = None) -> VerifyOutcome | None:
+        """Run one user request; with a check command, repeat until the check passes.
+
+        Every turn of the request, including the follow-ups that carry check
+        output, runs with the flags of the user's own message.
+        """
+
+        self._task_stopped = False
+        flags = TurnFlags.from_message(text)
+        command = self.config.verify_command
+        if not command:
+            self.run_turn(text, paths, flags=flags)
+            return None
+        rounds = 0
+
+        def turn(message: str):
+            nonlocal rounds
+            rounds += 1
+            result = self.run_turn(message, paths if rounds == 1 else [], flags=flags)
+            if self.last_turn_interrupted:
+                raise KeyboardInterrupt
+            return result
+
+        def check():
+            self._say(f"verify: {command}")
+            self.backend.flags = flags
+            return self.backend.execute(command)
+
+        try:
+            outcome = run_until_verified(
+                turn, check, text, command=command, max_rounds=self.config.max_rounds
+            )
+        except PolicyDenied as error:
+            self._say(f"verify: command refused: {error}")
+            return VerifyOutcome(False, rounds, str(error))
+        except KeyboardInterrupt:
+            self._task_stopped = True
+            self._say("verify: stopped")
+            return VerifyOutcome(False, rounds, "stopped")
+        if outcome.passed:
+            self._say(f"verify: passed after {outcome.rounds} round(s)")
+        else:
+            self._say(f"verify: still failing after {outcome.rounds} round(s)")
+            for line in outcome.last_output.splitlines()[-_FAILURE_TAIL_LINES:]:
+                self._say(line)
+        return outcome
+
+    def _say(self, text: str) -> None:
+        self.console.print(text, markup=False, highlight=False)
+
+    def _verify(self, argument: str) -> None:
+        if not argument:
+            self._say(f"verify: {self.config.verify_command or 'off'}")
+            return
+        command = None if argument.lower() == "off" else argument
+        self.config = replace(self.config, verify_command=command)
+        save_config(config_path(), self.config)
+        self._say(f"verify: {command or 'off'}")
+
+    def _loop(self, argument: str) -> None:
+        interval_text, _, prompt = argument.partition(" ")
+        prompt = prompt.strip()
+        try:
+            interval = parse_interval(interval_text)
+        except ValueError:
+            interval = None
+        if interval is None or not prompt:
+            self._say(_LOOP_USAGE)
+            return
+
+        def turn(message: str):
+            result = self.run_task(message)
+            if self.last_turn_interrupted or self._task_stopped:
+                raise KeyboardInterrupt
+            return result
+
+        count = run_interval_loop(
+            turn,
+            prompt,
+            interval,
+            sleep=self.sleep_fn,
+            on_iteration=lambda n: self._say(f"loop: iteration {n}"),
+        )
+        self._say(f"loop: stopped after {count} iteration(s)")
 
     def _slash(self, line: str) -> None:
         command, _, argument = line.partition(" ")
@@ -183,6 +280,12 @@ class Repl:
                 return
             self.pending_attachments.append(Path(argument).expanduser())
             self.console.print(f"attached {argument}")
+            return
+        if command == "/verify":
+            self._verify(argument)
+            return
+        if command == "/loop":
+            self._loop(argument)
             return
         if command == "/agents":
             for definition in self.agents:
@@ -359,16 +462,28 @@ class Repl:
             return self.input_fn()
 
 
-def run_cli(args, config: Config | None = None) -> int:
-    """Run one task, or open the terminal loop, from the current repo."""
+def run_cli(args, config: Config | None = None, *, repl_factory=Repl) -> int:
+    """Run one task, or open the terminal loop, from the current repo.
+
+    A one-shot task returns 2 when its check command still fails, else 0.
+    ``--until`` and ``--max-rounds`` apply to that run only and are not saved.
+    """
 
     from absolutcoder.config import ensure_config
 
     repo = Path.cwd()
     if config is None:
         config = ensure_config()
+    task = getattr(args, "task", None)
+    if task:
+        until = getattr(args, "until", None)
+        max_rounds = getattr(args, "max_rounds", None)
+        if until is not None:
+            config = replace(config, verify_command=until)
+        if max_rounds is not None:
+            config = replace(config, max_rounds=max_rounds)
     try:
-        repl = Repl(repo, config)
+        repl = repl_factory(repo, config)
     except ProviderMissing as error:
         print(error, file=sys.stderr)
         return 1
@@ -376,9 +491,9 @@ def run_cli(args, config: Config | None = None) -> int:
         print(f"Config error: shell: {error}", file=sys.stderr)
         return 1
     attachments = [Path(item) for item in getattr(args, "attach", [])]
-    if getattr(args, "task", None):
-        repl.run_turn(args.task, paths=attachments)
-        return 0
+    if task:
+        outcome = repl.run_task(task, paths=attachments)
+        return 2 if outcome is not None and not outcome.passed else 0
     repl.pending_attachments.extend(attachments)
     repl.loop()
     return 0

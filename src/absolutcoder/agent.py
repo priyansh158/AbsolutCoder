@@ -18,6 +18,7 @@ from absolutcoder.git_policy import execute_needs_approval, protect_context_file
 from absolutcoder.models import ModelFactory, build_model, construct_model, provider_error
 from absolutcoder.shell import GuardedShellBackend, RepoFilesystemBackend
 from absolutcoder.subagents import (  # noqa: F401 - SECRET_PATHS is re-exported
+    CHECKS_SENTENCE,
     SECRET_PATHS,
     AgentDef,
     build_specs,
@@ -37,6 +38,8 @@ _DELEGATION = (
 SYSTEM_PROMPT = f"""You are AbsolutCoder, a local coding agent working in this repository.
 
 Plan longer tasks with the todo list. {_DELEGATION}
+
+{CHECKS_SENTENCE}
 
 Update /AbsolutCoder.md as you learn the project. That file is local memory. It stays untracked: never add it, commit it, or push it.
 

@@ -10,10 +10,12 @@ import pytest
 from absolutcoder.git_policy import (
     PolicyDenied,
     TurnFlags,
+    execute_needs_approval,
     protect_context_file,
     render_command,
     scrub_commit_message,
     sets_commit_identity,
+    unwrap_shell,
     vet,
 )
 from absolutcoder.shell import GuardedShellBackend
@@ -154,3 +156,113 @@ def test_turn_flags_follow_the_user_message():
     assert TurnFlags.from_message("pull the latest and fetch tags").pull_requested is True
     assert TurnFlags.from_message("git reset --hard HEAD").destructive_requested is True
     assert TurnFlags.from_message("commit the fix").push_requested is False
+
+
+_ALL_FLAGS = TurnFlags(push_requested=True, pull_requested=True, destructive_requested=True)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'sh -c "git push"',
+        "bash -lc 'git push origin main'",
+        "cmd /c git push",
+        'cmd.exe /d /s /c "git push"',
+        'powershell -Command "git push"',
+        'eval "git push"',
+        "env X=1 git push",
+        "nohup git push",
+        "bash -c \"sh -c 'git push'\"",
+        '/bin/sh -c "git push"',
+        'C:\\Windows\\System32\\cmd.exe /c "git push"',
+        'if sh -c "git push"; then echo ok; fi',
+        "sudo -u root sh -c 'git push'",
+        "echo $(sh -c 'git push')",
+    ],
+)
+def test_wrapped_git_push_is_denied(command):
+    with pytest.raises(PolicyDenied):
+        vet(command, TurnFlags())
+    vet(command, TurnFlags(push_requested=True))
+
+
+def test_wrapped_destructive_git_is_denied():
+    with pytest.raises(PolicyDenied):
+        vet('sh -c "git reset --hard"', TurnFlags())
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'sh -c "git commit -m x"',
+        "bash -lc 'git add -A && git commit -m x'",
+        'eval "git commit -m x"',
+        "env X=1 git add f.txt",
+        "echo $(git commit -m x)",
+    ],
+)
+def test_wrapped_commit_and_add_are_refused(command):
+    for flags in (TurnFlags(), _ALL_FLAGS):
+        with pytest.raises(PolicyDenied, match="run git commit and git add directly"):
+            vet(command, flags)
+    vet("git commit -m x", TurnFlags())
+    vet("git add f.txt", TurnFlags())
+
+
+def test_wrapper_always_needs_approval():
+    assert execute_needs_approval('sh -c "git commit -m x"') is True
+    assert execute_needs_approval("git commit -m x") is False
+
+
+@pytest.mark.parametrize("command", ["git status", 'python -c "print(1)"', "ls -la"])
+def test_unwrap_shell_returns_none_for_plain_commands(command):
+    assert unwrap_shell(shlex.split(command)) is None
+
+
+def test_unwrap_shell_returns_the_inner_command():
+    assert unwrap_shell(["bash", "-ec", "git status"]) == "git status"
+    assert unwrap_shell(["cmd", "/C", "git", "push"]) == "git push"
+    assert unwrap_shell(["pwsh.exe", "-NoProfile", "-c", "git", "push"]) == "git push"
+    assert unwrap_shell(["eval", "git", "push"]) == "git push"
+    assert shlex.split(unwrap_shell(["env", "-u", "HOME", "X=1", "sh", "-c", "git push"])) == [
+        "sh",
+        "-c",
+        "git push",
+    ]
+    assert unwrap_shell(["X=1", "git", "push"]) == "git push"
+    assert unwrap_shell(["sudo", "-u", "root", "git", "push"]) == "git push"
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("push this logic into a helper", False),
+        ("push the button handler down into the base class", False),
+        ("push the value onto the stack", False),
+        ("please push", True),
+        ("push it", True),
+        ("commit and push the changes", True),
+        ("git push", True),
+        ("run git push into prod", True),
+        ("then push to origin", True),
+        ("don't push", False),
+        ("commit the fix", False),
+        ("fix the bug, then push.", True),
+    ],
+)
+def test_push_as_ordinary_verb_does_not_unlock(message, expected):
+    assert TurnFlags.from_message(message).push_requested is expected
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("pull this out into a function", False),
+        ("open a pull request", False),
+        ("pull the latest changes", True),
+        ("fetch origin", True),
+        ("git pull", True),
+    ],
+)
+def test_pull_as_ordinary_verb_does_not_unlock(message, expected):
+    assert TurnFlags.from_message(message).pull_requested is expected

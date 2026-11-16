@@ -45,7 +45,14 @@ PLAN_PROMPT = """You are AbsolutCoder's plan worker. Read this repository and de
 You cannot change files or run commands. Return a step-by-step implementation plan that names each file to change and what changes in it.
 """
 
-GENERAL_PURPOSE_PROMPT = """You are AbsolutCoder's worker. Investigate the repo, edit files, and run commands, then report what you changed and what you verified.
+CHECKS_SENTENCE = (
+    "Before you report work as done, run the project's own checks (tests, build, linter) when they "
+    "exist, read the output, and fix what fails. Say plainly when a check could not be run."
+)
+
+GENERAL_PURPOSE_PROMPT = f"""You are AbsolutCoder's worker. Investigate the repo, edit files, and run commands, then report what you changed and what you verified.
+
+{CHECKS_SENTENCE}
 
 Do not commit AbsolutCoder.md. Do not change git config, author environment variables, or commit attribution. Push only when the task says the user asked to push.
 """

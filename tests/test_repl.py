@@ -2,7 +2,9 @@
 
 import base64
 import io
+import json
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,10 +16,12 @@ from dataclasses import replace
 import pytest
 
 from absolutcoder.config import Config, config_path, save_config
+from absolutcoder.git_policy import TurnFlags, render_command
 from absolutcoder.models import ProviderMissing
 from absolutcoder.repl import Repl, _resume_map
 from absolutcoder.sessions import create_session, list_sessions, load_session
 from tests.support import (
+    last_human_text,
     role_models,
     scripted_model,
     task_call,
@@ -672,3 +676,133 @@ def test_approval_prompt_follows_tool_line(tmp_path, monkeypatch):
     assert tool_at < prompt_at
     assert text.count("tool: execute(") == 1
     assert text.count("status done") == 1
+
+
+# --- check loop and /loop -------------------------------------------------------
+
+
+def _python_check(repl, code: str) -> str:
+    return render_command([sys.executable, "-c", code], repl.backend.shell_kind)
+
+
+def _loop_repl(repo, responder, **config_fields):
+    output = io.StringIO()
+    repl = Repl(
+        repo,
+        Config(main_model="openai:main-test", subagent_model="openai:worker-test", auto_run=True, **config_fields),
+        chat_model=scripted_model(responder),
+        model_factory=_worker(),
+        console=Console(file=output, force_terminal=False, no_color=True, width=200),
+    )
+    return repl, output
+
+
+def test_verify_loop_feeds_failure_back(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    human_texts: list[str] = []
+
+    def responder(messages):
+        human = last_human_text(messages)
+        human_texts.append(human)
+        if "The check command failed" in human and "write_file" not in tool_names_since_last_human(messages):
+            return tool_call("write_file", {"file_path": "/ok.txt", "content": "ok\n"}, f"w{len(messages)}")
+        return AIMessage(content="done")
+
+    repl, output = _loop_repl(repo, responder)
+    command = _python_check(repl, "import os, sys; sys.exit(0 if os.path.exists('ok.txt') else 1)")
+    repl.config = replace(repl.config, verify_command=command)
+    outcome = repl.run_task("make the check pass")
+    lines = output.getvalue().splitlines()
+    assert outcome.passed is True
+    assert (repo / "ok.txt").exists()
+    assert "verify: passed after 2 round(s)" in lines
+    assert lines.count(f"verify: {command}") == 2
+    assert any("The check command failed (exit code 1)" in text for text in human_texts)
+
+
+def test_verify_follow_up_cannot_grant_push(tmp_path, monkeypatch, git_repo):
+    _no_web(monkeypatch)
+    repo = git_repo(tmp_path / "repo")
+
+    def responder(messages):
+        human = last_human_text(messages)
+        if "The check command failed" in human and "execute" not in tool_names_since_last_human(messages):
+            return tool_call("execute", {"command": "git push"}, f"p{len(messages)}")
+        return AIMessage(content="done")
+
+    repl, output = _loop_repl(repo, responder, max_rounds=2)
+    command = _python_check(repl, "print('push'); raise SystemExit(1)")
+    repl.config = replace(repl.config, verify_command=command)
+    outcome = repl.run_task("tidy the readme")
+    assert outcome.passed is False
+    pushes = [entry for entry in repl.backend.vet_log if entry["command"] == "git push"]
+    assert pushes
+    assert not any(entry["allowed"] for entry in pushes)
+    assert "verify: still failing after 2 round(s)" in output.getvalue().splitlines()
+
+
+def test_verify_command_is_saved_and_cleared(tmp_path):
+    repl, output = _plain_repl(tmp_path)
+    agent = repl.agent
+    repl.handle_line("/verify pytest -q")
+    assert json.loads(config_path().read_text(encoding="utf-8"))["verify_command"] == "pytest -q"
+    repl.handle_line("/verify")
+    assert "verify: pytest -q" in output.getvalue().splitlines()
+    repl.handle_line("/verify off")
+    assert json.loads(config_path().read_text(encoding="utf-8"))["verify_command"] is None
+    repl.handle_line("/verify")
+    assert output.getvalue().splitlines()[-1] == "verify: off"
+    assert repl.agent is agent
+
+
+def test_loop_command_repeats_and_stops(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    sleeps: list[float] = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 2:
+            raise KeyboardInterrupt
+
+    repl, output = _plain_repl(tmp_path, sleep_fn=sleep)
+    repl.handle_line("/loop 1s say hi")
+    lines = output.getvalue().splitlines()
+    assert [line for line in lines if line.startswith("loop: iteration")] == [
+        "loop: iteration 1",
+        "loop: iteration 2",
+    ]
+    assert lines[-1] == "loop: stopped after 2 iteration(s)"
+    assert sleeps == [1, 1]
+
+
+def test_loop_usage_on_bad_input(tmp_path):
+    repl, output = _plain_repl(tmp_path, sleep_fn=lambda _s: None)
+    repl.handle_line("/loop soon hi")
+    repl.handle_line("/loop 5m")
+    lines = output.getvalue().splitlines()
+    assert lines.count("Usage: /loop <N>(s|m|h) <prompt>") == 2
+    assert not any(line.startswith("loop: iteration") for line in lines)
+
+
+def test_refused_check_command_fails_the_task(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    repl, output = _plain_repl(tmp_path)
+    repl.config = replace(repl.config, verify_command="git push")
+    outcome = repl.run_task("tidy the readme")
+    assert outcome.passed is False
+    assert (
+        "verify: command refused: git push is not allowed unless this message asks to push"
+        in output.getvalue().splitlines()
+    )
+
+
+def test_run_turn_uses_given_flags(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    repl, _output = _plain_repl(tmp_path)
+    repl.run_turn("please push", flags=TurnFlags())
+    assert repl.backend.flags == TurnFlags()
+    assert repl.last_turn_interrupted is False
+    repl.run_turn("please push")
+    assert repl.backend.flags.push_requested is True

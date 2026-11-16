@@ -103,3 +103,51 @@ def test_cli_reports_non_object_providers(tmp_path):
     assert completed.returncode == 1
     assert "Config error" in completed.stderr
     assert "Traceback" not in completed.stderr
+
+
+def test_until_flag_sets_exit_code(tmp_path, monkeypatch):
+    from absolutcoder.cli import build_parser
+    from absolutcoder.config import Config
+    from absolutcoder.loops import VerifyOutcome
+    from absolutcoder.repl import run_cli
+
+    monkeypatch.chdir(tmp_path)
+    seen: list = []
+
+    def factory_returning(outcome):
+        class FakeRepl:
+            def __init__(self, repo, config):
+                seen.append(config)
+                self.pending_attachments = []
+
+            def run_task(self, text, paths=None):
+                seen.append((text, paths))
+                return outcome
+
+        return FakeRepl
+
+    config = Config(main_model="openai:a", subagent_model="openai:b", verify_command="make", max_rounds=5)
+    args = build_parser().parse_args(["fix it", "--until", "pytest -q", "--max-rounds", "3"])
+    assert run_cli(args, config, repl_factory=factory_returning(VerifyOutcome(False, 3, "boom"))) == 2
+    assert seen[0].verify_command == "pytest -q"
+    assert seen[0].max_rounds == 3
+    assert seen[1] == ("fix it", [])
+    assert config.verify_command == "make"
+    assert run_cli(args, config, repl_factory=factory_returning(VerifyOutcome(True, 1, "ok"))) == 0
+    plain = build_parser().parse_args(["fix it"])
+    assert run_cli(plain, config, repl_factory=factory_returning(None)) == 0
+    assert seen[-2].verify_command == "make"
+
+
+def test_until_without_task_is_an_error(capsys):
+    import pytest
+
+    from absolutcoder.cli import main
+
+    with pytest.raises(SystemExit) as raised:
+        main(["--until", "x"])
+    assert raised.value.code == 2
+    assert "--until needs a task" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as raised:
+        main(["do it", "--max-rounds", "0"])
+    assert raised.value.code == 2
