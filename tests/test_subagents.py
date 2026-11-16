@@ -650,3 +650,32 @@ def test_no_skills_means_no_route_and_no_text(tmp_path):
         assert "Always-on rules" not in text, role
         assert "Skill folders on disk" not in text, role
     assert UNTRUSTED_PARAGRAPH in texts["main"]
+
+
+def test_role_graph_gets_skills_and_write_ban(tmp_path, monkeypatch):
+    import absolutcoder.agent as agent_module
+    from absolutcoder.agent import build_role_graph
+
+    repo = _skill_repo(tmp_path)
+    _write_skill(_global_dir(), "demo", "Global demo skill.", always="ROLE GRAPH RULE\n")
+    captured: dict[str, dict] = {}
+
+    def recorder(**kwargs):
+        captured[kwargs["name"]] = kwargs
+        return object()
+
+    monkeypatch.setattr(agent_module, "create_deep_agent", recorder)
+    config = Config(main_model="openai:main-test", subagent_model="openai:worker-test")
+    roles = {d.name: d for d in builtin_agents()}
+    for name in ("general-purpose", "plan"):
+        build_role_graph(repo, config, None, roles[name], model_factory=role_models({}, default=_ok_model()))
+
+    ban = (["write"], ["/.absolutcoder-global/**"], "deny")
+    editing = captured["general-purpose"]
+    assert editing["skills"] == [("/.absolutcoder-global/skills/", "Global")]
+    assert "## Always-on rules from the demo skill\nROLE GRAPH RULE" in editing["system_prompt"]
+    assert ban in [(r.operations, r.paths, r.mode) for r in editing["permissions"]]
+    reading = captured["plan"]
+    assert "skills" not in reading
+    assert "ROLE GRAPH RULE" not in reading["system_prompt"]
+    assert ban in [(r.operations, r.paths, r.mode) for r in reading["permissions"]]

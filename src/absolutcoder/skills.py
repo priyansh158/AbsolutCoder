@@ -1,13 +1,17 @@
 """Skill folders: a global one shared by every project, and the project's own.
 
 A skill is a folder holding a ``SKILL.md`` with YAML frontmatter that names it
-and describes it. Global skills may also carry an ``always.md`` whose text is
-added to every request; project skills never can, so a cloned repository
-cannot add text to every request.
+and describes it; its name is its folder's name. Global skills may also carry
+an ``always.md`` whose text is added to every request; project skills never
+can, so a cloned repository cannot add text to every request.
+
+Reads stay inside the skills folders: a skill folder, ``SKILL.md`` or
+``always.md`` that is a link, or that resolves elsewhere, is ignored.
 """
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 from dataclasses import dataclass
@@ -21,9 +25,14 @@ from absolutcoder.config import data_dir
 GLOBAL_ROUTE = "/.absolutcoder-global/skills/"
 PROJECT_SOURCE = "/.absolutcoder/skills/"
 ALWAYS_LIMIT = 4000
+SKILL_FILE_LIMIT = 1_000_000  # bytes; a larger SKILL.md is not a skill
 
-_NAME_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+_NAME_PATTERN = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
 _NAME_MAX = 64
+_RESERVED_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"} | {f"com{i}" for i in range(1, 10)} | {f"lpt{i}" for i in range(1, 10)}
+)
+_INCOMING = ".skills-incoming"
 _SKIPPED_FOLDERS = frozenset({"fixtures", "node_modules", ".hallmark", ".git", "__pycache__"})
 _SKIPPED_FILES = ("*.test.mjs", "*.test.js", "*.test.cjs")
 
@@ -46,13 +55,50 @@ def _project_skills_dir(repo: Path) -> Path:
     return Path(repo) / ".absolutcoder" / "skills"
 
 
-def _frontmatter(skill_md: Path) -> dict | None:
-    """The frontmatter mapping of ``skill_md``, or ``None`` when it is not a valid skill file."""
+def _is_link(path: Path) -> bool:
+    return path.is_symlink() or path.is_junction()
+
+
+def _plain_child(path: Path, parent: Path) -> bool:
+    """``path`` is not a link and resolves to an entry directly inside ``parent``."""
 
     try:
-        lines = skill_md.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError):
+        return not _is_link(path) and path.resolve().parent == parent.resolve()
+    except Exception:
+        return False
+
+
+def _valid_name(name: object) -> bool:
+    return (
+        isinstance(name, str)
+        and len(name) <= _NAME_MAX
+        and _NAME_PATTERN.fullmatch(name) is not None
+        and name not in _RESERVED_NAMES
+    )
+
+
+def _read_skill_file(folder: Path) -> str | None:
+    """The text of ``folder/SKILL.md``, or ``None`` when it is missing, a link, too large or unreadable."""
+
+    path = folder / "SKILL.md"
+    try:
+        if not _plain_child(path, folder) or not path.is_file():
+            return None
+        with path.open("rb") as handle:
+            raw = handle.read(SKILL_FILE_LIMIT + 1)
+        if len(raw) > SKILL_FILE_LIMIT:
+            return None
+        return raw.decode("utf-8-sig")
+    except Exception:
         return None
+
+
+def _frontmatter(text: str | None) -> dict | None:
+    """The frontmatter mapping of a SKILL.md text, or ``None`` when it is not a valid skill file."""
+
+    if text is None:
+        return None
+    lines = text.splitlines()
     if not lines or lines[0].rstrip() != "---":
         return None
     closing = next((i for i in range(1, len(lines)) if lines[i].rstrip() == "---"), None)
@@ -60,7 +106,7 @@ def _frontmatter(skill_md: Path) -> dict | None:
         return None
     try:
         data = yaml.safe_load("\n".join(lines[1:closing]))
-    except yaml.YAMLError:
+    except Exception:  # PyYAML also raises ValueError, RecursionError, ... on hostile input
         return None
     if not isinstance(data, dict):
         return None
@@ -71,11 +117,13 @@ def _frontmatter(skill_md: Path) -> dict | None:
     return data
 
 
-def _read_skill(folder: Path, scope: str) -> SkillInfo | None:
-    data = _frontmatter(folder / "SKILL.md")
-    if data is None:
+def _read_skill(folder: Path, root: Path, scope: str) -> SkillInfo | None:
+    if not _plain_child(folder, root) or not _valid_name(folder.name):
         return None
-    return SkillInfo(name=data["name"], description=data["description"], scope=scope, folder=folder)
+    data = _frontmatter(_read_skill_file(folder))
+    if data is None or data["name"] != folder.name:
+        return None
+    return SkillInfo(name=folder.name, description=data["description"], scope=scope, folder=folder)
 
 
 def _skills_in(root: Path, scope: str) -> list[SkillInfo]:
@@ -83,9 +131,9 @@ def _skills_in(root: Path, scope: str) -> list[SkillInfo]:
 
     try:
         folders = [p for p in root.iterdir() if p.is_dir()]
-    except OSError:
+    except Exception:
         return []
-    found = (_read_skill(folder, scope) for folder in folders)
+    found = (_read_skill(folder, root, scope) for folder in folders)
     return sorted((s for s in found if s is not None), key=lambda s: s.name)
 
 
@@ -111,18 +159,37 @@ def skill_sources(repo: Path) -> list[tuple[str, str]]:
     return sources
 
 
+def _read_always(folder: Path) -> str | None:
+    """At most ``ALWAYS_LIMIT + 1`` characters of ``folder/always.md`` after leading whitespace."""
+
+    path = folder / "always.md"
+    try:
+        if not _plain_child(path, folder) or not path.is_file():
+            return None
+        text = ""
+        with path.open(encoding="utf-8-sig") as handle:
+            while len(text) <= ALWAYS_LIMIT:
+                chunk = handle.read(ALWAYS_LIMIT + 1 - len(text))
+                if not chunk:
+                    break
+                text = text + chunk if text else chunk.lstrip()
+        return text
+    except Exception:
+        return None
+
+
 def always_text(repo: Path) -> str:
     """Always-on rule blocks from global skills only, in name order."""
 
     blocks: list[str] = []
     for skill in _skills_in(global_skills_dir(), "global"):
-        try:
-            text = (skill.folder / "always.md").read_text(encoding="utf-8").strip()
-        except (OSError, UnicodeDecodeError):
+        text = _read_always(skill.folder)
+        if text is None:
             continue
+        text = text.strip()
         if len(text) > ALWAYS_LIMIT:
             text = text[:ALWAYS_LIMIT] + "\n[truncated]"
-        blocks.append(f"## Always-on rules from the {skill.name} skill\n{text}")
+        blocks.append(f"## Always-on rules from the {skill.folder.name} skill\n{text}")
     return "\n\n".join(blocks)
 
 
@@ -144,12 +211,14 @@ def skill_paths_note(repo: Path) -> str:
     )
 
 
-def _check_name(name: str) -> None:
-    if len(name) > _NAME_MAX or not _NAME_PATTERN.match(name):
+def _check_name(name: object) -> None:
+    if not isinstance(name, str) or len(name) > _NAME_MAX or _NAME_PATTERN.fullmatch(name) is None:
         raise ValueError(
             f"invalid skill name {name!r}: use lowercase letters, digits and single hyphens, "
             f"at most {_NAME_MAX} characters"
         )
+    if name in _RESERVED_NAMES:
+        raise ValueError("that name is reserved on Windows")
 
 
 def _contains(outer: Path, inner: Path) -> bool:
@@ -161,7 +230,7 @@ def _ignore(directory: str, names: list[str]) -> set[str]:
     skipped = set()
     for name in names:
         path = base / name
-        if path.is_symlink():
+        if _is_link(path):
             skipped.add(name)
         elif path.is_dir():
             if name in _SKIPPED_FOLDERS:
@@ -172,12 +241,16 @@ def _ignore(directory: str, names: list[str]) -> set[str]:
 
 
 def install_skill(source: Path) -> SkillInfo:
-    """Copy the skill folder ``source`` into the global skills folder, replacing a copy."""
+    """Copy the skill folder ``source`` into the global skills folder, replacing a copy.
+
+    The copy is made in a staging folder outside the skills folder and swapped
+    in only when complete; a failed install leaves the previous copy in place.
+    """
 
     source = Path(source)
     if not source.is_dir():
         raise ValueError(f"{source} is not a folder")
-    data = _frontmatter(source / "SKILL.md")
+    data = _frontmatter(_read_skill_file(source))
     if data is None:
         raise ValueError(
             f"{source} has no valid SKILL.md (frontmatter between --- lines with a name and a description)"
@@ -185,14 +258,30 @@ def install_skill(source: Path) -> SkillInfo:
     name = data["name"]
     _check_name(name)
     destination = global_skills_dir() / name
+    incoming = data_dir() / _INCOMING
     real_source = source.resolve()
-    real_destination = destination.resolve()
-    if _contains(real_source, real_destination) or _contains(real_destination, real_source):
-        raise ValueError(f"cannot install {source} onto itself ({destination})")
-    if destination.exists():
-        shutil.rmtree(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source, destination, ignore=_ignore)
+    for target in (destination.resolve(), incoming.resolve()):
+        if _contains(real_source, target) or _contains(target, real_source):
+            raise ValueError(f"cannot install {source} onto itself ({destination})")
+    staging = incoming / name
+    retired = incoming / f"{name}.old"
+    try:
+        for leftover in (staging, retired):
+            if leftover.exists():
+                shutil.rmtree(leftover)
+        shutil.copytree(source, staging, ignore=_ignore)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        had_old = destination.exists()
+        if had_old:
+            os.replace(destination, retired)
+        try:
+            os.replace(staging, destination)
+        except BaseException:
+            if had_old:
+                os.replace(retired, destination)
+            raise
+    finally:
+        shutil.rmtree(incoming, ignore_errors=True)
     return SkillInfo(name=name, description=data["description"], scope="global", folder=destination)
 
 
@@ -201,6 +290,12 @@ def remove_skill(name: str) -> bool:
 
     _check_name(name)
     target = global_skills_dir() / name
+    if target.is_symlink():
+        target.unlink()
+        return True
+    if target.is_junction():
+        os.rmdir(target)
+        return True
     if not target.is_dir():
         return False
     shutil.rmtree(target)
