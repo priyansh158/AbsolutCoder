@@ -4,6 +4,7 @@ import base64
 import io
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 from langchain_core.messages import AIMessage
 from rich.console import Console
@@ -14,7 +15,7 @@ import pytest
 
 from absolutcoder.config import Config, config_path, save_config
 from absolutcoder.models import ProviderMissing
-from absolutcoder.repl import Repl
+from absolutcoder.repl import Repl, _resume_map
 from absolutcoder.sessions import create_session, list_sessions, load_session
 from tests.support import role_models, scripted_model, tool_call, tool_names_since_last_human
 
@@ -356,6 +357,84 @@ def test_agents_command_lists_roster(tmp_path):
     lines = output.getvalue().splitlines()
     for name in ("explore", "plan", "general-purpose", "web-researcher"):
         assert any(line.startswith(f"{name}  [builtin]  ") for line in lines), name
+
+
+def _plain_repl(tmp_path, **kwargs):
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    output = io.StringIO()
+    repl = Repl(
+        repo,
+        Config(main_model="openai:main-test", subagent_model="openai:worker-test"),
+        chat_model=scripted_model(lambda _m: AIMessage(content="ok")),
+        model_factory=_worker(),
+        console=Console(file=output, force_terminal=False, no_color=True, width=200),
+        **kwargs,
+    )
+    return repl, output
+
+
+def _approval(interrupt_id, command):
+    value = {"action_requests": [{"name": "execute", "args": {"command": command}}]}
+    return SimpleNamespace(id=interrupt_id, value=value)
+
+
+def test_interrupt_without_id_fails_the_turn_once(tmp_path):
+    repl, output = _plain_repl(tmp_path, input_fn=lambda _prompt="": "y")
+    calls = {"stream": 0}
+    pending = SimpleNamespace(tasks=[SimpleNamespace(interrupts=[_approval(None, "echo x")])])
+
+    class StuckGraph:
+        def stream(self, *args, **kwargs):
+            calls["stream"] += 1
+            if calls["stream"] > 3:  # keep a regression from hanging the suite
+                raise AssertionError("re-streamed after an id-less interrupt")
+            return iter(())
+
+        def get_state(self, config):
+            return pending
+
+    repl.agent = StuckGraph()
+    assert repl.run_turn("go") is None
+    lines = [line for line in output.getvalue().splitlines() if line.startswith("Error:")]
+    assert lines == ["Error: Cannot resume: an approval request has no id."]
+    assert calls["stream"] == 1
+    assert "Run command?" not in output.getvalue()
+
+
+def test_decisions_are_keyed_by_interrupt_id(tmp_path):
+    answers = iter(["y", "n"])
+    repl, _output = _plain_repl(tmp_path, input_fn=lambda _prompt="": next(answers))
+    pair = [_approval("id-1", "echo one"), _approval("id-2", "echo two")]
+    resume = _resume_map(pair, repl._decisions(pair))
+    assert resume == {
+        "id-1": {"decisions": [{"type": "approve"}]},
+        "id-2": {"decisions": [{"type": "reject", "message": "User rejected the command."}]},
+    }
+
+    repl.input_fn = lambda _prompt="": "y"
+    single = [_approval("id-3", "echo three")]
+    assert _resume_map(single, repl._decisions(single)) == {"decisions": [{"type": "approve"}]}
+
+
+def test_web_tools_are_reused_across_rebuilds(tmp_path, monkeypatch):
+    import absolutcoder.agent as agent_module
+
+    received: list = []
+    real_build_specs = agent_module.build_specs
+
+    def recording_build_specs(*args, **kwargs):
+        received.append(kwargs.get("web_tools"))
+        return real_build_specs(*args, **kwargs)
+
+    monkeypatch.setattr(agent_module, "build_specs", recording_build_specs)
+    repl, output = _plain_repl(tmp_path)
+    repl.handle_line("/auto on")
+    assert "auto_run on" in output.getvalue()
+    assert len(received) == 2
+    assert received[0] is not None
+    assert all(tools is repl.web_tools for tools in received)
+    assert [tool.name for tool in repl.web_tools] == ["web_fetch", "web_search"]
 
 
 def _flatten(messages) -> str:

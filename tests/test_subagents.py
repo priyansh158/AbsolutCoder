@@ -8,7 +8,7 @@ from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
 from rich.console import Console
 
-from absolutcoder.agent import build_agent, workspace_backend
+from absolutcoder.agent import SECRET_PATHS, build_agent, workspace_backend
 from absolutcoder.config import Config
 from absolutcoder.repl import Repl
 from absolutcoder.subagents import (
@@ -16,6 +16,7 @@ from absolutcoder.subagents import (
     build_specs,
     builtin_agents,
     merge_agents,
+    roster_prompt,
     validate_groups,
 )
 from absolutcoder.webtools import UNTRUSTED_NOTE
@@ -140,6 +141,41 @@ def test_every_spec_declares_tools(tmp_path):
         assert "tools" in spec or "runnable" in spec
 
 
+def test_read_only_roles_deny_writes_and_secrets(tmp_path):
+    specs = build_specs(
+        builtin_agents(),
+        backend=workspace_backend(tmp_path),
+        config=Config(main_model="openai:m", subagent_model="openai:w"),
+        model_factory=role_models({}, default=_ok_model()),
+        interrupt_on=None,
+        web_tools=_fake_web_tools(),
+    )
+    by_name = {spec["name"]: spec for spec in specs}
+    for name in ("explore", "plan"):
+        rules = [(r.operations, r.paths, r.mode) for r in by_name[name]["permissions"]]
+        assert (["read", "write"], SECRET_PATHS, "deny") in rules, name
+        assert (["write"], ["/**"], "deny") in rules, name
+    # general-purpose sets no rules, so it inherits the parent's secret denies.
+    assert "permissions" not in by_name["general-purpose"]
+
+
+def test_general_purpose_cannot_read_env_file(tmp_path):
+    (tmp_path / ".env").write_text("SECRET=hunter2\n", encoding="utf-8")
+    replies: list = []
+
+    def worker(messages):
+        if not tool_names_since_last_human(messages):
+            return tool_call("read_file", {"file_path": "/.env"}, "r1")
+        replies.extend(m for m in messages if getattr(m, "type", None) == "tool")
+        return AIMessage(content="done")
+
+    main = _delegating_main(task_call("general-purpose", "read the env file", "t1"))
+    messages = _invoke(tmp_path, main, {"general-purpose": scripted_model(worker)})
+    assert replies and replies[-1].status == "error"
+    assert "hunter2" not in str(replies[-1].content)
+    assert all("hunter2" not in str(m.content) for m in messages)
+
+
 # --- delegation through the compiled graph ------------------------------------
 
 
@@ -186,6 +222,7 @@ def _invoke(tmp_path, main, workers: dict, *, extra_tools=()):
         chat_model=main,
         model_factory=role_models(workers, default=_ok_model()),
         extra_tools=extra_tools,
+        web_tools=_fake_web_tools(),
     )
     return agent.invoke({"messages": [{"role": "user", "content": "go"}]})["messages"]
 
@@ -286,8 +323,14 @@ def test_web_report_is_wrapped_as_untrusted(tmp_path):
     assert any(
         getattr(m, "type", None) == "tool" and str(m.content) == content for m in seen[-1]
     )
-    system = str(seen[0][0].content)
+    assert seen[0][0].type == "system"
+    system = seen[0][0].text  # content is a list of blocks; .text joins them
     assert UNTRUSTED_PARAGRAPH in system
+    assert roster_prompt(builtin_agents()) in system
+    assert (
+        roster_prompt(builtin_agents())
+        + "\nRead each worker's report and decide yourself what lands in the repository."
+    ) in system
 
 
 def test_main_extra_tools_do_not_reach_workers(tmp_path):

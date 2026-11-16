@@ -26,6 +26,7 @@ from absolutcoder.sessions import (
 )
 from absolutcoder.shell import GuardedShellBackend
 from absolutcoder.subagents import builtin_agents
+from absolutcoder.webtools import make_web_tools
 
 _COMMANDS = "Commands: /model, /subagent, /auto, /resume, /attach, /agents, /exit"
 
@@ -60,6 +61,8 @@ class Repl:
         self.checkpointer = checkpoint_saver()
         self.turn_vet_log: list[dict] = []
         self.agents = builtin_agents()
+        # Built once and reused by every rebuild, so no rebuild leaves a client behind.
+        self.web_tools = make_web_tools(max_chars=self.config.web_max_chars)
         self._failures: list[str] = []
         self._quiet = True  # the caller prints a failed start itself
         agent = self._try_build(self.config)
@@ -264,6 +267,7 @@ class Repl:
             model_factory=self.model_factory,
             backend=self.backend,
             agents=self.agents,
+            web_tools=self.web_tools,
         )
 
     def _drive(self, payload, config):
@@ -275,6 +279,9 @@ class Repl:
             if not interrupts:
                 self._render_final(snapshot)
                 return snapshot
+            if not all(getattr(item, "id", None) for item in interrupts):
+                # Command(resume={id: ...}) cannot address it; re-streaming would loop forever.
+                raise RuntimeError("Cannot resume: an approval request has no id.")
             payload = Command(resume=_resume_map(interrupts, self._decisions(interrupts)))
 
     def _decisions(self, interrupts) -> dict[str, dict]:
@@ -282,7 +289,7 @@ class Repl:
         for item in interrupts:
             interrupt_id = getattr(item, "id", None)
             if not interrupt_id:
-                continue  # Command(resume={id: ...}) cannot address it
+                continue  # _drive refuses to resume when any interrupt lacks an id
             value = item.value
             actions = value.get("action_requests", []) if isinstance(value, dict) else []
             decisions = []
