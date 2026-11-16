@@ -361,3 +361,53 @@ def test_find_shell_preferences():
             assert "system32" not in argv[0].replace("/", "\\").lower().split("\\")
     with pytest.raises(ValueError):
         find_shell("definitely-missing-shell")
+
+
+# --- A1: here-document bodies stay byte-identical when the command is rewritten
+
+
+_APP_BODY = "def f():\n    return 1\n\nx = 2\n"
+
+
+@posix_only
+def test_heredoc_body_survives_a_rewritten_add(tmp_path, git_repo):
+    repo = git_repo(tmp_path / "repo")
+    backend = GuardedShellBackend(root_dir=repo)
+    result = backend.execute("cat > app.py <<'EOF'\n" + _APP_BODY + "EOF\ngit add app.py")
+    assert result.exit_code == 0, result.output
+    assert (repo / "app.py").read_bytes() == _APP_BODY.encode()
+    assert _git(repo, "diff", "--cached", "--name-only").splitlines() == ["app.py"]
+
+
+@posix_only
+def test_heredoc_body_survives_a_rewritten_commit(tmp_path, git_repo):
+    repo = git_repo(tmp_path / "repo")
+    backend = GuardedShellBackend(root_dir=repo)
+    result = backend.execute("cat > app.py <<'EOF'\n" + _APP_BODY + "EOF\ngit add app.py\ngit commit -m x")
+    assert result.exit_code == 0, result.output
+    assert _git(repo, "show", "HEAD:app.py") == _APP_BODY
+    assert _git(repo, "log", "-1", "--format=%B").strip() == "x"
+
+
+@posix_only
+def test_heredoc_body_with_shell_text_is_written_verbatim(tmp_path, git_repo):
+    repo = git_repo(tmp_path / "repo")
+    backend = GuardedShellBackend(root_dir=repo)
+    (repo / "other.txt").write_text("other\n", encoding="utf-8")
+    body = "git add other.txt\na && b; c | d\ntrailing space   \n\n  indented\n"
+    result = backend.execute("cat > notes.txt <<'EOF' && git add notes.txt\n" + body + "EOF")
+    assert result.exit_code == 0, result.output
+    assert (repo / "notes.txt").read_bytes() == body.encode()
+    assert _git(repo, "diff", "--cached", "--name-only").splitlines() == ["notes.txt"]
+
+
+@posix_only
+def test_commit_with_heredoc_message_still_scrubbed(tmp_path, git_repo):
+    repo = git_repo(tmp_path / "repo")
+    backend = GuardedShellBackend(root_dir=repo)
+    (repo / "f.txt").write_text("f\n", encoding="utf-8")
+    result = backend.execute(
+        "git add f.txt && git commit -F - <<'EOF'\nfeat: x\n\n    indented body\nCo-authored-by: A <a@b.c>\nEOF"
+    )
+    assert result.exit_code == 0, result.output
+    assert _git(repo, "log", "-1", "--format=%B").strip() == "feat: x\n\n    indented body"

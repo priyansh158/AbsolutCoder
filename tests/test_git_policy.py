@@ -293,3 +293,103 @@ def test_push_as_ordinary_verb_does_not_unlock(message, expected):
 )
 def test_pull_as_ordinary_verb_does_not_unlock(message, expected):
     assert TurnFlags.from_message(message).pull_requested is expected
+
+
+# --- A1: here-documents ------------------------------------------------------
+
+
+def test_heredoc_body_is_not_vetted_as_commands():
+    command = "cat > notes.txt <<'EOF'\ngit push origin main\ngit reset --hard\nEOF\ngit add notes.txt"
+    vet(command, TurnFlags())
+    with pytest.raises(PolicyDenied, match="git push"):
+        vet(command + "\ngit push", TurnFlags())
+
+
+def test_expanding_heredoc_body_substitutions_are_vetted():
+    with pytest.raises(PolicyDenied, match="git push"):
+        vet("cat <<EOF\n$(git push)\nEOF", TurnFlags())
+    vet("cat <<'EOF'\n$(git push)\nEOF", TurnFlags())
+
+
+def test_span_aware_splitter_keeps_two_heredocs_with_their_segments():
+    from absolutcoder.git_policy import command_segments, split_command_chain
+
+    command = (
+        "cat > a.txt <<'EOF' && cat > b.txt <<-END; echo done\n"
+        "a && b; c | d\n"
+        "EOF\n"
+        "\tb body\n"
+        "\tEND\n"
+        "git add a.txt b.txt"
+    )
+    segments = command_segments(command)
+    assert [(s.operator, s.text) for s in segments] == [
+        ("", "cat > a.txt <<'EOF'"),
+        ("&&", "cat > b.txt <<-END"),
+        (";", "echo done"),
+        ("\n", "git add a.txt b.txt"),
+    ]
+    for segment in segments:
+        assert command[segment.start : segment.end] == segment.text
+    first, second = segments[0].heredocs, segments[1].heredocs
+    assert [(doc.delimiter, doc.expands) for doc in first] == [("EOF", False)]
+    assert [(doc.delimiter, doc.expands) for doc in second] == [("END", True)]
+    assert command[first[0].start : first[0].end] == "a && b; c | d\nEOF"
+    assert command[second[0].start : second[0].end] == "\tb body\n\tEND"
+    assert segments[2].heredocs == () and segments[3].heredocs == ()
+    assert split_command_chain(command) == [(s.operator, s.text) for s in segments]
+    assert split_command_chain("cat <<<'a; b' && echo x") == [("", "cat <<<'a; b'"), ("&&", "echo x")]
+
+
+# --- A2: shell punctuation ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("command", "flags"),
+    [
+        ("(cd sub && git push)", TurnFlags(push_requested=True)),
+        ("(git push)", TurnFlags(push_requested=True)),
+        ("git push&", TurnFlags(push_requested=True)),
+        ("git push>log.txt", TurnFlags(push_requested=True)),
+        ("git push 2>&1", TurnFlags(push_requested=True)),
+        ("(cd sub && git reset --hard)", TurnFlags(destructive_requested=True)),
+        ("git branch tmp & git push", TurnFlags(push_requested=True)),
+        ("{ git push; }", TurnFlags(push_requested=True)),
+        ('echo "$(git push)"', TurnFlags(push_requested=True)),
+        ("git status; git log; git push", TurnFlags(push_requested=True)),
+    ],
+)
+def test_shell_punctuation_does_not_hide_git(command, flags):
+    with pytest.raises(PolicyDenied):
+        vet(command, TurnFlags())
+    vet(command, flags)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'git branch "$(echo x)"',
+        "git branch `echo x`",
+        "git branch x & echo hi",
+        "git merge x > file",
+        "(git commit -m x)",
+        "git commit -m x | cat",
+        "git commit -F - <<'EOF'\nx\nEOF",
+    ],
+)
+def test_local_git_with_shell_features_needs_approval(command):
+    assert execute_needs_approval(command) is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    ['git commit -m "x"', "git branch feature", "git switch main", "git merge feature",
+     'git commit -m "a > b & (c)"'],
+)
+def test_plain_local_git_needs_no_approval(command):
+    assert execute_needs_approval(command) is False
+
+
+def test_add_then_commit_still_needs_approval():
+    # Pinned as found before the punctuation fix: add is not a no-prompt subcommand.
+    assert execute_needs_approval('git add a && git commit -m "x"') is True

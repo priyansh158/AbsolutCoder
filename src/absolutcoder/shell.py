@@ -21,14 +21,15 @@ from deepagents.backends.protocol import ExecuteResponse
 
 from absolutcoder.git_policy import (
     CONTEXT_FILENAME,
+    CommandSegment,
     PolicyDenied,
     TurnFlags,
+    command_segments,
     git_subcommand,
     prepare_commit_segment,
     protect_context_file,
     render_command,
     runs_git,
-    split_command_chain,
     unstage_context_file,
     vet,
 )
@@ -39,8 +40,6 @@ _EXTENDED_UNC_PREFIX = "\\\\?\\UNC\\"
 _GIT_MARKERS = ("cmd/git.exe", "bin/git.exe", "mingw64/bin/git.exe")
 _MENTIONS_GIT = re.compile(r"(?<![\w.-])git(?:\.exe)?(?![\w-])", re.IGNORECASE)
 _LEADING_KEYWORDS = re.compile(r"^((?:(?:do|then|else|elif|if|while|until|!|\{)\s+)*)(.*)$", re.DOTALL)
-_HEREDOC = re.compile(r"<<(?!<)")
-_JOINERS = {"&&": " && ", "||": " || ", ";": "; ", "|": " | ", "\n": "\n"}
 
 _REPO_LOCKS: dict[str, threading.RLock] = {}
 _REPO_LOCKS_GUARD = threading.Lock()
@@ -283,7 +282,8 @@ class GuardedShellBackend(_ExtendedPathMixin, LocalShellBackend):
         if _MENTIONS_GIT.search(command):
             for key in [key for key in env if key.upper().startswith(_IDENTITY_PREFIXES)]:
                 del env[key]
-        chain = split_command_chain(command)
+        segments = command_segments(command)
+        chain = [(segment.operator, segment.text) for segment in segments]
         subcommands = [git_subcommand(segment) for _op, segment in chain]
         writes_index = any(subcommand in {"commit", "add"} for subcommand in subcommands)
         uses_repo = any(runs_git(segment) for _op, segment in chain)
@@ -292,9 +292,9 @@ class GuardedShellBackend(_ExtendedPathMixin, LocalShellBackend):
                 return self._run(command, env, timeout)
             if self.shell_kind == "cmd":
                 if any(operator == "|" for operator, _segment in chain):
-                    return self._execute_pipeline(chain, env, timeout)
+                    return self._execute_pipeline(command, segments, env, timeout)
                 return self._execute_chain(chain, env, timeout)
-            script, message_files = self._posix_script(chain)
+            script, message_files = self._posix_script(command, segments)
             try:
                 return self._run(script, env, timeout)
             finally:
@@ -306,30 +306,35 @@ class GuardedShellBackend(_ExtendedPathMixin, LocalShellBackend):
 
     # --- POSIX shells: one script --------------------------------------------
 
-    def _posix_script(self, chain: list[tuple[str, str]]) -> tuple[str, list[Path]]:
-        """Rebuild the chain with AbsolutCoder.md unstaged around each add and commit."""
+    def _posix_script(self, command: str, segments: list[CommandSegment]) -> tuple[str, list[Path]]:
+        """``command`` with each add and commit wrapped so AbsolutCoder.md is unstaged around it.
+
+        Only those segments are replaced; every other byte of ``command``,
+        here-document bodies included, is kept. A replacement stays on one
+        line, because a here-document opened earlier on that line reads its
+        body from the next one.
+        """
 
         unstage = self._unstage_script()
         pieces: list[str] = []
         message_files: list[Path] = []
-        for index, (operator, segment) in enumerate(chain):
-            if index:
-                pieces.append(_JOINERS[operator])
-            subcommand = git_subcommand(segment)
+        cursor = 0
+        for segment in segments:
+            subcommand = git_subcommand(segment.text)
             if subcommand not in {"commit", "add"}:
-                pieces.append(segment)
                 continue
-            lead, body = _LEADING_KEYWORDS.match(segment).groups()
-            body = _foreground(body)
+            lead, body = _LEADING_KEYWORDS.match(segment.text).groups()
             if subcommand == "commit":
                 rewritten, path = prepare_commit_segment(body, self.cwd, self.shell_kind)
                 if path is not None:
                     message_files.append(path)
-                # A here-document body starts on the next line, so the brace stays on this one.
-                close = "; }" if _HEREDOC.search(rewritten) else "\n}"
-                pieces.append(f"{lead}{{ {unstage}; {rewritten}{close}")
+                replacement = f"{lead}{{ {unstage}; {rewritten}; }}"
             else:
-                pieces.append(f"{lead}{{ {body}\n__ac_rc=$?; {unstage}; (exit $__ac_rc)\n}}")
+                replacement = f"{lead}{{ {body}; __ac_rc=$?; {unstage}; (exit $__ac_rc); }}"
+            pieces.append(command[cursor : segment.start])
+            pieces.append(replacement)
+            cursor = _foreground(command, segment.end, pieces)
+        pieces.append(command[cursor:])
         return "".join(pieces), message_files
 
     def _unstage_script(self) -> str:
@@ -368,22 +373,23 @@ class GuardedShellBackend(_ExtendedPathMixin, LocalShellBackend):
             _delete(message_files)
         return ExecuteResponse(output="\n".join(outputs), exit_code=exit_code, truncated=truncated)
 
-    def _execute_pipeline(self, chain: list[tuple[str, str]], env: dict[str, str], timeout: int | None) -> ExecuteResponse:
+    def _execute_pipeline(
+        self, command: str, segments: list[CommandSegment], env: dict[str, str], timeout: int | None
+    ) -> ExecuteResponse:
         pieces: list[str] = []
         message_files: list[Path] = []
-        if any(git_subcommand(segment) == "commit" for _operator, segment in chain):
+        commits = [segment for segment in segments if git_subcommand(segment.text) == "commit"]
+        if commits:
             unstage_context_file(self.cwd, env)
+        cursor = 0
         try:
-            for index, (operator, segment) in enumerate(chain):
-                if index:
-                    pieces.append(f" {operator} ")
-                if git_subcommand(segment) == "commit":
-                    rewritten, path = prepare_commit_segment(segment, self.cwd, "cmd")
-                    pieces.append(rewritten)
-                    if path is not None:
-                        message_files.append(path)
-                else:
-                    pieces.append(segment)
+            for segment in commits:
+                rewritten, path = prepare_commit_segment(segment.text, self.cwd, "cmd")
+                pieces.extend([command[cursor : segment.start], rewritten])
+                cursor = segment.end
+                if path is not None:
+                    message_files.append(path)
+            pieces.append(command[cursor:])
             return self._run("".join(pieces), env, timeout)
         finally:
             _delete(message_files)
@@ -441,37 +447,20 @@ class GuardedShellBackend(_ExtendedPathMixin, LocalShellBackend):
         return _response(result, self._max_output_bytes)
 
 
-def _foreground(segment: str) -> str:
-    """Drop a trailing shell comment and a trailing ``&`` from an add or commit segment.
+def _foreground(command: str, end: int, pieces: list[str]) -> int:
+    """Run a rewritten add or commit in the foreground: a single ``&`` after it becomes ``;``.
 
-    The rebuilt group must stay valid shell, and a backgrounded commit would
-    race with the deletion of its message file.
+    A backgrounded commit would race with the deletion of its message file.
+    Returns where copying of ``command`` resumes.
     """
 
-    quote = ""
-    cut = len(segment)
-    index = 0
-    while index < len(segment):
-        char = segment[index]
-        if quote:
-            if char == "\\" and quote == '"':
-                index += 2
-                continue
-            if char == quote:
-                quote = ""
-        elif char == "\\":
-            index += 2
-            continue
-        elif char in {"'", '"'}:
-            quote = char
-        elif char == "#" and (index == 0 or segment[index - 1].isspace()):
-            cut = index
-            break
-        index += 1
-    text = segment[:cut].rstrip()
-    if text.endswith("&") and not text.endswith(("&&", ">&", "<&")):
-        text = text[:-1].rstrip()
-    return text
+    cursor = end
+    while cursor < len(command) and command[cursor] in " \t":
+        cursor += 1
+    if command.startswith("&", cursor) and not command.startswith(("&&", "&>"), cursor):
+        pieces.append(command[end:cursor] + ";")
+        return cursor + 1
+    return end
 
 
 def _response(result: subprocess.CompletedProcess, max_output_bytes: int) -> ExecuteResponse:

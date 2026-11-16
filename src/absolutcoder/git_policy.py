@@ -14,6 +14,7 @@ import subprocess
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 CONTEXT_FILENAME = "AbsolutCoder.md"
 _NO_PROMPT_GIT = frozenset({"commit", "branch", "switch", "merge"})
@@ -118,7 +119,7 @@ def vet(command: str, flags: TurnFlags) -> None:
     for segment, wrapped in _walk_segments(command):
         if sets_commit_identity(segment):
             raise PolicyDenied("commit identity variables cannot be set")
-        if wrapped and git_subcommand(segment) in {"commit", "add"}:
+        if wrapped and {"commit", "add"} & set(_git_subcommands(segment)):
             raise PolicyDenied(_WRAPPED_INDEX_WRITE)
         _vet_segment(segment, flags)
 
@@ -188,9 +189,13 @@ def execute_needs_approval(command: str) -> bool:
     """Ordinary shell commands ask first. Local git writes do not ask again.
 
     A wrapper such as ``sh -c`` or ``env`` always asks, and so does a command
-    ``vet`` would refuse for nesting too deep.
+    ``vet`` would refuse for nesting too deep. So does any command substitution,
+    redirection, single ``&``, subshell parenthesis or pipe: each could run or
+    overwrite something no git subcommand names.
     """
 
+    if _shell_features(command) & _ASKING_FEATURES:
+        return True
     try:
         segments = [segment for segment in iter_vet_segments(command) if segment.strip()]
     except PolicyDenied:
@@ -200,48 +205,320 @@ def execute_needs_approval(command: str) -> bool:
     for segment in segments:
         if unwrap_shell(_command_tokens(segment)) is not None:
             return True
-        if git_subcommand(segment) not in _NO_PROMPT_GIT:
+        subcommands = _git_subcommands(segment)
+        if not subcommands or any(sub not in _NO_PROMPT_GIT for sub in subcommands):
             return True
     return False
 
 
-def split_command_chain(command: str) -> list[tuple[str, str]]:
-    """Split a shell command on &&, ||, ;, |, and newlines outside quotes."""
+_ASKING_FEATURES = frozenset({"substitution", "redirect", "background", "subshell", "pipe"})
 
-    parts: list[tuple[str, str]] = []
-    buf: list[str] = []
-    operator = ""
-    quote = ""
-    index = 0
-    while index < len(command):
-        char = command[index]
-        if quote:
-            buf.append(char)
-            if char == quote and (index == 0 or command[index - 1] != "\\"):
-                quote = ""
-            index += 1
-            continue
-        if char in {"'", '"'}:
-            quote = char
-            buf.append(char)
-            index += 1
-            continue
-        if command.startswith("&&", index) or command.startswith("||", index):
-            parts.append((operator, "".join(buf)))
-            operator = command[index : index + 2]
-            buf = []
-            index += 2
-            continue
-        if char in {";", "\n", "|"}:
-            parts.append((operator, "".join(buf)))
-            operator = char
-            buf = []
-            index += 1
-            continue
-        buf.append(char)
+
+def split_command_chain(command: str) -> list[tuple[str, str]]:
+    """Split a shell command into ``(operator, segment)`` pairs outside quotes.
+
+    Separators are ``&&``, ``||``, ``;``, ``|``, a single ``&``, ``(``, ``)``
+    and newlines. Here-document bodies and comments are never segments; see
+    ``command_segments`` for where each segment sits in the text.
+    """
+
+    return [(segment.operator, segment.text) for segment in command_segments(command)]
+
+
+class HereDocument(NamedTuple):
+    """A here-document body: ``start`` is its first character, ``end`` the end of the delimiter line."""
+
+    delimiter: str
+    start: int
+    end: int
+    # An unquoted delimiter: $(...) and backticks in the body run.
+    expands: bool
+
+
+class CommandSegment(NamedTuple):
+    """One simple command of a command line and where it sits in the original text."""
+
+    operator: str
+    text: str
+    start: int
+    end: int
+    # The here-documents this segment opened; their bodies follow its line.
+    heredocs: tuple[HereDocument, ...] = ()
+
+
+def command_segments(command: str) -> list[CommandSegment]:
+    """The segments of ``command`` with their source spans, read the way a POSIX shell reads it.
+
+    ``command[segment.start:segment.end] == segment.text``. A here-document
+    (``<<`` / ``<<-`` through its delimiter line) belongs to the segment that
+    opened it and is never split, vetted or changed; ``<<<`` is a here-string.
+    ``$(...)``, backticks and ``${...}`` are never split either.
+    """
+
+    return _ShellScanner(command).run().result()
+
+
+def _shell_features(command: str) -> set[str]:
+    """Which of substitution, redirect, background, subshell and pipe ``command`` uses."""
+
+    return _ShellScanner(command).run().features
+
+
+_WORD_BREAK = frozenset(" \t\n;&|()<>")
+
+
+def _paren_end(text: str, open_index: int) -> int:
+    depth = 0
+    for index in range(open_index, len(text)):
+        if text[index] == "(":
+            depth += 1
+        elif text[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return len(text)
+
+
+class _ShellScanner:
+    """Walk shell text for splitting and inspection only; nothing here runs it."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.segments: list[CommandSegment] = []
+        self.bodies: dict[int, list[HereDocument]] = {}
+        # Outermost $(...) and backtick bodies, as (start, end) spans.
+        self.substitutions: list[tuple[int, int]] = []
+        self.features: set[str] = set()
+        self._nesting = 0
+
+    def run(self) -> _ShellScanner:
+        self._scan(0, nested=False)
+        return self
+
+    def result(self) -> list[CommandSegment]:
+        return [
+            segment._replace(heredocs=tuple(self.bodies.get(index, ())))
+            for index, segment in enumerate(self.segments)
+        ]
+
+    def run_heredoc_body(self) -> _ShellScanner:
+        """Scan the text as an expanding here-document body: only substitutions matter."""
+
+        text, index = self.text, 0
+        while index < len(text):
+            index = self._skip_expansion(index)
+        return self
+
+    def _skip_expansion(self, index: int) -> int:
+        text = self.text
+        if text[index] == "\\":
+            return index + 2
+        if text.startswith("$(", index):
+            return self._skip_substitution(index)
+        if text.startswith("${", index):
+            return self._skip_braces(index)
+        if text[index] == "`":
+            return self._skip_backtick(index)
+        return index + 1
+
+    def _scan(self, index: int, nested: bool, arith_end: int = -1) -> int:
+        """Scan from ``index``; nested scans return just past their closing ``)``."""
+
+        text, size = self.text, len(self.text)
+        pending: list[tuple[str, bool, bool, int | None]] = []
+        depth = 0
+        start, operator, comment = index, "", None
+        while index < size:
+            char = text[index]
+            if char in "\\$`":
+                index = self._skip_expansion(index)
+                continue
+            if char == "'":
+                end = text.find("'", index + 1)
+                index = size if end == -1 else end + 1
+                continue
+            if char == '"':
+                index = self._skip_double(index)
+                continue
+            if char == "#" and (index == 0 or text[index - 1] in _WORD_BREAK):
+                if comment is None:
+                    comment = index
+                newline = text.find("\n", index)
+                index = size if newline == -1 else newline
+                continue
+            if text.startswith("((", index):
+                # Arithmetic: << is a shift there, never a here-document.
+                arith_end = max(arith_end, _paren_end(text, index))
+            if text.startswith("<<", index) and not text.startswith("<<<", index) and index > arith_end:
+                index = self._heredoc_operator(index, pending, nested)
+                continue
+            if char == "\n":
+                if not nested:
+                    self._close(start, index if comment is None else comment, operator)
+                    operator = "\n"
+                index = self._read_bodies(index + 1, pending)
+                pending = []
+                start, comment = index, None
+                continue
+            if nested:
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    if depth == 0:
+                        return index + 1
+                    depth -= 1
+                index += 1
+                continue
+            found = self._operator(index)
+            if found is None:
+                if char in "<>":
+                    self.features.add("redirect")
+                index += 1
+                continue
+            separator, length = found
+            self.features.add({"&": "background", "(": "subshell", ")": "subshell", "|": "pipe"}.get(separator, "chain"))
+            self._close(start, index if comment is None else comment, operator)
+            operator = separator
+            index += length
+            start, comment = index, None
+        if not nested:
+            self._close(start, size if comment is None else comment, operator)
+        return size
+
+    def _operator(self, index: int) -> tuple[str, int] | None:
+        text = self.text
+        pair = text[index : index + 2]
+        before = text[index - 1] if index else ""
+        if pair in {"&&", "||"}:
+            return pair, 2
+        if pair == "|&":
+            return "|", 2
+        char = text[index]
+        if char == "|":
+            return None if before == ">" else ("|", 1)
+        if char == ";":
+            return ";", 1
+        if char == "&":
+            if pair == "&>" or before in {"<", ">"}:
+                return None
+            return "&", 1
+        if char in "()":
+            return char, 1
+        return None
+
+    def _close(self, start: int, end: int, operator: str) -> None:
+        raw = self.text[start:end]
+        stripped = raw.strip()
+        if not stripped:
+            return
+        begin = start + len(raw) - len(raw.lstrip())
+        self.segments.append(CommandSegment(operator, stripped, begin, begin + len(stripped)))
+
+    def _skip_double(self, index: int) -> int:
+        text = self.text
         index += 1
-    parts.append((operator, "".join(buf)))
-    return [(op, segment.strip()) for op, segment in parts if segment.strip()]
+        while index < len(text):
+            char = text[index]
+            if char == '"':
+                return index + 1
+            if char in "\\$`":
+                index = self._skip_expansion(index)
+                continue
+            index += 1
+        return len(text)
+
+    def _skip_substitution(self, index: int) -> int:
+        self.features.add("substitution")
+        outermost = self._nesting == 0
+        self._nesting += 1
+        arith_end = _paren_end(self.text, index + 1) if self.text.startswith("$((", index) else -1
+        end = self._scan(index + 2, nested=True, arith_end=arith_end)
+        self._nesting -= 1
+        if outermost:
+            closed = end <= len(self.text) and self.text[end - 1 : end] == ")"
+            self.substitutions.append((index + 2, end - 1 if closed else end))
+        return end
+
+    def _skip_backtick(self, index: int) -> int:
+        self.features.add("substitution")
+        text = self.text
+        cursor = index + 1
+        while cursor < len(text) and text[cursor] != "`":
+            cursor += 2 if text[cursor] == "\\" else 1
+        if self._nesting == 0:
+            self.substitutions.append((index + 1, min(cursor, len(text))))
+        return min(cursor + 1, len(text))
+
+    def _skip_braces(self, index: int) -> int:
+        text = self.text
+        depth = 0
+        cursor = index + 1
+        while cursor < len(text):
+            char = text[cursor]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return cursor + 1
+            elif char == "'":
+                end = text.find("'", cursor + 1)
+                cursor = len(text) if end == -1 else end + 1
+                continue
+            elif char == '"':
+                cursor = self._skip_double(cursor)
+                continue
+            elif char in "\\$`":
+                cursor = self._skip_expansion(cursor)
+                continue
+            cursor += 1
+        return len(text)
+
+    def _heredoc_operator(self, index: int, pending: list, nested: bool) -> int:
+        self.features.add("redirect")
+        text = self.text
+        cursor = index + 2
+        strip_tabs = text.startswith("-", cursor)
+        if strip_tabs:
+            cursor += 1
+        while cursor < len(text) and text[cursor] in " \t":
+            cursor += 1
+        parts: list[str] = []
+        quoted = False
+        while cursor < len(text) and text[cursor] not in _WORD_BREAK:
+            char = text[cursor]
+            if char == "\\":
+                quoted = True
+                parts.append(text[cursor + 1 : cursor + 2])
+                cursor += 2
+            elif char in {"'", '"'}:
+                quoted = True
+                end = text.find(char, cursor + 1)
+                end = len(text) if end == -1 else end
+                parts.append(text[cursor + 1 : end])
+                cursor = end + 1
+            else:
+                parts.append(char)
+                cursor += 1
+        if parts or quoted:
+            pending.append(("".join(parts), strip_tabs, quoted, None if nested else len(self.segments)))
+        return min(cursor, len(text))
+
+    def _read_bodies(self, position: int, pending: list) -> int:
+        text, size = self.text, len(self.text)
+        for delimiter, strip_tabs, quoted, owner in pending:
+            body_start, end = position, size
+            while position < size:
+                newline = text.find("\n", position)
+                line_end = size if newline == -1 else newline
+                line = text[position:line_end]
+                position = size if newline == -1 else newline + 1
+                if (line.lstrip("\t") if strip_tabs else line) == delimiter:
+                    end = line_end
+                    break
+            if owner is not None:
+                self.bodies.setdefault(owner, []).append(HereDocument(delimiter, body_start, end, not quoted))
+        return min(position, size)
 
 
 def iter_vet_segments(command: str) -> list[str]:
@@ -260,9 +537,14 @@ def _walk_segments(command: str, depth: int = 0, wrapped: bool = False) -> list[
     """
 
     found: list[tuple[str, bool]] = []
-    for _operator, segment in split_command_chain(command):
+    for part in command_segments(command):
+        segment = part.text
         found.append((segment, wrapped))
-        for inner in _substitutions(segment):
+        inners = _substitutions(segment)
+        for doc in part.heredocs:
+            if doc.expands:
+                inners.extend(_heredoc_substitutions(command[doc.start : doc.end]))
+        for inner in inners:
             # Substitution bodies only get shorter, so they need no depth limit.
             found.append((inner, True))
             found.extend(_walk_segments(inner, depth, True))
@@ -639,9 +921,11 @@ def _asked_destructive(text: str) -> bool:
 
 
 def _vet_segment(segment: str, flags: TurnFlags) -> None:
-    invocation = _git_invocation(_tokens(segment))
-    if invocation is None:
-        return
+    for invocation in _git_invocations(_tokens(segment)):
+        _vet_invocation(invocation, flags)
+
+
+def _vet_invocation(invocation: list[str], flags: TurnFlags) -> None:
     if _git_sets_config(invocation[1:]):
         if not flags.destructive_requested:
             raise PolicyDenied("git config is not allowed unless this message asks for it")
@@ -696,24 +980,57 @@ def _split_git_args(args: list[str]) -> tuple[str | None, list[str]]:
         if arg in {"-C", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix", "-c", "--config-env"}:
             index += 2
             continue
+        if _REDIRECTION.match(arg):
+            index += 2 if _BARE_REDIRECTION.match(arg) else 1
+            continue
         if arg.startswith("--") and "=" in arg:
             index += 1
             continue
         if arg.startswith("-"):
             index += 1
             continue
-        return arg.lower(), args[index + 1 :]
+        word = _without_attachments(arg)
+        if not word:
+            index += 1
+            continue
+        rest = [_without_attachments(item) for item in args[index + 1 :]]
+        return word.lower(), [item for item in rest if item]
     return None, []
 
 
+# A redirection operator whose target is the next word: >, >>, 2>, <, &>.
+_BARE_REDIRECTION = re.compile(r"^(?:\d*|&)(?:>>|>|<<<|<<-|<<|<>|<)&?$")
+# Glued punctuation that ends a word: push), push&, push>log.txt, push2>&1, --hard;.
+_ATTACHED = re.compile(r"\d*[<>]|[()&;|]")
+
+
+def _without_attachments(word: str) -> str:
+    """``word`` without trailing ``)``, ``&``, ``;`` or an attached redirection."""
+
+    return _ATTACHED.split(word, maxsplit=1)[0]
+
+
 def _git_invocation(tokens: list[str]) -> list[str] | None:
-    for index, token in enumerate(tokens):
-        if _is_identity_assignment(token):
-            continue
-        base = token.replace("\\", "/").rsplit("/", 1)[-1].lower()
-        if base in {"git", "git.exe"}:
-            return tokens[index:]
-    return None
+    found = _git_invocations(tokens)
+    return found[0] if found else None
+
+
+def _git_invocations(tokens: list[str]) -> list[list[str]]:
+    """Every place ``git`` appears as a word, each with the words after it."""
+
+    return [
+        tokens[index:]
+        for index, token in enumerate(tokens)
+        if not _is_identity_assignment(token) and _command_name(token) in {"git", "git.exe"}
+    ]
+
+
+def _git_subcommands(segment: str) -> list[str]:
+    return [
+        subcommand
+        for invocation in _git_invocations(_tokens(segment))
+        if (subcommand := _split_git_args(invocation[1:])[0]) is not None
+    ]
 
 
 def _tokens(segment: str) -> list[str]:
@@ -767,52 +1084,20 @@ def _adds_context_file(args: list[str]) -> bool:
 
 
 def _substitutions(segment: str) -> list[str]:
-    """The ``$(...)`` and backtick bodies outside quotes, without the ones nested in them."""
+    """The ``$(...)`` and backtick bodies outside single quotes, without the ones nested in them.
 
-    found: list[str] = []
-    quote = ""
-    index = 0
-    while index < len(segment):
-        char = segment[index]
-        if quote:
-            if char == quote:
-                quote = ""
-            index += 1
-            continue
-        if char in {"'", '"'}:
-            quote = char
-            index += 1
-            continue
-        if segment.startswith("$(", index):
-            end = _matching_paren(segment, index + 1)
-            if end is None:
-                break
-            inner = segment[index + 2 : end]
-            found.append(inner)
-            index = end + 1
-            continue
-        if char == "`":
-            end = segment.find("`", index + 1)
-            if end == -1:
-                break
-            inner = segment[index + 1 : end]
-            found.append(inner)
-            index = end + 1
-            continue
-        index += 1
-    return found
+    Double quotes do not stop a substitution: ``"$(git push)"`` runs git push.
+    """
+
+    scanner = _ShellScanner(segment).run()
+    return [segment[start:end] for start, end in scanner.substitutions]
 
 
-def _matching_paren(text: str, open_index: int) -> int | None:
-    depth = 0
-    for index in range(open_index, len(text)):
-        if text[index] == "(":
-            depth += 1
-        elif text[index] == ")":
-            depth -= 1
-            if depth == 0:
-                return index
-    return None
+def _heredoc_substitutions(body: str) -> list[str]:
+    """The substitutions an expanding here-document body runs."""
+
+    scanner = _ShellScanner(body).run_heredoc_body()
+    return [body[start:end] for start, end in scanner.substitutions]
 
 
 def _join_cmd(tokens: list[str]) -> str:
