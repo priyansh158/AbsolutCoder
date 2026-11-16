@@ -1074,10 +1074,6 @@ def _git_sets_config(args: list[str]) -> bool:
         if arg in {"-C", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix"}:
             index += 2
             continue
-        if arg.startswith("--") and "=" not in arg and arg not in {"--no-pager", "--paginate", "--bare", "--literal-pathspecs"}:
-            if arg in {"--git-dir", "--work-tree", "--namespace"}:
-                index += 2
-                continue
         if not arg.startswith("-"):
             return False
         index += 1
@@ -1178,8 +1174,6 @@ def _clean_is_forced(args: list[str]) -> bool:
         if arg in {"--force", "-f", "-fd", "-df", "-ff", "-xf", "-fx"}:
             return True
         if arg.startswith("-") and not arg.startswith("--") and "f" in arg[1:]:
-            return True
-        if arg == "--force":
             return True
     return False
 

@@ -27,8 +27,6 @@ from absolutcoder.shell import GuardedShellBackend
 from absolutcoder.subagents import AgentDef
 from absolutcoder.webtools import UNTRUSTED_CLOSE, UNTRUSTED_NOTE, UNTRUSTED_OPEN
 
-TASK_STATUSES = ("queued", "running", "needs_approval", "done", "failed", "cancelled")
-
 _UNFINISHED = frozenset({"queued", "running", "needs_approval"})
 _NOTIFY = frozenset({"done", "failed", "cancelled"})
 _NOTICE_LIMIT = 4000
