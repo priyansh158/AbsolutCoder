@@ -22,21 +22,8 @@ def _git(repo: Path, *args: str) -> str:
     return completed.stdout
 
 
-def init_repo(path: Path) -> Path:
-    path.mkdir(parents=True)
-    subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True)
-    _git(path, "config", "user.name", "Ada Fixture")
-    _git(path, "config", "user.email", "ada@example.com")
-    _git(path, "config", "commit.gpgsign", "false")
-    _git(path, "config", "core.autocrlf", "false")
-    hooks = path / "empty-hooks"
-    hooks.mkdir()
-    _git(path, "config", "core.hooksPath", str(hooks))
-    return path
-
-
-def test_push_and_pull_require_flags(tmp_path):
-    repo = init_repo(tmp_path / "repo")
+def test_push_and_pull_require_flags(tmp_path, git_repo):
+    repo = git_repo(tmp_path / "repo")
     backend = GuardedShellBackend(root_dir=repo)
     denied = TurnFlags()
     for command in (
@@ -59,8 +46,8 @@ def test_push_and_pull_require_flags(tmp_path):
     assert not (repo / "should-not-exist").exists()
 
 
-def test_git_config_reset_and_clean_require_the_destructive_flag(tmp_path):
-    repo = init_repo(tmp_path / "repo")
+def test_git_config_reset_and_clean_require_the_destructive_flag(tmp_path, git_repo):
+    repo = git_repo(tmp_path / "repo")
     backend = GuardedShellBackend(root_dir=repo)
     for command in ("git config user.name Mallory", "git reset --hard", "git clean -fd"):
         with pytest.raises(PolicyDenied):
@@ -74,12 +61,12 @@ def test_git_config_reset_and_clean_require_the_destructive_flag(tmp_path):
     vet("git clean -fd", allowed)
 
 
-def test_commit_drops_trailers_and_keeps_repo_identity(tmp_path, monkeypatch):
+def test_commit_drops_trailers_and_keeps_repo_identity(tmp_path, monkeypatch, git_repo):
     monkeypatch.setenv("GIT_AUTHOR_NAME", "Not Ada")
     monkeypatch.setenv("GIT_AUTHOR_EMAIL", "not@example.com")
     monkeypatch.setenv("GIT_COMMITTER_NAME", "Not Ada")
     monkeypatch.setenv("GIT_COMMITTER_EMAIL", "not@example.com")
-    repo = init_repo(tmp_path / "repo")
+    repo = git_repo(tmp_path / "repo")
     backend = GuardedShellBackend(root_dir=repo)
     (repo / "file.txt").write_text("x\n", encoding="utf-8")
     message = (
@@ -109,8 +96,8 @@ def test_scrub_commit_message_removes_attribution():
     assert scrubbed == "feat: work"
 
 
-def test_context_file_is_excluded_and_unstaged(tmp_path):
-    repo = init_repo(tmp_path / "repo")
+def test_context_file_is_excluded_and_unstaged(tmp_path, git_repo):
+    repo = git_repo(tmp_path / "repo")
     protect_context_file(repo)
     (repo / "tracked.txt").write_text("y\n", encoding="utf-8")
     subprocess.run(["git", "add", "-f", "AbsolutCoder.md"], cwd=repo, check=True, capture_output=True)

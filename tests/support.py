@@ -4,6 +4,8 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
+from absolutcoder.models import ModelFactory
+
 
 def scripted_model(responder):
     """Return a chat model whose replies come from ``responder(messages)``."""
@@ -55,3 +57,14 @@ def tool_names_since_last_human(messages) -> list[str]:
             names.append(message.name)
     names.reverse()
     return names
+
+
+def role_models(mapping: dict[str, BaseChatModel], *, seen: list | None = None) -> ModelFactory:
+    """Return a model factory that hands out ``mapping[role]`` and records requests."""
+
+    def factory(role: str, model_id: str):
+        if seen is not None:
+            seen.append((role, model_id))
+        return mapping[role]
+
+    return factory

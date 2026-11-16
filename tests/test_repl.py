@@ -10,20 +10,23 @@ from rich.console import Console
 
 from absolutcoder.config import Config
 from absolutcoder.repl import Repl
-from absolutcoder.sessions import list_sessions, load_session
-from tests.support import scripted_model, tool_call, tool_names_since_last_human
+from absolutcoder.sessions import create_session, list_sessions, load_session
+from tests.support import role_models, scripted_model, tool_call, tool_names_since_last_human
 
 _PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 )
 
 
+def _worker():
+    return role_models({"general-purpose": scripted_model(lambda _m: AIMessage(content="worker"))})
+
+
 def _console() -> Console:
     return Console(file=io.StringIO(), force_terminal=False, no_color=True, width=100)
 
 
-def test_model_command_updates_session_on_the_same_thread(tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+def test_model_command_updates_session_on_the_same_thread(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     config = Config(main_model="openai:main-test", subagent_model="openai:worker-test", auto_run=True)
@@ -31,6 +34,7 @@ def test_model_command_updates_session_on_the_same_thread(tmp_path, monkeypatch)
         repo,
         config,
         chat_model=scripted_model(lambda _messages: AIMessage(content="ok")),
+        model_factory=_worker(),
         console=_console(),
     )
     thread_id = repl.thread_id
@@ -41,8 +45,7 @@ def test_model_command_updates_session_on_the_same_thread(tmp_path, monkeypatch)
     assert repl.thread_id == thread_id == loaded.id
 
 
-def test_shell_interrupt_asks_before_execute(tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+def test_shell_interrupt_asks_before_execute(tmp_path):
     repo = _git_repo(tmp_path / "repo")
     prompts: list[str] = []
 
@@ -59,6 +62,7 @@ def test_shell_interrupt_asks_before_execute(tmp_path, monkeypatch):
         repo,
         Config(main_model="openai:main-test", subagent_model="openai:worker-test", auto_run=False),
         chat_model=scripted_model(responder),
+        model_factory=_worker(),
         input_fn=ask,
         console=_console(),
     )
@@ -74,8 +78,7 @@ def _git_repo(path: Path) -> Path:
     return path
 
 
-def test_stream_exception_stays_in_the_session(tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+def test_stream_exception_stays_in_the_session(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     output = io.StringIO()
@@ -84,6 +87,7 @@ def test_stream_exception_stays_in_the_session(tmp_path, monkeypatch):
         repo,
         Config(main_model="openai:main-test", subagent_model="openai:worker-test", auto_run=True),
         chat_model=scripted_model(lambda _messages: AIMessage(content="ok")),
+        model_factory=_worker(),
         input_fn=lambda _prompt="": next(lines),
         console=Console(file=output, force_terminal=False, no_color=True, width=100),
     )
@@ -107,8 +111,7 @@ def test_stream_exception_stays_in_the_session(tmp_path, monkeypatch):
     assert state["raised"] is True
 
 
-def test_resume_restores_checkpoint_image_path_and_models(tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+def test_resume_restores_checkpoint_image_path_and_models(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     image = tmp_path / "shot.png"
@@ -118,6 +121,7 @@ def test_resume_restores_checkpoint_image_path_and_models(tmp_path, monkeypatch)
         repo,
         Config(main_model="openai:main-test", subagent_model="openai:worker-test", auto_run=True),
         chat_model=fake,
+        model_factory=_worker(),
         console=_console(),
     )
     original.run_turn("look at this", paths=[image])
@@ -133,6 +137,7 @@ def test_resume_restores_checkpoint_image_path_and_models(tmp_path, monkeypatch)
         repo,
         Config(main_model="openai:other-main", subagent_model="openai:other-worker", auto_run=False),
         chat_model=fake,
+        model_factory=_worker(),
         input_fn=choose,
         console=_console(),
     )
@@ -143,6 +148,45 @@ def test_resume_restores_checkpoint_image_path_and_models(tmp_path, monkeypatch)
     state = resumed.agent.get_state({"configurable": {"thread_id": resumed.thread_id}})
     blob = _flatten(state.values.get("messages", []))
     assert str(image.resolve()) in blob
+
+
+def test_resume_with_unavailable_provider_prints_hint(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    missing = ImportError(
+        "Initializing ChatGroq requires the langchain-groq package. "
+        "Please install it with `pip install langchain-groq`"
+    )
+    fine = _worker()
+
+    def factory(role, model_id):
+        if model_id.startswith("groq:"):
+            raise missing
+        return fine(role, model_id)
+
+    output = io.StringIO()
+    repl = Repl(
+        repo,
+        Config(main_model="openai:main-test", subagent_model="openai:worker-test", auto_run=True),
+        chat_model=scripted_model(lambda _messages: AIMessage(content="ok")),
+        model_factory=factory,
+        console=Console(file=output, force_terminal=False, no_color=True, width=100),
+    )
+    original_id = repl.thread_id
+    other = create_session(repo, "groq:x", "groq:x")
+    ids = [session.id for session in list_sessions(repo)]
+    repl.input_fn = lambda _prompt="": str(ids.index(other.id) + 1)
+    repl.handle_line("/resume")
+
+    text = output.getvalue()
+    assert "pip install langchain-groq" in text
+    assert "Traceback" not in text
+    assert repl.thread_id == original_id
+    assert repl.session.id == original_id
+    assert repl.config.main_model == "openai:main-test"
+    snapshot = repl.run_turn("still there?")
+    assert snapshot is not None
+    assert "ok" in _flatten(snapshot.values.get("messages", []))
 
 
 def _flatten(messages) -> str:

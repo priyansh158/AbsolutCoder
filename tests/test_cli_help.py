@@ -33,10 +33,9 @@ def test_absolut_help_exits_zero():
 
 def _run_absolut(tmp_path, main_model, subagent_model, drop_keys):
     scripts, executable = _executable()
-    (tmp_path / "config.json").write_text(
-        json.dumps({"main_model": main_model, "subagent_model": subagent_model}),
-        encoding="utf-8",
-    )
+    payload = {"main_model": main_model, "subagent_model": subagent_model}
+    payload = {key: value for key, value in payload.items() if value is not None}
+    (tmp_path / "config.json").write_text(json.dumps(payload), encoding="utf-8")
     env = os.environ.copy()  # keeps PYTHONPATH so the child imports this worktree
     env["PATH"] = str(scripts) + os.pathsep + env.get("PATH", "")
     env["ABSOLUTCODER_HOME"] = str(tmp_path)
@@ -75,4 +74,12 @@ def test_cli_reports_bad_model_id(tmp_path):
     completed = _run_absolut(tmp_path, "a b:x", "openai:gpt-x", ["OPENAI_API_KEY"])
     assert completed.returncode == 1
     assert "Config error" in completed.stderr
+    assert "Traceback" not in completed.stderr
+
+
+def test_cli_reports_incomplete_config(tmp_path):
+    completed = _run_absolut(tmp_path, None, "openai:x", ["OPENAI_API_KEY"])
+    assert completed.returncode == 1
+    assert "Config error" in completed.stderr
+    assert "main_model" in completed.stderr
     assert "Traceback" not in completed.stderr

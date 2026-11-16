@@ -2,28 +2,36 @@
 
 import base64
 
+import pytest
+from langchain_core.messages import AIMessage
+
 from absolutcoder.agent import MEMORY_PATH, build_agent
 from absolutcoder.attachments import build_user_content
 from absolutcoder.config import Config
+from absolutcoder.models import ProviderMissing
+from tests.support import role_models, scripted_model, tool_call
 
 _PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 )
 
 
-def test_build_agent_uses_worker_memory_and_image_blocks(tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+def _ok_model():
+    return scripted_model(lambda _messages: AIMessage(content="ok"))
+
+
+def test_build_agent_uses_memory_and_image_blocks(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
-    from tests.support import scripted_model
-    from langchain_core.messages import AIMessage
-
     config = Config(main_model="gpt-main", subagent_model="worker-test", auto_run=False)
-    agent = build_agent(repo, config, None, chat_model=scripted_model(lambda _messages: AIMessage(content="ok")))
+    agent = build_agent(
+        repo,
+        config,
+        None,
+        chat_model=_ok_model(),
+        model_factory=role_models({"general-purpose": _ok_model()}),
+    )
 
-    worker = _worker_model(agent)
-    assert worker.model_name == "worker-test"
-    assert type(worker).__name__ == "ChatOpenAI"
     assert _memory_sources(agent) == [MEMORY_PATH]
     assert "TodoListMiddleware.after_model" in agent.nodes
     assert "HumanInTheLoopMiddleware.after_model" in agent.nodes
@@ -48,37 +56,76 @@ def _memory_sources(agent) -> list[str]:
     return list(middleware.sources)
 
 
-def _worker_model(agent):
-    tools = agent.nodes["tools"].bound.func.__self__
-    task = tools.tools_by_name["task"].func
-    found = []
 
-    def walk(obj, depth: int, seen: set[int]) -> None:
-        if obj is None or depth > 12 or id(obj) in seen:
-            return
-        seen.add(id(obj))
-        if type(obj).__name__ == "ChatOpenAI":
-            found.append(obj)
-            return
-        if isinstance(obj, dict):
-            for value in obj.values():
-                walk(value, depth + 1, seen)
-            return
-        if isinstance(obj, (list, tuple, set, frozenset)):
-            for value in obj:
-                walk(value, depth + 1, seen)
-            return
-        closure = getattr(obj, "__closure__", None)
-        if closure:
-            for cell in closure:
-                try:
-                    walk(cell.cell_contents, depth + 1, seen)
-                except ValueError:
-                    pass
-        for attr in ("bound", "func", "nodes"):
-            if hasattr(obj, attr):
-                walk(getattr(obj, attr), depth + 1, seen)
+def test_subagent_model_comes_from_factory(tmp_path):
+    seen: list = []
+    config = Config(main_model="openai:main-test", subagent_model="openai:worker-test")
+    build_agent(
+        tmp_path,
+        config,
+        None,
+        chat_model=_ok_model(),
+        model_factory=role_models({"general-purpose": _ok_model()}, seen=seen),
+    )
+    assert seen == [("general-purpose", "openai:worker-test")]
 
-    walk(task, 0, set())
-    assert found, "worker model was not compiled onto the task tool"
-    return found[0]
+
+def test_agent_models_override_worker_model(tmp_path):
+    seen: list = []
+    config = Config(
+        main_model="openai:main-test",
+        subagent_model="openai:worker-test",
+        agent_models={"general-purpose": "anthropic:w"},
+    )
+    build_agent(
+        tmp_path,
+        config,
+        None,
+        chat_model=_ok_model(),
+        model_factory=role_models({"general-purpose": _ok_model()}, seen=seen),
+    )
+    assert seen == [("general-purpose", "anthropic:w")]
+
+
+def test_main_delegates_to_worker_offline(tmp_path):
+    def main(messages):
+        if any(getattr(m, "type", None) == "tool" and m.name == "task" for m in messages):
+            return AIMessage(content="main done")
+        return tool_call(
+            "task", {"description": "say hi", "subagent_type": "general-purpose"}, "call-task"
+        )
+
+    config = Config(
+        main_model="openai:main-test", subagent_model="openai:worker-test", auto_run=True
+    )
+    agent = build_agent(
+        tmp_path,
+        config,
+        None,
+        chat_model=scripted_model(main),
+        model_factory=role_models(
+            {"general-purpose": scripted_model(lambda _m: AIMessage(content="worker says hi"))}
+        ),
+    )
+    result = agent.invoke({"messages": [{"role": "user", "content": "delegate"}]})
+    messages = result["messages"]
+    task_messages = [m for m in messages if getattr(m, "type", None) == "tool" and m.name == "task"]
+    assert len(task_messages) == 1
+    assert "worker says hi" in str(task_messages[0].content)
+    assert messages[-1].content == "main done"
+
+
+_GROQ_ERROR = ImportError(
+    "Initializing ChatGroq requires the langchain-groq package. "
+    "Please install it with `pip install langchain-groq`"
+)
+
+
+def test_missing_provider_package_becomes_hint(tmp_path):
+    def factory(role, model_id):
+        raise _GROQ_ERROR
+
+    config = Config(main_model="groq:x", subagent_model="groq:x")
+    with pytest.raises(ProviderMissing) as caught:
+        build_agent(tmp_path, config, None, model_factory=factory)
+    assert "pip install langchain-groq" in str(caught.value)

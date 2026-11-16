@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+from dataclasses import replace
 from pathlib import Path
 
 from langgraph.errors import GraphBubbleUp
@@ -12,6 +14,7 @@ from absolutcoder.agent import build_agent
 from absolutcoder.attachments import build_user_content
 from absolutcoder.config import Config, config_path, resolve_model, save_config
 from absolutcoder.git_policy import TurnFlags, protect_context_file
+from absolutcoder.models import ModelFactory, ProviderMissing
 from absolutcoder.sessions import (
     Session,
     checkpoint_saver,
@@ -32,16 +35,18 @@ class Repl:
         config: Config,
         *,
         chat_model=None,
+        model_factory: ModelFactory | None = None,
         input_fn=None,
         console: Console | None = None,
     ) -> None:
         self.repo = Path(repo).resolve()
-        self.config = Config(
+        self.config = replace(
+            config,
             main_model=resolve_model(config.main_model),
             subagent_model=resolve_model(config.subagent_model),
-            auto_run=config.auto_run,
         )
         self.chat_model = chat_model
+        self.model_factory = model_factory
         self.input_fn = input_fn or input
         self.console = console or Console()
         self.pending_attachments: list[Path] = []
@@ -137,11 +142,20 @@ class Repl:
         self.console.print("Commands: /model, /subagent, /auto, /resume, /attach, /exit")
 
     def _retarget(self, *, main_model: str | None = None, subagent_model: str | None = None, auto_run: bool | None = None) -> None:
-        self.config = Config(
-            main_model=self.config.main_model if main_model is None else main_model,
-            subagent_model=self.config.subagent_model if subagent_model is None else subagent_model,
-            auto_run=self.config.auto_run if auto_run is None else auto_run,
+        previous = self.config
+        updated = replace(
+            previous,
+            main_model=previous.main_model if main_model is None else main_model,
+            subagent_model=previous.subagent_model if subagent_model is None else subagent_model,
+            auto_run=previous.auto_run if auto_run is None else auto_run,
         )
+        try:
+            agent = self._build(updated)
+        except ProviderMissing as error:
+            self.console.print(str(error))
+            return
+        self.config = updated
+        self.agent = agent
         save_config(config_path(), self.config)
         self.session = update_session(
             self.session.id,
@@ -150,7 +164,6 @@ class Repl:
             auto_run=self.config.auto_run,
         )
         self.thread_id = self.session.id
-        self.agent = self._build()
 
     def _resume(self, argument: str) -> None:
         sessions = list_sessions(self.repo)
@@ -171,22 +184,30 @@ class Repl:
 
     def _adopt(self, session: Session) -> None:
         loaded = load_session(session.id)
-        self.session = loaded
-        self.thread_id = loaded.id
-        self.config = Config(
+        adopted = replace(
+            self.config,
             main_model=loaded.main_model,
             subagent_model=loaded.subagent_model,
             auto_run=loaded.auto_run,
         )
-        self.agent = self._build()
+        try:
+            agent = self._build(adopted)
+        except ProviderMissing as error:
+            self.console.print(str(error))
+            return
+        self.session = loaded
+        self.thread_id = loaded.id
+        self.config = adopted
+        self.agent = agent
         self.console.print(f"Resumed {loaded.id}")
 
-    def _build(self):
+    def _build(self, config: Config | None = None):
         return build_agent(
             self.repo,
-            self.config,
+            config or self.config,
             self.checkpointer,
             chat_model=self.chat_model,
+            model_factory=self.model_factory,
             backend=self.backend,
         )
 
@@ -274,7 +295,11 @@ def run_cli(args, config: Config | None = None) -> int:
     repo = Path.cwd()
     if config is None:
         config = ensure_config()
-    repl = Repl(repo, config)
+    try:
+        repl = Repl(repo, config)
+    except ProviderMissing as error:
+        print(error, file=sys.stderr)
+        return 1
     attachments = [Path(item) for item in getattr(args, "attach", [])]
     if getattr(args, "task", None):
         repl.run_turn(args.task, paths=attachments)

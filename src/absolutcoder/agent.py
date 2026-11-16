@@ -9,8 +9,9 @@ from deepagents.backends import CompositeBackend
 from langchain.agents.middleware import TodoListMiddleware
 from langgraph.graph.state import CompiledStateGraph
 
-from absolutcoder.config import Config, resolve_model
+from absolutcoder.config import Config
 from absolutcoder.git_policy import execute_needs_approval, protect_context_file
+from absolutcoder.models import ModelFactory, ProviderMissing, build_model, install_hint
 from absolutcoder.shell import GuardedShellBackend, RepoFilesystemBackend
 
 MEMORY_PATH = "/AbsolutCoder.md"
@@ -52,6 +53,7 @@ def build_agent(
     checkpointer,
     *,
     chat_model=None,
+    model_factory: ModelFactory | None = None,
     backend: GuardedShellBackend | None = None,
 ) -> CompiledStateGraph:
     """Compile one deep agent. The main model supervises a single worker.
@@ -66,8 +68,30 @@ def build_agent(
     root = Path(repo).resolve()
     protect_context_file(root)
     routed = workspace_backend(root, backend)
-    main_model = chat_model if chat_model is not None else resolve_model(config.main_model)
-    worker_model = resolve_model(config.subagent_model)
+    factory = model_factory or default_model_factory(config)
+    try:
+        return _compile(root, config, checkpointer, routed, chat_model, factory)
+    except ImportError as error:
+        hint = install_hint(error)
+        if hint is None:
+            raise
+        raise ProviderMissing(f"{error}\nInstall it with: {hint}") from error
+
+
+def default_model_factory(config: Config) -> ModelFactory:
+    """Build models from the configured provider settings."""
+
+    def factory(role: str, model_id: str):
+        return build_model(model_id, config.providers)
+
+    return factory
+
+
+def _compile(root, config, checkpointer, routed, chat_model, factory) -> CompiledStateGraph:
+    main_model = chat_model if chat_model is not None else factory("main", config.main_model)
+    worker_model = factory(
+        "general-purpose", config.agent_models.get("general-purpose", config.subagent_model)
+    )
     interrupt_on = None if config.auto_run else {"execute": _execute_interrupt()}
     kwargs = {
         "model": main_model,
