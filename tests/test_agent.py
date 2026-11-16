@@ -158,3 +158,16 @@ def test_other_factory_errors_become_provider_missing(tmp_path):
     config = Config(main_model="openai:x", subagent_model="openai:x")
     with pytest.raises(ProviderMissing, match="Could not set up openai:x: Missing credentials"):
         build_agent(tmp_path, config, None, model_factory=factory)
+
+
+def test_commit_message_sentence_reaches_main_and_shell_roles():
+    from absolutcoder.agent import COMMIT_MESSAGE_LINE, _main_system_prompt, _with_shell_line
+    from absolutcoder.subagents import builtin_agents
+
+    assert COMMIT_MESSAGE_LINE == "Write commit messages with one or more -m options; each is taken as you wrote it."
+    roles = _with_shell_line(builtin_agents(), "bash")
+    assert _main_system_prompt(roles, "bash").count(COMMIT_MESSAGE_LINE) == 1
+    for role in roles:
+        assert (COMMIT_MESSAGE_LINE in role.prompt) is ("shell" in role.groups), role.name
+    assert any("shell" in role.groups for role in roles)
+    assert any("shell" not in role.groups for role in roles)

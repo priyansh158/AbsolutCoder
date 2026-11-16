@@ -411,3 +411,79 @@ def test_commit_with_heredoc_message_still_scrubbed(tmp_path, git_repo):
     )
     assert result.exit_code == 0, result.output
     assert _git(repo, "log", "-1", "--format=%B").strip() == "feat: x\n\n    indented body"
+
+
+# --- B: stored commit messages under a POSIX shell ---------------------------
+
+
+def _staged_repo(tmp_path, git_repo):
+    repo = git_repo(tmp_path / "repo")
+    (repo / "f.txt").write_text("f\n", encoding="utf-8")
+    subprocess.run(["git", "add", "f.txt"], cwd=repo, check=True, capture_output=True)
+    return repo, GuardedShellBackend(root_dir=repo)
+
+
+@posix_only
+def test_substituted_heredoc_message_is_scrubbed(tmp_path, git_repo, monkeypatch):
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Not Ada")
+    repo, backend = _staged_repo(tmp_path, git_repo)
+    result = backend.execute(
+        "git commit -m \"$(cat <<'EOF'\nfeat: x\n\nbody line\nCo-authored-by: A <a@b.c>\nEOF\n)\""
+    )
+    assert result.exit_code == 0, result.output
+    assert _git(repo, "log", "-1", "--format=%B").strip() == "feat: x\n\nbody line"
+    assert _identity(repo) == _REPO_IDENTITY
+
+
+@posix_only
+def test_variable_in_message_is_expanded(tmp_path, git_repo):
+    repo, backend = _staged_repo(tmp_path, git_repo)
+    result = backend.execute('NAME=world; git commit -m "hello $NAME" -m "Generated-by: AbsolutCoder"')
+    assert result.exit_code == 0, result.output
+    assert _git(repo, "log", "-1", "--format=%B").strip() == "hello world"
+
+
+@posix_only
+def test_glued_message_is_stored_whole(tmp_path, git_repo):
+    repo, backend = _staged_repo(tmp_path, git_repo)
+    result = backend.execute('git commit -m"fix algorithm"')
+    assert result.exit_code == 0, result.output
+    assert _git(repo, "log", "-1", "--format=%B").strip() == "fix algorithm"
+
+
+@posix_only
+def test_am_commits_tracked_changes(tmp_path, git_repo):
+    repo, backend = _staged_repo(tmp_path, git_repo)
+    assert backend.execute('git commit -m "first"').exit_code == 0
+    (repo / "f.txt").write_text("changed\n", encoding="utf-8")
+    result = backend.execute('git commit -am "x"')
+    assert result.exit_code == 0, result.output
+    assert _git(repo, "log", "-1", "--format=%B").strip() == "x"
+    assert _git(repo, "show", "HEAD:f.txt") == "changed\n"
+    assert _identity(repo) == _REPO_IDENTITY
+
+
+@posix_only
+def test_attribution_trailer_option_is_dropped(tmp_path, git_repo):
+    repo, backend = _staged_repo(tmp_path, git_repo)
+    result = backend.execute(
+        'git commit -m "x" --trailer "Co-authored-by: A <a@b.c>" --trailer "Reviewed-by: B <b@c.d>"'
+    )
+    assert result.exit_code == 0, result.output
+    body = _git(repo, "log", "-1", "--format=%B")
+    assert "Co-authored-by" not in body
+    assert "Reviewed-by: B <b@c.d>" in body
+
+
+@posix_only
+def test_merge_message_is_scrubbed(tmp_path, git_repo):
+    repo, backend = _staged_repo(tmp_path, git_repo)
+    assert backend.execute('git commit -m "base"').exit_code == 0
+    assert backend.execute("git switch -c side").exit_code == 0
+    (repo / "g.txt").write_text("g\n", encoding="utf-8")
+    assert backend.execute('git add g.txt && git commit -m "side work"').exit_code == 0
+    assert backend.execute("git switch -").exit_code == 0
+    result = backend.execute('git merge --no-ff -m "merge\n\nGenerated-by: tool" side')
+    assert result.exit_code == 0, result.output
+    assert _git(repo, "log", "-1", "--format=%B").strip() == "merge"
+    assert _identity(repo) == _REPO_IDENTITY

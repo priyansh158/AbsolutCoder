@@ -734,17 +734,33 @@ def prepare_commit_segment(segment: str, repo: Path, kind: str = "cmd") -> tuple
     is not known before the script runs.
     """
 
-    if git_subcommand(segment) != "commit":
+    subcommand = git_subcommand(segment)
+    # git revert and git cherry-pick are never rewritten: their -m is the
+    # mainline parent number, not a message, and they keep the original message.
+    if subcommand not in {"commit", "merge"}:
         return segment, None
     posix = kind != "cmd"
-    tokens = [token for token in _tokens(segment) if not _is_identity_assignment(token)]
-    messages: list[str] = []
+    words = [(value, raw) for value, raw in _words(segment) if not _is_identity_assignment(value)]
+    tokens = [value for value, _raw in words]
+    value_options = _SHORT_VALUE_OPTIONS[subcommand]
+    # (text, the word as written) for each -m / --message value.
+    messages: list[tuple[str, str]] = []
     kept: list[str] = []
     message_source: str | None = None
     stdin_redirects: list[str] = []
     index = 0
     while index < len(tokens):
         token = tokens[index]
+        if token == "--trailer":
+            if index + 1 < len(tokens) and not _is_attribution(tokens[index + 1]):
+                kept.extend(tokens[index : index + 2])
+            index += 2
+            continue
+        if token.startswith("--trailer="):
+            if not _is_attribution(token.split("=", 1)[1]):
+                kept.append(token)
+            index += 1
+            continue
         if posix and token in {"-F", "--file"} and index + 1 < len(tokens):
             message_source = tokens[index + 1]
             index += 2
@@ -770,31 +786,46 @@ def prepare_commit_segment(segment: str, repo: Path, kind: str = "cmd") -> tuple
         if token.startswith("--author="):
             index += 1
             continue
-        if token in {"-m", "--message"}:
-            index += 1
-            if index < len(tokens):
-                messages.append(tokens[index])
-            index += 1
+        if token == "--message":
+            if index + 1 < len(words):
+                messages.append(words[index + 1])
+            index += 2
             continue
         if token.startswith("--message="):
-            messages.append(token.split("=", 1)[1])
+            raw = words[index][1]
+            text = token.split("=", 1)[1]
+            messages.append((text, raw[len("--message="):] if raw.startswith("--message=") else shlex.quote(text)))
             index += 1
             continue
-        if token.startswith("-") and not token.startswith("--") and token.endswith("m") and len(token) > 2:
-            prefix = token[1:-1]
-            index += 1
-            if index < len(tokens):
-                messages.append(tokens[index])
-            if prefix:
-                kept.append("-" + prefix)
-            index += 1
+        cluster = _message_cluster(token, value_options)
+        if cluster is not None:
+            flags, glued = cluster
+            if flags:
+                kept.append("-" + flags)
+            if glued:
+                raw = words[index][1]
+                head = token[: len(flags) + 2]
+                messages.append((glued, raw[len(head):] if raw.startswith(head) else shlex.quote(glued)))
+                index += 1
+            else:
+                if index + 1 < len(words):
+                    messages.append(words[index + 1])
+                index += 2
             continue
         kept.append(token)
         index += 1
     if posix:
         kept = _without_identity_env(kept)
+    if messages and posix and any(_expands_at_run_time(raw) for _text, raw in messages):
+        # The shell produces the message at run time; filter it like -F -.
+        producer = "printf '%s\\n\\n' " + " ".join(raw for _text, raw in messages)
+        if stdin_redirects:
+            # printf ignores stdin; a here-document operator must stay so its body is not run.
+            producer += " " + render_command(stdin_redirects, kind)
+        scrubber = render_command(["grep", "-Eiv", _SCRUB_PATTERN], kind)
+        return f"{producer} | {scrubber} | {render_command([*kept, '-F', '-'], kind)}", None
     if messages:
-        path = _write_message(repo, scrub_commit_message("\n\n".join(messages)))
+        path = _write_message(repo, scrub_commit_message("\n\n".join(text for text, _raw in messages)))
         kept.extend(["-F", str(path)])
         kept.extend(stdin_redirects)
         return render_command(kept, kind), path
@@ -803,6 +834,88 @@ def prepare_commit_segment(segment: str, repo: Path, kind: str = "cmd") -> tuple
     source = stdin_redirects if message_source == "-" else ["<", message_source]
     scrubber = render_command(["grep", "-Eiv", _SCRUB_PATTERN, *source], kind)
     return scrubber + " | " + render_command([*kept, "-F", "-"], kind), None
+
+
+# Short options that take a value, so an "m" after them in a cluster is that value.
+_SHORT_VALUE_OPTIONS = {"commit": frozenset("FCctS"), "merge": frozenset("sXFS")}
+_NAME_EXPANSION = re.compile(r"\$[A-Za-z_{]")
+
+
+def _message_cluster(token: str, value_options: frozenset[str]) -> tuple[str, str] | None:
+    """``(flags before m, glued message)`` for a short-option cluster that carries ``-m``.
+
+    ``-am`` is flags ``a`` and ``m`` (the message is the next word, so the
+    glued part is empty); ``-mfoo`` is ``m`` with the message ``foo``;
+    ``-amfoo`` is ``a`` and ``m`` with ``foo``.
+    """
+
+    if not token.startswith("-") or token.startswith("--"):
+        return None
+    for position in range(1, len(token)):
+        char = token[position]
+        if char == "m":
+            return token[1:position], token[position + 1 :]
+        if char in value_options or not char.isalpha():
+            return None
+    return None
+
+
+def _is_attribution(line: str) -> bool:
+    return bool(_TRAILER.match(line) or _ATTRIBUTION.search(line))
+
+
+def _expands_at_run_time(raw: str) -> bool:
+    """True when the word as written has ``$(``, a backtick or ``$NAME`` outside single quotes."""
+
+    quote = ""
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if quote == "'":
+            if char == "'":
+                quote = ""
+        elif char == "\\":
+            index += 2
+            continue
+        elif char == "'" and not quote:
+            quote = "'"
+        elif char == '"':
+            quote = "" if quote else '"'
+        elif char == "`" or raw.startswith("$(", index) or _NAME_EXPANSION.match(raw, index):
+            return True
+        index += 1
+    return False
+
+
+def _words(segment: str) -> list[tuple[str, str]]:
+    """``(value, word as written)`` for each shell word of ``segment``."""
+
+    scanner = _ShellScanner(segment)
+    found: list[tuple[str, str]] = []
+    start = None
+    index = 0
+    while index < len(segment):
+        char = segment[index]
+        if char in " \t\n":
+            if start is not None:
+                found.append(segment[start:index])
+                start = None
+            index += 1
+            continue
+        if start is None:
+            start = index
+        if char == "'":
+            end = segment.find("'", index + 1)
+            index = len(segment) if end == -1 else end + 1
+        elif char == '"':
+            index = scanner._skip_double(index)
+        elif char in "\\$`":
+            index = scanner._skip_expansion(index)
+        else:
+            index += 1
+    if start is not None:
+        found.append(segment[start:])
+    return [(" ".join(_tokens(raw)) if raw.strip() else raw, raw) for raw in found]
 
 
 def _without_identity_env(tokens: list[str]) -> list[str]:

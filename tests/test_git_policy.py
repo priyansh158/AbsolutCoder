@@ -393,3 +393,79 @@ def test_plain_local_git_needs_no_approval(command):
 def test_add_then_commit_still_needs_approval():
     # Pinned as found before the punctuation fix: add is not a no-prompt subcommand.
     assert execute_needs_approval('git add a && git commit -m "x"') is True
+
+
+# --- B: commit rewriting -----------------------------------------------------
+
+
+def _rewrite(segment: str, tmp_path: Path, kind: str = "bash") -> tuple[str, str | None]:
+    from absolutcoder.git_policy import prepare_commit_segment
+
+    rewritten, path = prepare_commit_segment(segment, tmp_path, kind)
+    text = path.read_text(encoding="utf-8") if path is not None else None
+    if path is not None:
+        path.unlink()
+    return rewritten, text
+
+
+def test_dynamic_message_is_left_to_the_shell_and_filtered(tmp_path):
+    for segment in (
+        'git commit -m "$(cat msg.txt)"',
+        "git commit -m \"subject $VAR\"",
+        "git commit -m `cat msg.txt`",
+    ):
+        rewritten, written = _rewrite(segment, tmp_path)
+        assert written is None, segment
+        assert rewritten.startswith("printf '%s\\n\\n' "), rewritten
+        message_word = segment.split(" -m ", 1)[1]
+        assert message_word in rewritten
+        assert "| grep -Eiv " in rewritten and rewritten.endswith(" -F -")
+        assert "env -u GIT_AUTHOR_NAME" in rewritten
+    # Single quotes keep $ literal: the message is still written ahead.
+    rewritten, written = _rewrite("git commit -m '$(not run) $HOME'", tmp_path)
+    assert written == "$(not run) $HOME\n"
+    # cmd keeps writing the message ahead.
+    _rewritten, written = _rewrite('git commit -m "$(cat msg.txt)"', tmp_path, "cmd")
+    assert written == "$(cat msg.txt)\n"
+
+
+@pytest.mark.parametrize(
+    ("segment", "message", "kept"),
+    [
+        ('git commit -m"fix algorithm"', "fix algorithm", []),
+        ("git commit -mSubject", "Subject", []),
+        ('git commit -am "x"', "x", ["-a"]),
+        ('git commit -amfix', "fix", ["-a"]),
+        ('git commit -m"feat: y" -m"Co-authored-by: A <a@b.c>"', "feat: y", []),
+    ],
+)
+def test_glued_message_options(tmp_path, segment, message, kept):
+    rewritten, written = _rewrite(segment, tmp_path)
+    assert written == message + "\n"
+    words = shlex.split(rewritten)
+    for flag in kept:
+        assert flag in words
+    assert not any(word.startswith("-m") for word in words)
+
+
+def test_attribution_trailers_are_dropped_and_others_kept(tmp_path):
+    rewritten, _ = _rewrite(
+        'git commit -s -m x --trailer "Co-authored-by: A <a@b.c>" --trailer="Assisted-by: tool" '
+        '--trailer "Reviewed-by: B <b@c.d>" --trailer=Generated-by:AbsolutCoder --trailer "Note: absolutcoder"',
+        tmp_path,
+    )
+    words = shlex.split(rewritten)
+    assert "Reviewed-by: B <b@c.d>" in words
+    assert "-s" in words
+    assert not any("Co-authored-by" in w or "Assisted-by" in w or "Generated-by" in w for w in words)
+    assert not any("absolutcoder" in w.lower() for w in words)
+
+
+def test_merge_message_is_scrubbed_and_revert_left_alone(tmp_path):
+    rewritten, written = _rewrite('git merge --no-ff -m "merge\n\nGenerated-by: tool" side', tmp_path)
+    assert written == "merge\n"
+    words = shlex.split(rewritten)
+    assert "-F" in words and "side" in words and "--no-ff" in words
+    assert "env -u GIT_AUTHOR_NAME" in rewritten
+    for segment in ("git revert -m 1 HEAD", "git cherry-pick -m 1 abc"):
+        assert _rewrite(segment, tmp_path) == (segment, None)

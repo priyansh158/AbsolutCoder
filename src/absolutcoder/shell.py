@@ -39,6 +39,9 @@ _EXTENDED_PREFIX = "\\\\?\\"
 _EXTENDED_UNC_PREFIX = "\\\\?\\UNC\\"
 _GIT_MARKERS = ("cmd/git.exe", "bin/git.exe", "mingw64/bin/git.exe")
 _MENTIONS_GIT = re.compile(r"(?<![\w.-])git(?:\.exe)?(?![\w-])", re.IGNORECASE)
+# Segments the backend rewrites, and those that store a commit message.
+_REWRITTEN = frozenset({"commit", "add", "merge"})
+_MAKES_COMMIT = frozenset({"commit", "merge"})
 _LEADING_KEYWORDS = re.compile(r"^((?:(?:do|then|else|elif|if|while|until|!|\{)\s+)*)(.*)$", re.DOTALL)
 
 _REPO_LOCKS: dict[str, threading.RLock] = {}
@@ -285,7 +288,7 @@ class GuardedShellBackend(_ExtendedPathMixin, LocalShellBackend):
         segments = command_segments(command)
         chain = [(segment.operator, segment.text) for segment in segments]
         subcommands = [git_subcommand(segment) for _op, segment in chain]
-        writes_index = any(subcommand in {"commit", "add"} for subcommand in subcommands)
+        writes_index = any(subcommand in _REWRITTEN for subcommand in subcommands)
         uses_repo = any(runs_git(segment) for _op, segment in chain)
         with self.git_lock if uses_repo else nullcontext():
             if not writes_index:
@@ -321,10 +324,10 @@ class GuardedShellBackend(_ExtendedPathMixin, LocalShellBackend):
         cursor = 0
         for segment in segments:
             subcommand = git_subcommand(segment.text)
-            if subcommand not in {"commit", "add"}:
+            if subcommand not in _REWRITTEN:
                 continue
             lead, body = _LEADING_KEYWORDS.match(segment.text).groups()
-            if subcommand == "commit":
+            if subcommand in _MAKES_COMMIT:
                 rewritten, path = prepare_commit_segment(body, self.cwd, self.shell_kind)
                 if path is not None:
                     message_files.append(path)
@@ -378,7 +381,7 @@ class GuardedShellBackend(_ExtendedPathMixin, LocalShellBackend):
     ) -> ExecuteResponse:
         pieces: list[str] = []
         message_files: list[Path] = []
-        commits = [segment for segment in segments if git_subcommand(segment.text) == "commit"]
+        commits = [segment for segment in segments if git_subcommand(segment.text) in _MAKES_COMMIT]
         if commits:
             unstage_context_file(self.cwd, env)
         cursor = 0
@@ -398,7 +401,7 @@ class GuardedShellBackend(_ExtendedPathMixin, LocalShellBackend):
         command = segment
         created: Path | None = None
         subcommand = git_subcommand(segment)
-        if subcommand == "commit":
+        if subcommand in _MAKES_COMMIT:
             unstage_context_file(self.cwd, env)
             command, created = prepare_commit_segment(segment, self.cwd, "cmd")
         result = self._run(command, env, timeout)

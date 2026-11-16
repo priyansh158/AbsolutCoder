@@ -68,6 +68,7 @@ BACKGROUND_PARAGRAPH = (
     "let you look earlier; cancel_task stops one."
 )
 _TASK_TOOL_NAME = "start_task"
+COMMIT_MESSAGE_LINE = "Write commit messages with one or more -m options; each is taken as you wrote it."
 
 
 def shell_line(kind: str) -> str:
@@ -87,7 +88,7 @@ def _main_system_prompt(agents: list[AgentDef], shell_kind: str, *, background: 
 
     roster = roster_prompt(agents) + "\n" + _REPORT_GUIDANCE
     prompt = SYSTEM_PROMPT.replace(" " + _DELEGATION, "\n\n" + roster)
-    prompt = prompt.rstrip("\n") + "\n\n" + shell_line(shell_kind) + "\n\n" + UNTRUSTED_PARAGRAPH + "\n"
+    prompt = prompt.rstrip("\n") + "\n\n" + shell_line(shell_kind) + " " + COMMIT_MESSAGE_LINE + "\n\n" + UNTRUSTED_PARAGRAPH + "\n"
     if background:
         prompt += "\n" + BACKGROUND_PARAGRAPH + "\n"
     return prompt
@@ -96,7 +97,7 @@ def _main_system_prompt(agents: list[AgentDef], shell_kind: str, *, background: 
 def _with_shell_line(agents: list[AgentDef], shell_kind: str) -> list[AgentDef]:
     """Roles with the shell group get the shell sentence at the end of their prompt."""
 
-    line = shell_line(shell_kind)
+    line = shell_line(shell_kind) + " " + COMMIT_MESSAGE_LINE
     return [
         replace(d, prompt=d.prompt.rstrip("\n") + "\n\n" + line + "\n") if "shell" in d.groups else d
         for d in agents
