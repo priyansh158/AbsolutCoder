@@ -47,6 +47,8 @@ _BUILTIN_COMMANDS = frozenset(
 )
 _MAP_USAGE = "Usage: /map [build|update|on|off]"
 _MAP_OFF_HINT = "map: off (use /map on)"
+_MAP_BUILT_HINT = "map: ready (already built; /map update refreshes it)"
+_MAP_SMALL_HINT = "map: too small (/map build builds it anyway)"
 # A turn that called one of these may have changed files, so the code map is refreshed.
 _CHANGING_TOOLS = frozenset({"write_file", "edit_file", "delete", "execute"})
 _LOOP_USAGE = "Usage: /loop <N>(s|m|h) <prompt>"
@@ -113,9 +115,20 @@ class Repl:
         # rule are in it; a build already under way counts as usable.
         self._code_map_factory = code_map_factory or CodeMap
         self.code_map: CodeMap | None = None
-        earlier_map = False
         if self.config.code_map == "auto":
             self.code_map = self._new_code_map()
+        try:
+            self._start(background, warnings)
+        except BaseException:
+            if self.code_map is not None:
+                self.code_map.close()  # any failed start leaves no map work behind
+            raise
+
+    def _start(self, background: bool, warnings: list[str]) -> None:
+        """The rest of ``__init__``: tasks, the first build, then the session row."""
+
+        earlier_map = False
+        if self.code_map is not None:
             earlier_map = self.code_map.status() == "ready"
             self.code_map.ensure()
         # The manager and its tools exist before the first build so every build,
@@ -141,8 +154,6 @@ class Repl:
         if agent is None:
             if self.tasks is not None:
                 self.tasks.shutdown()
-            if self.code_map is not None:
-                self.code_map.close()
             raise ProviderMissing("\n".join(self._failures))
         self.session = create_session(
             self.repo,
@@ -156,7 +167,7 @@ class Repl:
         self.agent = agent
         self._report_roster(warnings)
         if earlier_map:
-            self._map_status("ready")
+            self._print_status_line("map: ready")
 
     # --- settings: saved vs effective ------------------------------------------
     #
@@ -421,9 +432,8 @@ class Repl:
             return  # the start_task call line already shows it
         status = "needs approval (press Enter to answer)" if record.status == "needs_approval" else record.status
         self._print_status_line(f"task {record.id} [{record.agent}] {status}")
-        code_map = self.code_map
-        if code_map is not None and record.status in {"done", "failed"}:
-            code_map.refresh()  # the task's tools are not observed: it may have changed files
+        if record.status in {"done", "failed", "cancelled"}:
+            self._refresh_map()  # the task's tools are not observed: it may have changed files
 
     def _print_status_line(self, text: str) -> None:
         """One whole line from any thread: end an open streamed line first, under the output lock."""
@@ -437,9 +447,19 @@ class Repl:
     # --- the code map -----------------------------------------------------------
 
     def _new_code_map(self) -> CodeMap:
-        return self._code_map_factory(
-            self.repo, min_files=self.config.code_map_min_files, on_status=self._map_status
+        """A code map whose status lines print only while it is the session's current map."""
+
+        made: list[CodeMap] = []
+
+        def on_status(status: str) -> None:
+            if made and self.code_map is made[0]:
+                self._map_status(status)
+
+        code_map = self._code_map_factory(
+            self.repo, min_files=self.config.code_map_min_files, on_status=on_status
         )
+        made.append(code_map)
+        return code_map
 
     def _map_status(self, status: str) -> None:
         """Print a code map status change; runs on the map's build thread, never reads input."""
@@ -451,8 +471,23 @@ class Repl:
 
     def _refresh_map_after_turn(self) -> None:
         renderer = self._renderer
-        if self.code_map is not None and renderer is not None and renderer.tools_used & _CHANGING_TOOLS:
-            self.code_map.refresh()
+        if renderer is not None and renderer.tools_used & _CHANGING_TOOLS:
+            self._refresh_map()
+
+    def _refresh_map(self) -> None:
+        """Refresh the current map; nothing it raises reaches a turn or a task event."""
+
+        code_map = self.code_map
+        if code_map is None:
+            return
+        try:
+            code_map.refresh()
+        except Exception:  # noqa: BLE001, S110 - a map refresh must never break a turn or a task
+            pass
+
+    def _map_line(self, code_map: CodeMap) -> str:
+        status = code_map.status()
+        return _MAP_SMALL_HINT if status == "too small" else f"map: {status}"
 
     def _map_command(self, argument: str) -> None:
         action = argument.lower()
@@ -465,8 +500,8 @@ class Repl:
             if self.code_map is not None:
                 self.code_map.close()
                 self.code_map = None
-            self._swap_graph()
-            self._say("map: off")
+            if self._swap_graph():
+                self._say("map: off")
             return
         if action == "on":
             self.config = replace(self.config, code_map="auto")
@@ -475,34 +510,37 @@ class Repl:
                 self.code_map = self._new_code_map()
             self.code_map.ensure()
             self._swap_graph()
-            self._say(f"map: {self.code_map.status()}")
+            self._say(self._map_line(self.code_map))
             return
         code_map = self.code_map
         if code_map is None:
             self._say(_MAP_OFF_HINT if action else "map: off")
             return
         if not action:
-            self._say(f"map: {code_map.status()}")
+            self._say(self._map_line(code_map))
         elif action == "update":
             status = code_map.status()
-            code_map.refresh()
+            self._refresh_map()
             self._say("map: updating" if status == "ready" else f"map: {status}")
         else:  # build
             before = code_map.status()
             code_map.ensure(force=True)
-            if before in {"ready", "building", "unavailable"}:
+            if before == "ready":
+                self._say(_MAP_BUILT_HINT)
+            elif before in {"building", "unavailable"}:
                 self._say(f"map: {before}")  # nothing new starts; a started build reports itself
             if before not in {"ready", "building"} and code_map.usable():
                 self._swap_graph()
 
-    def _swap_graph(self) -> None:
+    def _swap_graph(self) -> bool:
         """Build a new graph for the current settings and switch to it; keep the old one if that fails."""
 
         agent = self._try_build(self.config)
         if agent is None:
             self._say("The change is saved but not live in this session yet.")
-            return
+            return False
         self.agent = agent
+        return True
 
     def close(self) -> bool:
         """Stop the background tasks; False when the user left while some were still running.

@@ -2025,7 +2025,18 @@ def _map_main(seen: list | None = None):
     return respond
 
 
-def _map_repl(tmp_path, *, count=25, main=None, bound=None, workers=None, made=None, **config_fields):
+def _map_repl(
+    tmp_path,
+    *,
+    count=25,
+    main=None,
+    bound=None,
+    workers=None,
+    made=None,
+    map_class=CodeMap,
+    repl_kwargs=None,
+    **config_fields,
+):
     """A Repl in a folder with ``count`` code files and a code map on a fake runner."""
 
     repo = tmp_path / "repo"
@@ -2036,18 +2047,20 @@ def _map_repl(tmp_path, *, count=25, main=None, bound=None, workers=None, made=N
     made = [] if made is None else made
 
     def factory(path, **kwargs):
-        code_map = CodeMap(path, runner=runner, python="py", **kwargs)
+        code_map = map_class(path, runner=runner, python="py", **kwargs)
         made.append(code_map)
         return code_map
 
+    config_fields.setdefault("auto_run", True)
     output = io.StringIO()
     repl = Repl(
         repo,
-        Config(main_model="openai:main-test", subagent_model="openai:worker-test", auto_run=True, **config_fields),
+        Config(main_model="openai:main-test", subagent_model="openai:worker-test", **config_fields),
         chat_model=scripted_model(main or _map_main(), bound=bound),
         model_factory=role_models(workers or {}, default=_reply("ok")),
         console=Console(file=output, force_terminal=False, no_color=True, width=200),
         code_map_factory=factory,
+        **(repl_kwargs or {}),
     )
     return repl, output, runner, made
 
@@ -2278,6 +2291,212 @@ def test_map_survives_model_switch(tmp_path, monkeypatch):
         assert made == [repl.code_map]
         repl.run_turn("hello")
         assert "code_map_query" in bound[-1]
+    finally:
+        repl.close()
+
+
+class _BrokenRefresh(CodeMap):
+    def refresh(self):
+        raise RuntimeError("refresh broke")
+
+
+class _KeptCallback(CodeMap):
+    """A code map that keeps the status callback the Repl gave it."""
+
+    def __init__(self, *args, on_status=None, **kwargs):
+        super().__init__(*args, on_status=on_status, **kwargs)
+        self.callback = on_status
+
+
+def test_turn_that_fails_before_the_stream_does_not_refresh(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    repl, _output, runner, _made = _map_repl(tmp_path)
+    try:
+        assert repl.code_map.wait(10) == "ready"
+        repl.run_turn("write")
+        repl.code_map.wait(10)
+        assert runner.commands("update") == [UPDATE]
+
+        def broken(*_args, **_kwargs):
+            raise RuntimeError("no content")
+
+        monkeypatch.setattr("absolutcoder.repl.build_user_content", broken)
+        assert repl.run_turn("hello") is None
+        assert repl.last_turn_failed
+        repl.code_map.wait(10)
+        assert runner.commands("update") == [UPDATE]
+    finally:
+        repl.close()
+
+
+def test_a_raising_refresh_never_breaks_a_turn_or_a_task(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    repl, output, _runner, _made = _map_repl(
+        tmp_path, map_class=_BrokenRefresh, workers={"explore": _reply("3 files")}
+    )
+    try:
+        assert repl.code_map.wait(10) == "ready"
+        snapshot = repl.run_turn("write")
+        assert snapshot is not None
+        assert not repl.last_turn_failed
+        assert "done" in _lines(output)
+        repl._task_event(SimpleNamespace(id="t9", agent="explore", status="done"))
+        assert "task t9 [explore] done" in _lines(output)
+        repl.tasks.start("explore", "count", flags=TurnFlags())
+        assert repl.tasks.wait("t1", timeout=TIMEOUT).status == "done"
+        assert len(repl.tasks.drain_notices()) == 1
+    finally:
+        repl.close()
+
+
+def test_map_hints_for_ready_and_small_maps(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    repl, output, runner, _made = _map_repl(tmp_path)
+    try:
+        assert repl.code_map.wait(10) == "ready"
+        repl.handle_line("/map build")
+        assert _lines(output)[-1] == "map: ready (already built; /map update refreshes it)"
+        assert len(runner.commands("extract")) == 1
+    finally:
+        repl.close()
+    small, output, _runner, _made = _map_repl(tmp_path / "small", count=3)
+    try:
+        hint = "map: too small (/map build builds it anyway)"
+        small.handle_line("/map")
+        assert _lines(output)[-1] == hint
+        small.handle_line("/map off")
+        small.handle_line("/map on")
+        assert _lines(output)[-1] == hint
+    finally:
+        small.close()
+
+
+def test_status_from_a_replaced_map_is_not_printed(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    repl, output, _runner, made = _map_repl(tmp_path, map_class=_KeptCallback)
+    try:
+        assert repl.code_map.wait(10) == "ready"
+        old = repl.code_map
+        repl.handle_line("/map off")
+        before = _lines(output)
+        old.callback("ready")
+        old.callback("failed: late")
+        assert _lines(output) == before
+        repl.handle_line("/map on")
+        before = _lines(output)
+        old.callback("ready")
+        assert _lines(output) == before
+        repl.code_map.callback("failed: current")
+        assert _lines(output) == [*before, "map: failed: current"]
+        assert len(made) == 2
+    finally:
+        repl.close()
+
+
+def test_map_off_reports_a_failed_swap(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    repl, output, _runner, _made = _map_repl(tmp_path)
+    try:
+        assert repl.code_map.wait(10) == "ready"
+        repl._try_build = lambda _config: None
+        repl.handle_line("/map off")
+        assert _lines(output)[-1] == "The change is saved but not live in this session yet."
+        assert "map: off" not in _lines(output)
+        assert json.loads(config_path().read_text(encoding="utf-8"))["code_map"] == "off"
+    finally:
+        repl.close()
+
+
+def test_cancelled_background_task_refreshes_the_map(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    repl, _output, runner, _made = _map_repl(tmp_path)
+    try:
+        assert repl.code_map.wait(10) == "ready"
+        repl._task_event(SimpleNamespace(id="t1", agent="explore", status="cancelled"))
+        repl.code_map.wait(10)
+        assert runner.commands("update") == [UPDATE]
+    finally:
+        repl.close()
+
+
+def test_any_failed_start_closes_the_map(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+
+    def broken(*_args, **_kwargs):
+        raise RuntimeError("no session row")
+
+    monkeypatch.setattr("absolutcoder.repl.create_session", broken)
+    made: list = []
+    with pytest.raises(RuntimeError, match="no session row"):
+        _map_repl(tmp_path, made=made)
+    code_map = made[0]
+    assert code_map.wait(10) == "ready"
+    code_map.refresh()
+    assert code_map.wait(10) == "ready"
+    assert code_map._runner.commands("update") == []
+
+
+def test_map_switches_keep_run_only_overrides(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    prompts: list = []
+
+    def ask(prompt=""):
+        prompts.append(prompt)
+        return "n"
+
+    repl, output, _runner, _made = _map_repl(
+        tmp_path, auto_run=False, repl_kwargs={"overrides": {"auto_run": True}, "input_fn": ask}
+    )
+    try:
+        assert repl.code_map.wait(10) == "ready"
+        repl.handle_line("/map off")
+        saved = json.loads(config_path().read_text(encoding="utf-8"))
+        assert (saved["code_map"], saved["auto_run"]) == ("off", False)
+        repl.handle_line("/map on")
+        saved = json.loads(config_path().read_text(encoding="utf-8"))
+        assert (saved["code_map"], saved["auto_run"]) == ("auto", False)
+        assert repl.config.auto_run is True
+        repl.run_turn("run")
+        assert prompts == []
+        assert any(entry["command"] == "echo hi" and entry["allowed"] for entry in repl.turn_vet_log)
+    finally:
+        repl.close()
+
+
+def test_rule_and_tools_survive_other_rebuilds(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    seen: list = []
+    bound: list = []
+    repl, _output, _runner, _made = _map_repl(tmp_path, main=_map_main(seen), bound=bound)
+    try:
+        assert repl.code_map.wait(10) == "ready"
+        for line in ("/subagent openai:other-worker", "/auto on", "/resume 1"):
+            repl.handle_line(line)
+            repl.run_turn("hello")
+            assert CODE_MAP_RULE in _system_text(seen[-1]), line
+            assert all(name in bound[-1] for name in MAP_TOOL_NAMES), line
+    finally:
+        repl.close()
+
+
+def test_background_role_graph_gets_the_rule_and_tools(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    seen: list = []
+    bound: list = []
+
+    def explorer(messages):
+        seen.append(messages)
+        return AIMessage(content="found")
+
+    repl, _output, _runner, _made = _map_repl(
+        tmp_path, workers={"explore": scripted_model(explorer, bound=bound)}
+    )
+    try:
+        assert repl.code_map.wait(10) == "ready"
+        repl.tasks.start("explore", "look around", flags=TurnFlags())
+        assert repl.tasks.wait("t1", timeout=TIMEOUT).status == "done"
+        assert CODE_MAP_RULE in _system_text(seen[-1])
+        assert bound and all(name in bound[-1] for name in MAP_TOOL_NAMES)
     finally:
         repl.close()
 

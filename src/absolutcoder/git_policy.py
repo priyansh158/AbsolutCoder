@@ -18,6 +18,7 @@ from typing import NamedTuple
 
 CONTEXT_FILENAME = "AbsolutCoder.md"
 CODE_MAP_DIR = "graphify-out/"  # the code map's output folder, never committed
+_EXCLUDE_LOOKUP_TIMEOUT = 10  # seconds for ``git rev-parse --git-path``
 _NO_PROMPT_GIT = frozenset({"commit", "branch", "switch", "merge"})
 _TRAILER = re.compile(r"^\s*(co-authored-by|assisted-by|generated-by)\s*:", re.IGNORECASE)
 _ATTRIBUTION = re.compile(r"absolut\s*coder|absolutcoder", re.IGNORECASE)
@@ -172,12 +173,10 @@ def protect_context_file(repo: Path | str) -> None:
     memory = root / CONTEXT_FILENAME
     if not memory.exists():
         memory.write_text(DEFAULT_MEMORY, encoding="utf-8")
-    git_dir = root / ".git"
-    if not git_dir.is_dir():
-        return
-    info = git_dir / "info"
-    info.mkdir(parents=True, exist_ok=True)
-    exclude = info / "exclude"
+    exclude = _git_exclude_file(root)
+    if exclude is None:
+        return  # not inside a repository, or git is missing
+    exclude.parent.mkdir(parents=True, exist_ok=True)
     for entry in (CONTEXT_FILENAME, CODE_MAP_DIR):
         existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
         lines = [line.strip() for line in existing.splitlines()]
@@ -185,6 +184,28 @@ def protect_context_file(repo: Path | str) -> None:
             suffix = "" if existing.endswith("\n") or not existing else "\n"
             exclude.write_text(existing + suffix + entry + "\n", encoding="utf-8")
     unstage_context_file(root)
+
+
+def _git_exclude_file(root: Path) -> Path | None:
+    """The repository's info/exclude as git resolves it (worktrees and subfolders too), or None."""
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--git-path", "info/exclude"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=_EXCLUDE_LOOKUP_TIMEOUT,
+            stdin=subprocess.DEVNULL,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    text = (result.stdout or "").strip()
+    if result.returncode != 0 or not text:
+        return None
+    path = Path(text)
+    return path if path.is_absolute() else root / path
 
 
 def execute_needs_approval(command: str) -> bool:

@@ -121,6 +121,52 @@ def test_graphify_out_is_git_excluded(tmp_path, git_repo):
     assert checked.returncode == 0, checked.stderr
 
 
+def _ignored(folder: Path, path: str) -> bool:
+    checked = subprocess.run(["git", "check-ignore", path], cwd=folder, capture_output=True, text=True)
+    return checked.returncode == 0
+
+
+def test_exclude_works_in_a_linked_worktree(tmp_path, git_repo):
+    repo = git_repo(tmp_path / "repo")
+    (repo / "readme.txt").write_text("x\n", encoding="utf-8")
+    _git(repo, "add", "readme.txt")
+    _git(repo, "commit", "-m", "first")
+    worktree = tmp_path / "linked"
+    _git(repo, "worktree", "add", "--detach", str(worktree))
+    assert (worktree / ".git").is_file()
+    protect_context_file(worktree)
+    protect_context_file(worktree)
+    assert _ignored(worktree, "AbsolutCoder.md")
+    assert _ignored(worktree, "graphify-out/graph.json")
+    common = Path(_git(worktree, "rev-parse", "--git-common-dir").strip())
+    if not common.is_absolute():
+        common = worktree / common
+    lines = (common / "info" / "exclude").read_text(encoding="utf-8").splitlines()
+    assert lines.count("AbsolutCoder.md") == 1
+    assert lines.count("graphify-out/") == 1
+
+
+def test_exclude_works_in_a_subfolder_of_a_repository(tmp_path, git_repo):
+    repo = git_repo(tmp_path / "repo")
+    exclude = repo / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    exclude.write_text("*.log", encoding="utf-8")  # no trailing newline
+    sub = repo / "pkg" / "inner"
+    sub.mkdir(parents=True)
+    protect_context_file(sub)
+    assert _ignored(sub, "AbsolutCoder.md")
+    assert _ignored(sub, "graphify-out/graph.json")
+    assert exclude.read_text(encoding="utf-8").splitlines() == ["*.log", "AbsolutCoder.md", "graphify-out/"]
+
+
+def test_non_repository_gets_no_git_files(tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    folder = tmp_path / "plain"
+    protect_context_file(folder)
+    protect_context_file(folder)
+    assert sorted(p.name for p in folder.iterdir()) == ["AbsolutCoder.md"]
+
+
 def test_context_file_is_excluded_and_unstaged(tmp_path, git_repo):
     repo = git_repo(tmp_path / "repo")
     protect_context_file(repo)
