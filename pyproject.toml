@@ -9,6 +9,9 @@ dependencies = [
     "langgraph",
     "langgraph-checkpoint-sqlite",
     "rich",
+    "httpx",
+    "pyyaml",
+    "ddgs",
 ]
 
 [project.optional-dependencies]
