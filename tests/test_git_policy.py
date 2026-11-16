@@ -429,6 +429,17 @@ def test_dynamic_message_is_left_to_the_shell_and_filtered(tmp_path):
     assert written == "$(cat msg.txt)\n"
 
 
+def test_untracked_mode_is_not_read_as_a_message(tmp_path):
+    rewritten, written = _rewrite('git commit -unormal -m "x"', tmp_path)
+    assert written == "x\n"
+    assert "-unormal" in shlex.split(rewritten)
+    # -um is unusual: it may pass through, but the message must never be corrupted.
+    rewritten, written = _rewrite('git commit -um "x"', tmp_path)
+    assert written in {None, "x\n"}
+    if written is None:
+        assert "-um" in shlex.split(rewritten)
+
+
 @pytest.mark.parametrize(
     ("segment", "message", "kept"),
     [

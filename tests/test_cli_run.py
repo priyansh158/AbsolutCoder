@@ -78,7 +78,7 @@ def test_one_shot_exit_codes(tmp_path, monkeypatch, state, code):
 def _real_factory(made: list, **repl_kwargs):
     worker = scripted_model(lambda _m: AIMessage(content="w"))
 
-    def factory(repo_path, config, background=True):
+    def factory(repo_path, config, background=True, overrides=None):
         repl = Repl(
             repo_path,
             config,
@@ -86,6 +86,7 @@ def _real_factory(made: list, **repl_kwargs):
             model_factory=role_models({}, default=worker),
             console=Console(file=io.StringIO(), force_terminal=False, width=200),
             background=background,
+            overrides=overrides,
             **repl_kwargs,
         )
         made.append(repl)
@@ -99,8 +100,8 @@ def test_one_shot_error_line_goes_to_stderr(tmp_path, monkeypatch, capsys):
     made: list = []
     real = _real_factory(made)
 
-    def factory(repo_path, config, background=True):
-        repl = real(repo_path, config, background)
+    def factory(repo_path, config, background=True, overrides=None):
+        repl = real(repo_path, config, background, overrides)
 
         def broken(*_a, **_k):
             raise RuntimeError("stream broke")

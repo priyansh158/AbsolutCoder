@@ -1197,7 +1197,7 @@ def test_task_approval_is_asked_at_prompt_boundary(tmp_path, monkeypatch):
         repl.run_turn("start it")
         assert repl.tasks.wait("t1", timeout=TIMEOUT).status == "needs_approval"
         assert prompts == []
-        assert "task t1 [general-purpose] needs approval" in output.getvalue().splitlines()
+        assert "task t1 [general-purpose] needs approval (press Enter to answer)" in output.getvalue().splitlines()
         repl.service_tasks()
         assert prompts == ["[y/n] "]
         assert "task t1 [general-purpose] wants to run: echo hi" in output.getvalue().splitlines()
@@ -1424,7 +1424,7 @@ def test_task_event_lines_are_whole_lines(tmp_path, monkeypatch):
         task_lines = [line for line in lines if re.search(r"task t\d", line)]
         assert sum(line.endswith(" done") for line in task_lines) == 3
         for line in task_lines:
-            assert re.fullmatch(r"task t\d+ \[[^\]]+\] (running|done|failed|cancelled|needs approval)", line), line
+            assert re.fullmatch(r"task t\d+ \[[^\]]+\] (running|done|failed|cancelled|needs approval \(press Enter to answer\))", line), line
         assert "Hello" in [line.strip() for line in lines]
         assert "world" in lines
     finally:
@@ -1579,3 +1579,81 @@ def test_eof_at_task_approval_says_why(tmp_path, monkeypatch):
         assert output.getvalue().splitlines().count(_NO_TERMINAL) == 1
     finally:
         repl.close()
+
+
+def _echo_repl(repo, prompts, *, overrides=None):
+    def ask(prompt=""):
+        prompts.append(prompt)
+        return "y"
+
+    def responder(messages):
+        if "execute" not in tool_names_since_last_human(messages):
+            return tool_call("execute", {"command": "echo hi"}, f"echo-{len(messages)}")
+        return AIMessage(content="ran")
+
+    return Repl(
+        repo,
+        Config(main_model="openai:main-test", subagent_model="openai:worker-test", auto_run=False),
+        chat_model=scripted_model(responder),
+        model_factory=_worker(),
+        input_fn=ask,
+        console=_console(),
+        background=False,
+        overrides=overrides,
+    )
+
+
+def _resume_number(repo, session_id) -> int:
+    return [s.id for s in list_sessions(repo)].index(session_id) + 1
+
+
+def test_run_only_auto_is_never_persisted_and_survives_changes(tmp_path):
+    repo = _git_repo(tmp_path / "repo")
+    save_config(config_path(), Config(main_model="openai:main-test", subagent_model="openai:worker-test"))
+    before = config_path().read_text(encoding="utf-8")
+    prompts: list[str] = []
+    repl = _echo_repl(repo, prompts, overrides={"auto_run": True})
+    assert repl.config.auto_run is True
+    assert load_session(repl.session.id).auto_run is False
+    assert config_path().read_text(encoding="utf-8") == before
+    repl.handle_line("/model gpt-other")
+    assert repl.config.main_model == "openai:gpt-other"
+    assert load_session(repl.session.id).auto_run is False
+    assert json.loads(config_path().read_text(encoding="utf-8"))["auto_run"] is False
+    repl.run_turn("say hi")
+    assert prompts == []
+    assert {"command": "echo hi", "allowed": True} in repl.backend.vet_log
+    first_session = repl.session.id
+
+    asked: list[str] = []
+    plain = _echo_repl(repo, asked)
+    plain.handle_line(f"/resume {_resume_number(repo, first_session)}")
+    assert plain.session.id == first_session
+    assert plain.config.auto_run is False
+    plain.run_turn("say hi")
+    assert asked == ["[y/n] "]
+
+    quiet: list[str] = []
+    again = _echo_repl(repo, quiet, overrides={"auto_run": True})
+    again.handle_line(f"/resume {_resume_number(repo, first_session)}")
+    assert again.session.id == first_session
+    assert again.config.auto_run is True
+    again.run_turn("say hi")
+    assert quiet == []
+
+
+def test_auto_off_under_run_only_auto_is_saved_and_asks(tmp_path):
+    repo = _git_repo(tmp_path / "repo")
+    save_config(config_path(), Config(main_model="openai:main-test", subagent_model="openai:worker-test"))
+    prompts: list[str] = []
+    repl = _echo_repl(repo, prompts, overrides={"auto_run": True})
+    repl.handle_line("/auto off")
+    assert repl.config.auto_run is False
+    assert json.loads(config_path().read_text(encoding="utf-8"))["auto_run"] is False
+    repl.handle_line("/model gpt-other")
+    assert repl.config.auto_run is False
+    repl.run_turn("say hi")
+    assert prompts == ["[y/n] "]
+    repl.handle_line("/auto on")
+    assert json.loads(config_path().read_text(encoding="utf-8"))["auto_run"] is True
+    assert load_session(repl.session.id).auto_run is True

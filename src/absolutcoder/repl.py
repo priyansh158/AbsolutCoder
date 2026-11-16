@@ -6,7 +6,7 @@ import inspect
 import os
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
 
@@ -60,9 +60,12 @@ class Repl:
         console: Console | None = None,
         sleep_fn=time.sleep,
         background: bool = True,
+        overrides: Mapping[str, object] | None = None,
     ) -> None:
         self.repo = Path(repo).resolve()
-        self.config = replace(
+        # Settings for this run only (--auto, --until, --max-rounds, --until-timeout).
+        self.overrides: dict[str, object] = dict(overrides or {})
+        self.saved_config = replace(
             config,
             main_model=resolve_model(config.main_model),
             subagent_model=resolve_model(config.subagent_model),
@@ -78,8 +81,6 @@ class Repl:
         self.pending_attachments: list[Path] = []
         self.last_turn_interrupted = False
         self.last_turn_failed = False
-        # Settings given for this run only (--auto, --until-timeout): field -> the value config.json keeps.
-        self.run_only: dict[str, object] = {}
         self._no_terminal_noted = False
         self._task_stopped = False
         protect_context_file(self.repo)
@@ -120,15 +121,31 @@ class Repl:
             raise ProviderMissing("\n".join(self._failures))
         self.session = create_session(
             self.repo,
-            self.config.main_model,
-            self.config.subagent_model,
-            auto_run=self.config.auto_run,
+            self.saved_config.main_model,
+            self.saved_config.subagent_model,
+            auto_run=self.saved_config.auto_run,
         )
         if self.tasks is not None:
             self.tasks.session_id = self.session.id
         self.thread_id = self.session.id
         self.agent = agent
         self._report_roster(warnings)
+
+    # --- settings: saved vs effective ------------------------------------------
+    #
+    # saved_config is what config.json and the session rows hold. The process
+    # runs with ``config``: saved_config with the run-only overrides on top.
+
+    @property
+    def config(self) -> Config:
+        return replace(self.saved_config, **self.overrides) if self.overrides else self.saved_config
+
+    @config.setter
+    def config(self, value: Config) -> None:
+        """Store ``value`` as the saved settings; overridden fields keep their saved values."""
+
+        kept = {name: getattr(self.saved_config, name) for name in self.overrides}
+        self.saved_config = replace(value, **kept) if kept else value
 
     def _build_task_graph(self, role, backend):
         """Build a background task's graph from the settings current when it starts."""
@@ -351,7 +368,7 @@ class Repl:
 
         if record.status == "queued":
             return  # the start_task call line already shows it
-        status = "needs approval" if record.status == "needs_approval" else record.status
+        status = "needs approval (press Enter to answer)" if record.status == "needs_approval" else record.status
         with self._output:
             renderer = self._renderer
             if renderer is not None:
@@ -549,26 +566,28 @@ class Repl:
             return None
 
     def _retarget(self, *, main_model: str | None = None, subagent_model: str | None = None, auto_run: bool | None = None) -> bool:
-        previous = self.config
-        updated = replace(
+        previous = self.saved_config
+        saved = replace(
             previous,
             main_model=previous.main_model if main_model is None else main_model,
             subagent_model=previous.subagent_model if subagent_model is None else subagent_model,
             auto_run=previous.auto_run if auto_run is None else auto_run,
         )
-        agent = self._try_build(updated)
+        overrides = dict(self.overrides)
+        if auto_run is not None:
+            overrides.pop("auto_run", None)  # /auto is a real, saved choice
+        agent = self._try_build(replace(saved, **overrides))
         if agent is None:
             return False
-        self.config = updated
+        self.overrides = overrides
+        self.saved_config = saved
         self.agent = agent
-        if auto_run is not None:
-            self.run_only.pop("auto_run", None)  # /auto chose a value to keep
         self._save()
         self.session = update_session(
             self.session.id,
-            main_model=self.config.main_model,
-            subagent_model=self.config.subagent_model,
-            auto_run=self.config.auto_run,
+            main_model=saved.main_model,
+            subagent_model=saved.subagent_model,
+            auto_run=saved.auto_run,
         )
         self.thread_id = self.session.id
         return True
@@ -592,18 +611,18 @@ class Repl:
 
     def _adopt(self, session: Session) -> None:
         loaded = load_session(session.id)
-        adopted = replace(
-            self.config,
+        saved = replace(
+            self.saved_config,
             main_model=loaded.main_model,
             subagent_model=loaded.subagent_model,
             auto_run=loaded.auto_run,
         )
-        agent = self._try_build(adopted)
+        agent = self._try_build(replace(saved, **self.overrides))
         if agent is None:
             return
         self.session = loaded
         self.thread_id = loaded.id
-        self.config = adopted
+        self.saved_config = saved
         self.agent = agent
         self.console.print(f"Resumed {loaded.id}")
 
@@ -679,9 +698,9 @@ class Repl:
             self.error_console.print(_NO_TERMINAL, markup=False, highlight=False)
 
     def _save(self) -> None:
-        """Write the settings; values given for this run only are written as they were."""
+        """Write the saved settings; run-only overrides are never written."""
 
-        save_config(config_path(), replace(self.config, **self.run_only))
+        save_config(config_path(), self.saved_config)
 
     def _auto_value(self, argument: str) -> bool | None:
         lowered = argument.lower()
@@ -715,33 +734,29 @@ def run_cli(args, config: Config | None = None, *, repl_factory=Repl) -> int:
     repo = Path.cwd()
     if config is None:
         config = ensure_config()
-    run_only: dict[str, object] = {}
+    overrides: dict[str, object] = {}
     if getattr(args, "auto", False):
-        run_only["auto_run"] = config.auto_run
-        config = replace(config, auto_run=True)
+        overrides["auto_run"] = True
     until_timeout = getattr(args, "until_timeout", None)
     if until_timeout is not None:
-        run_only["verify_timeout"] = config.verify_timeout
-        config = replace(config, verify_timeout=until_timeout)
+        overrides["verify_timeout"] = until_timeout
     task = getattr(args, "task", None)
     if task:
         until = getattr(args, "until", None)
         max_rounds = getattr(args, "max_rounds", None)
         if until is not None:
-            config = replace(config, verify_command=until)
+            overrides["verify_command"] = until
         if max_rounds is not None:
-            config = replace(config, max_rounds=max_rounds)
+            overrides["max_rounds"] = max_rounds
     try:
         # A one-shot run ends with its turn, so it gets no background tasks.
-        repl = _make_repl(repl_factory, repo, config, background=not task)
+        repl = _make_repl(repl_factory, repo, config, overrides, background=not task)
     except ProviderMissing as error:
         print(error, file=sys.stderr)
         return 1
     except ShellNotFound as error:
         print(f"Config error: shell: {error}", file=sys.stderr)
         return 1
-    if run_only and isinstance(getattr(repl, "run_only", None), dict):
-        repl.run_only.update(run_only)
     if task and hasattr(repl, "error_console"):
         repl.error_console = Console(stderr=True)
     attachments = [Path(item) for item in getattr(args, "attach", [])]
@@ -782,18 +797,27 @@ def _one_shot_code(repl, outcome: VerifyOutcome | None) -> int:
     return 1 if getattr(repl, "last_turn_failed", False) else 0
 
 
-def _make_repl(repl_factory, repo: Path, config: Config, *, background: bool):
-    """Call the factory, passing ``background`` when it takes that keyword."""
+def _make_repl(repl_factory, repo: Path, config: Config, overrides: dict[str, object], *, background: bool):
+    """Call the factory with the saved ``config`` and the run-only ``overrides``.
 
-    # The signature is inspected only so test fakes without that keyword still work.
+    A factory that does not take ``overrides`` gets the effective config instead.
+    """
+
+    # The signature is inspected only so test fakes without these keywords still work.
     try:
-        parameters = inspect.signature(repl_factory).parameters.values()
+        parameters = list(inspect.signature(repl_factory).parameters.values())
     except (TypeError, ValueError):
-        parameters = ()
-    accepts = any(p.name == "background" or p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters)
-    if accepts:
-        return repl_factory(repo, config, background=background)
-    return repl_factory(repo, config)
+        parameters = []
+    any_keyword = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters)
+    names = {p.name for p in parameters}
+    kwargs: dict = {}
+    if any_keyword or "background" in names:
+        kwargs["background"] = background
+    if any_keyword or "overrides" in names:
+        kwargs["overrides"] = overrides
+    elif overrides:
+        config = replace(config, **overrides)
+    return repl_factory(repo, config, **kwargs)
 
 
 def _interactive_loop(repl) -> None:

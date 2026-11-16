@@ -742,7 +742,7 @@ def prepare_commit_segment(segment: str, repo: Path, kind: str = "cmd") -> tuple
     posix = kind != "cmd"
     words = [(value, raw) for value, raw in _words(segment) if not _is_identity_assignment(value)]
     tokens = [value for value, _raw in words]
-    value_options = _SHORT_VALUE_OPTIONS[subcommand]
+    no_value_flags = _NO_VALUE_FLAGS[subcommand]
     # (text, the word as written) for each -m / --message value.
     messages: list[tuple[str, str]] = []
     kept: list[str] = []
@@ -797,7 +797,7 @@ def prepare_commit_segment(segment: str, repo: Path, kind: str = "cmd") -> tuple
             messages.append((text, raw[len("--message="):] if raw.startswith("--message=") else shlex.quote(text)))
             index += 1
             continue
-        cluster = _message_cluster(token, value_options)
+        cluster = _message_cluster(token, no_value_flags)
         if cluster is not None:
             flags, glued = cluster
             if flags:
@@ -823,7 +823,7 @@ def prepare_commit_segment(segment: str, repo: Path, kind: str = "cmd") -> tuple
             # printf ignores stdin; a here-document operator must stay so its body is not run.
             producer += " " + render_command(stdin_redirects, kind)
         scrubber = render_command(["grep", "-Eiv", _SCRUB_PATTERN], kind)
-        return f"{producer} | {scrubber} | {render_command([*kept, '-F', '-'], kind)}", None
+        return _run_time_message(f"{producer} | {scrubber}", kept, subcommand, kind), None
     if messages:
         path = _write_message(repo, scrub_commit_message("\n\n".join(text for text, _raw in messages)))
         kept.extend(["-F", str(path)])
@@ -833,20 +833,40 @@ def prepare_commit_segment(segment: str, repo: Path, kind: str = "cmd") -> tuple
         return render_command(kept + stdin_redirects, kind), None
     source = stdin_redirects if message_source == "-" else ["<", message_source]
     scrubber = render_command(["grep", "-Eiv", _SCRUB_PATTERN, *source], kind)
-    return scrubber + " | " + render_command([*kept, "-F", "-"], kind), None
+    return _run_time_message(scrubber, kept, subcommand, kind), None
 
 
-# Short options that take a value, so an "m" after them in a cluster is that value.
-_SHORT_VALUE_OPTIONS = {"commit": frozenset("FCctS"), "merge": frozenset("sXFS")}
+def _run_time_message(filtered: str, kept: list[str], subcommand: str, kind: str) -> str:
+    """Feed the filtered message produced by ``filtered`` to the commit or merge in ``kept``.
+
+    git commit reads ``-F -`` from stdin. git merge reads ``-F`` only by file
+    name, so its message goes through a temporary file that is removed
+    afterwards; the merge's exit status is kept.
+    """
+
+    if subcommand != "merge":
+        return f"{filtered} | {render_command([*kept, '-F', '-'], kind)}"
+    merge = render_command(kept, kind) + ' -F "$__ac_msg"'
+    return (
+        f'__ac_msg=$(mktemp) && {{ {filtered} > "$__ac_msg"; {merge}; '
+        '__ac_rc=$?; rm -f "$__ac_msg"; (exit $__ac_rc); }'
+    )
+
+
+# Short options that take no value. Only these may come before the "m" of a
+# message cluster: any other letter takes a value (some, like -u, glued and
+# optional), so the rest of the word is that value and is passed through.
+_NO_VALUE_FLAGS = {"commit": frozenset("asnvqeiopz"), "merge": frozenset("nveq")}
 _NAME_EXPANSION = re.compile(r"\$[A-Za-z_{]")
 
 
-def _message_cluster(token: str, value_options: frozenset[str]) -> tuple[str, str] | None:
+def _message_cluster(token: str, no_value_flags: frozenset[str]) -> tuple[str, str] | None:
     """``(flags before m, glued message)`` for a short-option cluster that carries ``-m``.
 
     ``-am`` is flags ``a`` and ``m`` (the message is the next word, so the
     glued part is empty); ``-mfoo`` is ``m`` with the message ``foo``;
-    ``-amfoo`` is ``a`` and ``m`` with ``foo``.
+    ``-amfoo`` is ``a`` and ``m`` with ``foo``. ``-unormal`` is not a
+    message cluster: ``u`` takes the glued value ``normal``.
     """
 
     if not token.startswith("-") or token.startswith("--"):
@@ -855,7 +875,7 @@ def _message_cluster(token: str, value_options: frozenset[str]) -> tuple[str, st
         char = token[position]
         if char == "m":
             return token[1:position], token[position + 1 :]
-        if char in value_options or not char.isalpha():
+        if char not in no_value_flags:
             return None
     return None
 

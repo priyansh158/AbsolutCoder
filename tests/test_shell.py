@@ -487,3 +487,52 @@ def test_merge_message_is_scrubbed(tmp_path, git_repo):
     assert result.exit_code == 0, result.output
     assert _git(repo, "log", "-1", "--format=%B").strip() == "merge"
     assert _identity(repo) == _REPO_IDENTITY
+
+
+def _side_branch(tmp_path, git_repo, *, conflict=False):
+    repo, backend = _staged_repo(tmp_path, git_repo)
+    assert backend.execute('git commit -m "base"').exit_code == 0
+    assert backend.execute("git switch -c side").exit_code == 0
+    (repo / "f.txt").write_text("side\n", encoding="utf-8")
+    assert backend.execute('git commit -am "side work"').exit_code == 0
+    assert backend.execute("git switch -").exit_code == 0
+    if conflict:
+        (repo / "f.txt").write_text("main\n", encoding="utf-8")
+        assert backend.execute('git commit -am "main work"').exit_code == 0
+    return repo, backend
+
+
+def _untracked(repo):
+    return _git(repo, "status", "--porcelain", "--untracked-files=all").splitlines()
+
+
+@posix_only
+def test_merge_with_run_time_message_is_scrubbed(tmp_path, git_repo):
+    repo, backend = _side_branch(tmp_path, git_repo)
+    result = backend.execute('B=side; git merge --no-ff -m "Merge $B" -m "Generated-by: tool" side')
+    assert result.exit_code == 0, result.output
+    assert _git(repo, "log", "-1", "--format=%B").strip() == "Merge side"
+    assert _git(repo, "rev-list", "--parents", "-1", "HEAD").count(" ") == 2
+    assert _identity(repo) == _REPO_IDENTITY
+
+
+@posix_only
+def test_merge_with_message_file_is_scrubbed(tmp_path, git_repo):
+    repo, backend = _side_branch(tmp_path, git_repo)
+    (tmp_path / "msg.txt").write_text(
+        "Merge the side work\n\nBody line.\nCo-authored-by: A <a@b.c>\n", encoding="utf-8"
+    )
+    result = backend.execute("git merge --no-ff -F ../msg.txt side")
+    assert result.exit_code == 0, result.output
+    assert _git(repo, "log", "-1", "--format=%B").strip() == "Merge the side work\n\nBody line."
+
+
+@posix_only
+def test_failing_merge_keeps_its_exit_code_and_leaves_no_file(tmp_path, git_repo):
+    repo, backend = _side_branch(tmp_path, git_repo, conflict=True)
+    result = backend.execute('B=side; git merge --no-ff -m "Merge $B" side && echo merged')
+    assert result.exit_code != 0, result.output
+    assert "merged" not in result.output
+    leftovers = [line for line in _untracked(repo) if line.startswith("??")]
+    assert leftovers == []
+    assert not list((repo / ".git").glob("absolut-commit-*"))
