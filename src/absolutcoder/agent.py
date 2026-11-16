@@ -17,22 +17,27 @@ from absolutcoder.config import Config
 from absolutcoder.git_policy import execute_needs_approval, protect_context_file
 from absolutcoder.models import ModelFactory, build_model, construct_model, provider_error
 from absolutcoder.shell import GuardedShellBackend, RepoFilesystemBackend
+from absolutcoder.skills import GLOBAL_ROUTE, PROJECT_SOURCE, global_skills_dir, skill_sources
 from absolutcoder.subagents import (  # noqa: F401 - SECRET_PATHS is re-exported
     CHECKS_SENTENCE,
     SECRET_PATHS,
     AgentDef,
     build_specs,
     builtin_agents,
+    global_skills_permissions,
     role_middleware,
     role_model_id,
     role_permissions,
+    role_skill_sources,
     roster_prompt,
     secret_permissions,
+    skill_text,
     web_runnable,
+    with_skill_text,
 )
 
 MEMORY_PATH = "/AbsolutCoder.md"
-SKILLS_SOURCE = "/.absolutcoder/skills/"
+SKILLS_SOURCE = PROJECT_SOURCE
 
 _DELEGATION = (
     "Delegate investigation and multi-step edits to the general-purpose worker with the task "
@@ -80,10 +85,13 @@ def shell_line(kind: str) -> str:
     )
 
 
-def _main_system_prompt(agents: list[AgentDef], shell_kind: str, *, background: bool = False) -> str:
+def _main_system_prompt(
+    agents: list[AgentDef], shell_kind: str, *, background: bool = False, skills: str = ""
+) -> str:
     """SYSTEM_PROMPT with its delegation sentence replaced by the roster.
 
     ``background`` adds the paragraph on background tasks (the task tools are given).
+    ``skills`` (the skill-folders note and always-on rules) is appended last.
     """
 
     roster = roster_prompt(agents) + "\n" + _REPORT_GUIDANCE
@@ -91,6 +99,8 @@ def _main_system_prompt(agents: list[AgentDef], shell_kind: str, *, background: 
     prompt = prompt.rstrip("\n") + "\n\n" + shell_line(shell_kind) + " " + COMMIT_MESSAGE_LINE + "\n\n" + UNTRUSTED_PARAGRAPH + "\n"
     if background:
         prompt += "\n" + BACKGROUND_PARAGRAPH + "\n"
+    if skills:
+        prompt += "\n" + skills + "\n"
     return prompt
 
 
@@ -139,7 +149,10 @@ def build_agent(
         "model": main_model,
         "name": "main",
         "system_prompt": _main_system_prompt(
-            roster, shell_kind, background=any(t.name == _TASK_TOOL_NAME for t in extra_tools)
+            roster,
+            shell_kind,
+            background=any(t.name == _TASK_TOOL_NAME for t in extra_tools),
+            skills=skill_text(root),
         ),
         "tools": list(extra_tools),
         "middleware": [TodoListMiddleware()],
@@ -150,16 +163,18 @@ def build_agent(
             model_factory=factory,
             interrupt_on=interrupt_on,
             web_tools=web_tools,
+            repo=root,
         ),
         "memory": [MEMORY_PATH],
-        "permissions": secret_permissions(),
+        "permissions": secret_permissions() + global_skills_permissions(),
         "backend": routed,
         "checkpointer": checkpointer,
     }
     if interrupt_on is not None:
         kwargs["interrupt_on"] = interrupt_on
-    if (root / ".absolutcoder" / "skills").is_dir():
-        kwargs["skills"] = [SKILLS_SOURCE]
+    sources = skill_sources(root)
+    if sources:
+        kwargs["skills"] = sources
     try:
         return create_deep_agent(**kwargs)
     except (ImportError, ValueError) as error:
@@ -196,7 +211,7 @@ def build_role_graph(
     if "web" in role.groups:
         return web_runnable(role, model, model_id, config, web_tools, checkpointer=checkpointer)
     routed = workspace_backend(root, backend, shell_preference=config.shell)
-    definition = _with_shell_line([role], routed.default.shell_kind)[0]
+    definition = with_skill_text(_with_shell_line([role], routed.default.shell_kind)[0], root)
     permissions = role_permissions(role)
     kwargs = {
         "model": model,
@@ -204,12 +219,17 @@ def build_role_graph(
         "system_prompt": definition.prompt,
         "tools": [],
         "middleware": [*role_middleware(role, routed), _NoSubWorkers()],
-        "permissions": secret_permissions() if permissions is None else permissions,
+        "permissions": (
+            secret_permissions() + global_skills_permissions() if permissions is None else permissions
+        ),
         "backend": routed,
         "checkpointer": checkpointer,
     }
     if "shell" in role.groups and not config.auto_run:
         kwargs["interrupt_on"] = {"execute": _execute_interrupt()}
+    sources = role_skill_sources(role, root)
+    if sources:
+        kwargs["skills"] = sources
     try:
         return create_deep_agent(**kwargs)
     except (ImportError, ValueError) as error:
@@ -249,14 +269,18 @@ def workspace_backend(
     """Route repo files at ``/`` and keep command execution on the guarded shell.
 
     ``shell_preference`` (the ``shell`` setting) is used only when no shell
-    backend is passed in.
+    backend is passed in. When the global skills folder exists it is routed at
+    ``GLOBAL_ROUTE`` (the longest prefix wins, so it never shadows repo paths).
     """
 
     guarded = shell or GuardedShellBackend(
         root_dir=root, virtual_mode=True, inherit_env=True, shell=shell_preference
     )
-    filesystem = RepoFilesystemBackend(root_dir=root, virtual_mode=True)
-    return CompositeBackend(default=guarded, routes={"/": filesystem})
+    routes = {"/": RepoFilesystemBackend(root_dir=root, virtual_mode=True)}
+    global_dir = global_skills_dir()
+    if global_dir.is_dir():
+        routes[GLOBAL_ROUTE] = RepoFilesystemBackend(root_dir=global_dir, virtual_mode=True)
+    return CompositeBackend(default=guarded, routes=routes)
 
 
 def _execute_interrupt() -> dict:

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 
 from deepagents import FilesystemPermission
 from deepagents.middleware import FilesystemMiddleware
@@ -14,6 +15,7 @@ from langchain_core.tools import BaseTool
 
 from absolutcoder.config import Config
 from absolutcoder.models import ModelFactory, construct_model, provider_error
+from absolutcoder.skills import always_text, skill_paths_note, skill_sources
 from absolutcoder.webtools import make_web_tools, wrap_untrusted
 
 SECRET_PATHS = [
@@ -152,6 +154,37 @@ def secret_permissions() -> list[FilesystemPermission]:
     ]
 
 
+def global_skills_permissions() -> list[FilesystemPermission]:
+    """Deny writes under the global skills route; reading stays allowed."""
+
+    return [FilesystemPermission(operations=["write"], paths=["/.absolutcoder-global/**"], mode="deny")]
+
+
+def role_skill_sources(d: AgentDef, repo: Path | None) -> list[tuple[str, str]]:
+    """Skill sources for a role that edits files; other roles get none."""
+
+    if repo is None or "edit" not in d.groups:
+        return []
+    return skill_sources(repo)
+
+
+def with_skill_text(d: AgentDef, repo: Path | None) -> AgentDef:
+    """A role that edits files gets the skill-folders note and always-on rules in its prompt."""
+
+    if repo is None or "edit" not in d.groups:
+        return d
+    extra = skill_text(repo)
+    if not extra:
+        return d
+    return replace(d, prompt=d.prompt.rstrip("\n") + "\n\n" + extra + "\n")
+
+
+def skill_text(repo: Path) -> str:
+    """The skill-folders note and the always-on rules, each only when non-empty."""
+
+    return "\n\n".join(part for part in (skill_paths_note(repo), always_text(repo)) if part)
+
+
 def roster_prompt(defs: list[AgentDef]) -> str:
     lines = ["Workers you can start with the task tool:"]
     lines.extend(f"- {d.name}: {d.description}" for d in defs)
@@ -167,11 +200,13 @@ def build_specs(
     model_factory: ModelFactory,
     interrupt_on: dict | None,
     web_tools: Sequence[BaseTool] | None = None,
+    repo: Path | None = None,
 ) -> list[dict]:
     """Turn role definitions into deepagents subagent specs.
 
     ``interrupt_on`` is not set on declarative specs: they inherit the
     parent's, which is how ``execute`` approvals reach general-purpose.
+    With ``repo``, roles that edit files get its skills and skill text.
     """
 
     specs: list[dict] = []
@@ -182,7 +217,11 @@ def build_specs(
             runnable = web_runnable(d, model, model_id, config, web_tools)
             specs.append({"name": d.name, "description": d.description, "runnable": runnable})
         else:
-            specs.append(_declarative_spec(d, model, backend))
+            spec = _declarative_spec(with_skill_text(d, repo), model, backend)
+            sources = role_skill_sources(d, repo)
+            if sources:
+                spec["skills"] = sources
+            specs.append(spec)
     return specs
 
 
@@ -210,9 +249,11 @@ def role_permissions(d: AgentDef) -> list[FilesystemPermission] | None:
 
     if "edit" in d.groups:
         return None
-    return secret_permissions() + [
-        FilesystemPermission(operations=["write"], paths=["/**"], mode="deny")
-    ]
+    return (
+        secret_permissions()
+        + global_skills_permissions()
+        + [FilesystemPermission(operations=["write"], paths=["/**"], mode="deny")]
+    )
 
 
 def _declarative_spec(d: AgentDef, model, backend) -> dict:

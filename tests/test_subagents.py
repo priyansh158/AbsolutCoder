@@ -441,7 +441,7 @@ def test_skills_source_passed_only_when_dir_exists(tmp_path, monkeypatch):
     assert "skills" not in captured[-1]
     (tmp_path / ".absolutcoder" / "skills").mkdir(parents=True)
     build_agent(tmp_path, config, None, **kwargs)
-    assert captured[-1]["skills"] == ["/.absolutcoder/skills/"]
+    assert captured[-1]["skills"] == [("/.absolutcoder/skills/", "Project")]
 
 
 def test_skill_is_offered_to_the_main_model(tmp_path):
@@ -469,3 +469,184 @@ def test_skill_is_offered_to_the_main_model(tmp_path):
     agent.invoke({"messages": [{"role": "user", "content": "go"}]})
     assert seen[0][0].type == "system"
     assert "release-notes" in seen[0][0].text
+
+
+# --- global skills folder -------------------------------------------------------
+
+
+def _write_skill(folder, name, description, body="# Steps\nDo the thing.\n", always=None):
+    target = folder / name
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: {description}\n---\n{body}", encoding="utf-8"
+    )
+    if always is not None:
+        (target / "always.md").write_text(always, encoding="utf-8")
+    return target
+
+
+def _global_dir():
+    from absolutcoder.skills import global_skills_dir
+
+    return global_skills_dir()
+
+
+def _skill_repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    return repo
+
+
+def _scripted_calls(calls, final="done", seen=None):
+    """A responder that makes each tool call in ``calls`` in turn, then answers ``final``."""
+
+    def respond(messages):
+        if seen is not None:
+            seen.append(list(messages))
+        done = _tool_replies(messages)
+        if len(done) < len(calls):
+            name, args = calls[len(done)]
+            return tool_call(name, args, f"c{len(done)}")
+        return AIMessage(content=final)
+
+    return respond
+
+
+def _tool_replies(messages):
+    return [m for m in messages if getattr(m, "type", None) == "tool"]
+
+
+def test_global_skill_is_listed_and_readable_through_the_route(tmp_path):
+    repo = _skill_repo(tmp_path)
+    _write_skill(_global_dir(), "demo", "Global demo skill.", body="# Demo\nGLOBAL BODY TEXT\n")
+    seen: list = []
+    path = "/.absolutcoder-global/skills/demo/SKILL.md"
+    main = scripted_model(_scripted_calls([("read_file", {"file_path": path})], seen=seen))
+    messages = _invoke(repo, main, {})
+    system = seen[0][0].text
+    assert "Global Skills" in system
+    assert "demo" in system and "Global demo skill." in system
+    replies = _tool_replies(messages)
+    assert replies and replies[0].status != "error"
+    assert "GLOBAL BODY TEXT" in str(replies[0].content)
+
+
+def test_project_skill_overrides_global_of_same_name(tmp_path):
+    repo = _skill_repo(tmp_path)
+    _write_skill(_global_dir(), "demo", "Global description here.")
+    _write_skill(repo / ".absolutcoder" / "skills", "demo", "Project description here.")
+    seen: list = []
+    _invoke(repo, scripted_model(_scripted_calls([], seen=seen)), {})
+    system = seen[0][0].text
+    assert system.count("Project description here.") == 1
+    assert "Global description here." not in system
+
+
+def test_global_route_does_not_shadow_repo_folders(tmp_path):
+    repo = _skill_repo(tmp_path)
+    _write_skill(_global_dir(), "p", "Global p.", body="GLOBAL P BODY\n")
+    (repo / "skills").mkdir()
+    (repo / "skills" / "readme.txt").write_text("REPO README TEXT\n", encoding="utf-8")
+    _write_skill(repo / ".absolutcoder" / "skills", "p", "Project p.", body="PROJECT P BODY\n")
+    main = scripted_model(
+        _scripted_calls(
+            [
+                ("read_file", {"file_path": "/skills/readme.txt"}),
+                ("read_file", {"file_path": "/.absolutcoder/skills/p/SKILL.md"}),
+            ]
+        )
+    )
+    replies = _tool_replies(_invoke(repo, main, {}))
+    assert "REPO README TEXT" in str(replies[0].content)
+    assert "PROJECT P BODY" in str(replies[1].content)
+    assert "GLOBAL P BODY" not in str(replies[1].content)
+
+
+def test_global_skills_are_read_only_to_file_tools(tmp_path):
+    repo = _skill_repo(tmp_path)
+    folder = _write_skill(_global_dir(), "demo", "Global demo skill.", body="ORIGINAL\n")
+    before = (folder / "SKILL.md").read_text(encoding="utf-8")
+    attempts = [
+        ("write_file", {"file_path": "/.absolutcoder-global/skills/demo/new.md", "content": "x"}),
+        (
+            "edit_file",
+            {
+                "file_path": "/.absolutcoder-global/skills/demo/SKILL.md",
+                "old_string": "ORIGINAL",
+                "new_string": "CHANGED",
+            },
+        ),
+    ]
+    worker_seen: list = []
+    worker = scripted_model(_scripted_calls(attempts, seen=worker_seen))
+
+    def main(messages):
+        replies = _tool_replies(messages)
+        if len(replies) < len(attempts):
+            name, args = attempts[len(replies)]
+            return tool_call(name, args, f"m{len(replies)}")
+        if not _task_messages(messages):
+            return tool_calls(task_call("general-purpose", "change the skill", "t1"))
+        return AIMessage(content="done")
+
+    messages = _invoke(repo, scripted_model(main), {"general-purpose": worker})
+    main_replies = [m for m in _tool_replies(messages) if m.name in ("write_file", "edit_file")]
+    assert [m.status for m in main_replies] == ["error", "error"]
+    worker_replies = _tool_replies(worker_seen[-1])
+    assert [m.status for m in worker_replies] == ["error", "error"]
+    assert not (folder / "new.md").exists()
+    assert (folder / "SKILL.md").read_text(encoding="utf-8") == before
+
+
+def _system_texts(repo, roles):
+    """Delegate once to each role; return the system text each model received."""
+
+    seen = {role: [] for role in ["main", *roles]}
+
+    def recorder(role):
+        def respond(messages):
+            seen[role].append(list(messages))
+            return AIMessage(content=f"{role} ok")
+
+        return scripted_model(respond)
+
+    main = _delegating_main(
+        *(task_call(role, "check", f"t{i}") for i, role in enumerate(roles)), seen=seen["main"]
+    )
+    _invoke(repo, main, {role: recorder(role) for role in roles})
+    return {role: seen[role][0][0].text for role in seen}
+
+
+def test_always_text_reaches_main_and_editing_roles_only(tmp_path):
+    repo = _skill_repo(tmp_path)
+    _write_skill(_global_dir(), "demo", "Global demo skill.", always="ALWAYS RULE ONE\n")
+    texts = _system_texts(repo, ["explore", "plan", "general-purpose", "web-researcher"])
+    block = "## Always-on rules from the demo skill\nALWAYS RULE ONE"
+    assert block in texts["main"]
+    assert block in texts["general-purpose"]
+    assert "Skill folders on disk" in texts["general-purpose"]
+    for role in ("explore", "plan", "web-researcher"):
+        assert "ALWAYS RULE ONE" not in texts[role], role
+        assert "Skill folders on disk" not in texts[role], role
+
+
+def test_editing_worker_sees_skills(tmp_path):
+    repo = _skill_repo(tmp_path)
+    _write_skill(_global_dir(), "demo", "Global demo skill.")
+    texts = _system_texts(repo, ["explore", "general-purpose"])
+    assert "Global Skills" in texts["general-purpose"]
+    assert "Global demo skill." in texts["general-purpose"]
+    assert "Global demo skill." not in texts["explore"]
+    assert "Skills System" not in texts["explore"]
+
+
+def test_no_skills_means_no_route_and_no_text(tmp_path):
+    repo = _skill_repo(tmp_path)
+    assert not _global_dir().exists()
+    assert list(workspace_backend(repo).routes) == ["/"]
+    texts = _system_texts(repo, ["general-purpose"])
+    for role, text in texts.items():
+        assert "Skills System" not in text, role
+        assert "Always-on rules" not in text, role
+        assert "Skill folders on disk" not in text, role
+    assert UNTRUSTED_PARAGRAPH in texts["main"]
