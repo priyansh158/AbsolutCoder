@@ -52,7 +52,9 @@ def test_verify_timeout_defaults_and_loads(tmp_path):
     assert load_config(_write(tmp_path, verify_timeout=60)).verify_timeout == 60
 
 
-@pytest.mark.parametrize("key", ["verify_timeout", "max_rounds", "web_max_chars", "max_background_tasks"])
+@pytest.mark.parametrize(
+    "key", ["verify_timeout", "max_rounds", "web_max_chars", "max_background_tasks", "code_map_min_files"]
+)
 @pytest.mark.parametrize("value", [0, -1, "5", 2.5, True, None])
 def test_numeric_settings_must_be_positive_integers(tmp_path, key, value):
     with pytest.raises(ValueError, match=key):

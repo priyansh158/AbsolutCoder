@@ -421,6 +421,20 @@ def test_no_code_map_means_no_map_tools(tmp_path):
             assert not set(MAP_TOOL_NAMES) & bound, (code_map, role)
 
 
+def test_role_map_tools_need_the_read_group(tmp_path):
+    from absolutcoder.codemap import MAP_TOOL_NAMES, make_map_tools
+    from absolutcoder.subagents import role_map_tools
+
+    tools = make_map_tools(_fake_code_map(tmp_path, ready=True))
+    roles = {d.name: d for d in builtin_agents()}
+    assert role_map_tools(roles["web-researcher"], tools) == []
+    no_read = AgentDef("odd", "built directly", "p", ("shell",))
+    assert role_map_tools(no_read, tools) == []
+    assert tuple(t.name for t in role_map_tools(roles["explore"], tools)) == MAP_TOOL_NAMES
+    assert role_map_tools(roles["explore"], None) == []
+    assert role_map_tools(roles["explore"], []) == []
+
+
 def test_role_graph_gets_map_tools_only_for_reading_roles(tmp_path, monkeypatch):
     import absolutcoder.agent as agent_module
     from absolutcoder.agent import build_role_graph

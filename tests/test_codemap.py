@@ -2,6 +2,7 @@
 
 import importlib.util
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -63,10 +64,30 @@ def _ready_map(tmp_path, handler=None, **kwargs):
     return code_map, runner
 
 
+_LEAKY = (
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "AWS_SECRET_ACCESS_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
+    "OLLAMA_HOST",
+    "ANTHROPIC_AUTH_TOKEN",
+    "HF_TOKEN",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "AWS_SESSION_TOKEN",
+    "MY_SECRET",
+    "PYTHONSTARTUP",
+    "PYTHONINSPECT",
+)
+
+
 def test_build_command_is_code_only_and_offline(tmp_path, monkeypatch):
-    for name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY", "OPENAI_BASE_URL"):
+    for name in _LEAKY:
         monkeypatch.setenv(name, "secret-value")
-    monkeypatch.setenv("ABSOLUTCODER_KEEP_ME", "kept")
+    monkeypatch.setenv("openai_api_key", "secret-value")
+    monkeypatch.setenv("ABSOLUTCODER_DROP_ME", "dropped")
+    monkeypatch.setenv("LC_ALL", "C.UTF-8")
+    monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
     repo = _code_repo(tmp_path)
     runner = Runner(_builds_graph)
     code_map = CodeMap(repo, runner=runner, python="py")
@@ -78,15 +99,23 @@ def test_build_command_is_code_only_and_offline(tmp_path, monkeypatch):
     args, kwargs = runner.calls[0]
     assert args == ["py", "-m", "graphify", "extract", ".", "--code-only"]
     assert kwargs["cwd"] == str(repo.resolve())
-    assert kwargs.get("shell", False) is False
+    assert kwargs["shell"] is False
+    assert kwargs["stdin"] is subprocess.DEVNULL
     assert kwargs["capture_output"] is True and kwargs["text"] is True
     assert kwargs["timeout"] == 600
     env = kwargs["env"]
     assert env["GRAPHIFY_BACKEND"] == "none"
     assert env["GRAPHIFY_QUERY_LOG_DISABLE"] == "1"
-    for name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY", "OPENAI_BASE_URL"):
-        assert name not in env, name
-    assert env["ABSOLUTCODER_KEEP_ME"] == "kept"
+    assert env["PYTHONIOENCODING"] == "utf-8"
+    assert env["PYTHONUTF8"] == "1"
+    upper = {name.upper() for name in env}
+    for name in (*_LEAKY, "ABSOLUTCODER_DROP_ME"):
+        assert name not in upper, name
+    assert "PATH" in upper
+    if sys.platform == "win32":
+        assert "SYSTEMROOT" in upper
+    assert env.get("LC_ALL") == "C.UTF-8"
+    assert env.get("PYTHONDONTWRITEBYTECODE") == "1"
 
 
 def test_query_is_passed_as_one_argument(tmp_path):
@@ -96,7 +125,8 @@ def test_query_is_passed_as_one_argument(tmp_path):
     args, kwargs = runner.calls[-1]
     graph = str(code_map.graph_path)
     assert args == ["py", "-m", "graphify", "query", question, "--budget", "2000", "--graph", graph]
-    assert kwargs.get("shell", False) is False
+    assert kwargs["shell"] is False
+    assert kwargs["stdin"] is subprocess.DEVNULL
     assert kwargs["timeout"] == 60
 
     code_map.query("--graph /etc/passwd")
@@ -116,11 +146,27 @@ def test_query_is_passed_as_one_argument(tmp_path):
     assert len(runner.calls) == before
 
 
+def test_nul_characters_are_removed(tmp_path):
+    code_map, runner = _ready_map(tmp_path, lambda a, k: _done(a, stdout="answer"))
+    assert code_map.query("where\x00 is\x00 x") == "answer"
+    assert runner.calls[-1][0][4] == "where is x"
+    assert code_map.explain("\x00-\x00-name\x00") == "answer"
+    assert runner.calls[-1][0][4] == "name"
+    assert code_map.path("a\x00", "\x00b") == "answer"
+    assert runner.calls[-1][0][4:6] == ["a", "b"]
+    before = len(runner.calls)
+    assert code_map.query("\x00\x00").startswith("Error:")
+    assert len(runner.calls) == before
+
+
 def test_budget_is_clamped(tmp_path):
-    code_map, runner = _ready_map(tmp_path)
+    code_map, runner = _ready_map(tmp_path, lambda a, k: _done(a, stdout="answer"))
     for asked, used in ((10, "200"), (99999, "8000"), (1234, "1234"), (2000, "2000")):
         code_map.query("where", budget=asked)
         assert runner.calls[-1][0][5:7] == ["--budget", used], asked
+    for odd in (float("inf"), float("-inf"), float("nan"), "lots", None):
+        assert code_map.query("where", budget=odd) == "answer", odd
+        assert runner.calls[-1][0][5:7] == ["--budget", "2000"], odd
 
 
 def test_map_tools_report_not_ready_and_errors(tmp_path):
@@ -213,6 +259,64 @@ def test_ignored_folders_do_not_count(tmp_path):
     assert CodeMap(repo, runner=Runner()).status() == "missing"
 
 
+def test_file_count_is_cached(tmp_path, monkeypatch):
+    walks: list = []
+    real = codemap_module._has_enough_code
+
+    def spy(repo, min_files):
+        walks.append(repo)
+        return real(repo, min_files)
+
+    monkeypatch.setattr(codemap_module, "_has_enough_code", spy)
+    now = [1000.0]
+    runner = Runner(_builds_graph)
+    code_map = CodeMap(_code_repo(tmp_path, count=5), runner=runner, clock=lambda: now[0])
+    for _ in range(10):
+        assert code_map.status() == "too small"
+    assert len(walks) == 1
+    now[0] += 29.0
+    code_map.ensure()
+    assert code_map.status() == "too small"
+    assert len(walks) == 1 and runner.calls == []
+    now[0] += 2.0  # past 30 seconds
+    assert code_map.status() == "too small"
+    assert len(walks) == 2
+    code_map.ensure(force=True)  # ignores the cached negative
+    assert len(walks) == 3
+    assert code_map.wait(10) == "ready"
+
+    # A positive count is kept for good.
+    walks.clear()
+    enough = CodeMap(_code_repo(tmp_path / "big"), runner=Runner(), clock=lambda: now[0])
+    for _ in range(5):
+        assert enough.status() == "missing"
+        now[0] += 100.0
+    assert len(walks) == 1
+
+
+def test_thread_start_failure_is_reported(tmp_path, monkeypatch):
+    def refuse(self):
+        raise RuntimeError("can't start new thread")
+
+    seen: list[str] = []
+    runner = Runner(_builds_graph)
+    code_map = CodeMap(_code_repo(tmp_path), runner=runner, on_status=seen.append)
+    monkeypatch.setattr(threading.Thread, "start", refuse)
+    code_map.ensure()
+    assert code_map.status() == "failed: can't start new thread"
+    assert seen == ["failed: can't start new thread"]
+    assert code_map.wait(1) == "failed: can't start new thread"
+    assert runner.calls == []
+
+    ready, ready_runner = _ready_map(tmp_path / "ready")
+    ready.refresh()
+    assert ready.wait(1) == "ready"
+    monkeypatch.undo()
+    ready.refresh()  # the failed start left no refresh marked as running
+    assert ready.wait(10) == "ready"
+    assert len(ready_runner.commands("update")) == 1
+
+
 def test_build_runs_in_background_once(tmp_path):
     release = threading.Event()
     started = threading.Event()
@@ -262,6 +366,13 @@ def test_failed_build_reports_and_can_be_retried(tmp_path):
     assert status == "failed: " + ("parse error " + "z" * 300)[:200]
     assert not code_map.usable()
     assert seen == ["building", status]
+    failed = "The code map failed to build. Search and read files directly."
+    assert code_map.query("x") == failed
+    assert code_map.explain("x") == failed
+    assert code_map.path("x", "y") == failed
+    tools = {t.name: t for t in make_map_tools(code_map)}
+    assert tools["code_map_query"].invoke({"question": "x"}) == failed
+    assert len(runner.calls) == 1
 
     code_map.ensure()  # a failed build is retried only when forced
     assert code_map.wait(10) == status
