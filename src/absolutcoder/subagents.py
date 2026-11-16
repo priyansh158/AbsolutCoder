@@ -176,20 +176,43 @@ def build_specs(
 
     specs: list[dict] = []
     for d in defs:
-        model_id = d.model or config.agent_models.get(d.name) or config.subagent_model
+        model_id = role_model_id(d, config)
         model = construct_model(model_factory, d.name, model_id)
         if "web" in d.groups:
-            try:
-                specs.append(_web_spec(d, model, config, web_tools))
-            except (ImportError, ValueError) as error:
-                # create_agent resolves a string id here, not in create_deep_agent.
-                converted = provider_error(error, model_id)
-                if converted is None:
-                    raise
-                raise converted from error
+            runnable = web_runnable(d, model, model_id, config, web_tools)
+            specs.append({"name": d.name, "description": d.description, "runnable": runnable})
         else:
             specs.append(_declarative_spec(d, model, backend))
     return specs
+
+
+def role_model_id(d: AgentDef, config: Config) -> str:
+    """The model id a role runs on: its own, else its configured one, else the worker model."""
+
+    return d.model or config.agent_models.get(d.name) or config.subagent_model
+
+
+def role_middleware(d: AgentDef, backend) -> list[AgentMiddleware]:
+    """An allowlisted FilesystemMiddleware for roles without every filesystem tool.
+
+    It is named FilesystemMiddleware, so it replaces deepagents' default one.
+    It has no rules of its own; deepagents copies the permissions onto it.
+    """
+
+    allowed = [name for group in d.groups for name in TOOL_GROUPS[group]]
+    if set(allowed) == _FS_TOOLS:
+        return []
+    return [FilesystemMiddleware(backend=backend, tools=allowed)]
+
+
+def role_permissions(d: AgentDef) -> list[FilesystemPermission] | None:
+    """Secret and write denies for roles without ``edit``; ``None`` inherits the parent's."""
+
+    if "edit" in d.groups:
+        return None
+    return secret_permissions() + [
+        FilesystemPermission(operations=["write"], paths=["/**"], mode="deny")
+    ]
 
 
 def _declarative_spec(d: AgentDef, model, backend) -> dict:
@@ -200,28 +223,42 @@ def _declarative_spec(d: AgentDef, model, backend) -> dict:
         "model": model,
         "tools": [],
     }
-    allowed = [name for group in d.groups for name in TOOL_GROUPS[group]]
-    if set(allowed) != _FS_TOOLS:
-        # Named FilesystemMiddleware, so it replaces the default one. It has no
-        # rules of its own; deepagents copies the spec's permissions onto it.
-        spec["middleware"] = [FilesystemMiddleware(backend=backend, tools=allowed)]
-    if "edit" not in d.groups:
-        spec["permissions"] = secret_permissions() + [
-            FilesystemPermission(operations=["write"], paths=["/**"], mode="deny")
-        ]
+    middleware = role_middleware(d, backend)
+    if middleware:
+        spec["middleware"] = middleware
+    permissions = role_permissions(d)
+    if permissions is not None:
+        spec["permissions"] = permissions
     return spec
 
 
-def _web_spec(d: AgentDef, model, config: Config, web_tools: Sequence[BaseTool] | None) -> dict:
-    tools = list(web_tools) if web_tools is not None else make_web_tools(max_chars=config.web_max_chars)
-    runnable = create_agent(
-        model,
-        tools=tools,
-        system_prompt=d.prompt,
-        middleware=[UntrustedReportMiddleware(d.name)],
-        name=d.name,
-    )
-    return {"name": d.name, "description": d.description, "runnable": runnable}
+def web_runnable(
+    d: AgentDef,
+    model,
+    model_id: str,
+    config: Config,
+    web_tools: Sequence[BaseTool] | None,
+    *,
+    checkpointer=None,
+):
+    """A web role: only the web tools, and its final report wrapped as untrusted."""
+
+    try:
+        tools = list(web_tools) if web_tools is not None else make_web_tools(max_chars=config.web_max_chars)
+        return create_agent(
+            model,
+            tools=tools,
+            system_prompt=d.prompt,
+            middleware=[UntrustedReportMiddleware(d.name)],
+            name=d.name,
+            checkpointer=checkpointer,
+        )
+    except (ImportError, ValueError) as error:
+        # create_agent resolves a string id here, not in create_deep_agent.
+        converted = provider_error(error, model_id)
+        if converted is None:
+            raise
+        raise converted from error
 
 
 class UntrustedReportMiddleware(AgentMiddleware):

@@ -9,7 +9,7 @@ from pathlib import Path
 
 from deepagents import create_deep_agent
 from deepagents.backends import CompositeBackend
-from langchain.agents.middleware import TodoListMiddleware
+from langchain.agents.middleware import AgentMiddleware, TodoListMiddleware
 from langchain_core.tools import BaseTool
 from langgraph.graph.state import CompiledStateGraph
 
@@ -23,8 +23,12 @@ from absolutcoder.subagents import (  # noqa: F401 - SECRET_PATHS is re-exported
     AgentDef,
     build_specs,
     builtin_agents,
+    role_middleware,
+    role_model_id,
+    role_permissions,
     roster_prompt,
     secret_permissions,
+    web_runnable,
 )
 
 MEMORY_PATH = "/AbsolutCoder.md"
@@ -147,6 +151,66 @@ def build_agent(
         if converted is None:
             raise
         raise converted from error
+
+
+def build_role_graph(
+    repo: Path | str,
+    config: Config,
+    checkpointer,
+    role: AgentDef,
+    *,
+    model_factory: ModelFactory | None = None,
+    backend: GuardedShellBackend | None = None,
+    web_tools: Sequence[BaseTool] | None = None,
+) -> CompiledStateGraph:
+    """Compile one worker role as a standalone graph, for a background task.
+
+    The role is the top-level model, with the same tools and restrictions
+    ``build_specs`` gives it as a delegated worker. It has no sub-workers and
+    no ``task`` tool, and never the main loop's task-manager tools.
+    """
+
+    root = Path(repo).resolve()
+    protect_context_file(root)
+    factory = model_factory or default_model_factory(config)
+    model_id = role_model_id(role, config)
+    model = construct_model(factory, role.name, model_id)
+    if "web" in role.groups:
+        return web_runnable(role, model, model_id, config, web_tools, checkpointer=checkpointer)
+    routed = workspace_backend(root, backend, shell_preference=config.shell)
+    definition = _with_shell_line([role], routed.default.shell_kind)[0]
+    permissions = role_permissions(role)
+    kwargs = {
+        "model": model,
+        "name": role.name,
+        "system_prompt": definition.prompt,
+        "tools": [],
+        "middleware": [*role_middleware(role, routed), _NoSubWorkers()],
+        "permissions": secret_permissions() if permissions is None else permissions,
+        "backend": routed,
+        "checkpointer": checkpointer,
+    }
+    if "shell" in role.groups and not config.auto_run:
+        kwargs["interrupt_on"] = {"execute": _execute_interrupt()}
+    try:
+        return create_deep_agent(**kwargs)
+    except (ImportError, ValueError) as error:
+        converted = provider_error(error, model_id)
+        if converted is None:
+            raise
+        raise converted from error
+
+
+class _NoSubWorkers(AgentMiddleware):
+    """Takes the ``SubAgentMiddleware`` slot by name, so the graph has no ``task`` tool.
+
+    deepagents replaces a default middleware with a caller's middleware of the
+    same name; this one adds no tools and no hooks.
+    """
+
+    @property
+    def name(self) -> str:
+        return "SubAgentMiddleware"
 
 
 def default_model_factory(config: Config) -> ModelFactory:
