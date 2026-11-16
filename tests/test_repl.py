@@ -454,3 +454,42 @@ def _flatten(messages) -> str:
             continue
         parts.append(str(content))
     return "\n".join(parts)
+
+
+def _custom_files_repo(tmp_path, files):
+    repo = tmp_path / "repo"
+    folder = repo / ".absolutcoder" / "agents"
+    folder.mkdir(parents=True)
+    for name, text in files.items():
+        (folder / name).write_text(text, encoding="utf-8")
+    return repo
+
+
+def test_startup_reports_custom_roles_and_warnings(tmp_path):
+    repo = _custom_files_repo(
+        tmp_path,
+        {
+            "reviewer.md": "---\ndescription: Reviews code.\n---\nYou review.\n",
+            "broken.md": "no frontmatter here\n",
+        },
+    )
+    output = io.StringIO()
+    repl = Repl(
+        repo,
+        Config(main_model="openai:main-test", subagent_model="openai:worker-test"),
+        chat_model=scripted_model(lambda _m: AIMessage(content="ok")),
+        model_factory=_worker(),
+        console=Console(file=output, force_terminal=False, no_color=True, width=200),
+    )
+    lines = output.getvalue().splitlines()
+    assert "agents: 4 built-in, 0 home, 1 repo" in lines
+    warnings = [line for line in lines if line.startswith("agents: broken.md")]
+    assert len(warnings) == 1
+    assert sum(line.startswith("agents: ") for line in lines) == 2
+    repl.handle_line("/agents")
+    assert any(line.startswith("reviewer  [repo]  ") for line in output.getvalue().splitlines())
+
+
+def test_startup_is_silent_without_custom_roles(tmp_path):
+    repl, output = _plain_repl(tmp_path)
+    assert not any(line.startswith("agents:") for line in output.getvalue().splitlines())

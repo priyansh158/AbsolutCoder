@@ -12,6 +12,7 @@ from langgraph.types import Command
 from rich.console import Console
 
 from absolutcoder.agent import build_agent
+from absolutcoder.agent_files import load_roster
 from absolutcoder.attachments import build_user_content
 from absolutcoder.config import Config, config_path, resolve_model, save_config
 from absolutcoder.git_policy import TurnFlags, protect_context_file
@@ -25,7 +26,6 @@ from absolutcoder.sessions import (
     update_session,
 )
 from absolutcoder.shell import GuardedShellBackend
-from absolutcoder.subagents import builtin_agents
 from absolutcoder.webtools import make_web_tools
 
 _COMMANDS = "Commands: /model, /subagent, /auto, /resume, /attach, /agents, /exit"
@@ -60,7 +60,7 @@ class Repl:
         self.backend = GuardedShellBackend(root_dir=self.repo, virtual_mode=True, inherit_env=True)
         self.checkpointer = checkpoint_saver()
         self.turn_vet_log: list[dict] = []
-        self.agents = builtin_agents()
+        self.agents, warnings = load_roster(self.repo)
         # Built once and reused by every rebuild, so no rebuild leaves a client behind.
         self.web_tools = make_web_tools(max_chars=self.config.web_max_chars)
         self._failures: list[str] = []
@@ -77,6 +77,19 @@ class Repl:
         )
         self.thread_id = self.session.id
         self.agent = agent
+        self._report_roster(warnings)
+
+    def _report_roster(self, warnings: list[str]) -> None:
+        for warning in warnings:
+            self.console.print(f"agents: {warning}", markup=False)
+        counts = {source: 0 for source in ("builtin", "home", "repo")}
+        for definition in self.agents:
+            counts[definition.source] = counts.get(definition.source, 0) + 1
+        if counts["home"] or counts["repo"]:
+            self.console.print(
+                f"agents: {counts['builtin']} built-in, {counts['home']} home, {counts['repo']} repo",
+                markup=False,
+            )
 
     def loop(self) -> None:
         self.console.print(f"AbsolutCoder. {_COMMANDS}")

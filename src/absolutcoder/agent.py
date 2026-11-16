@@ -26,6 +26,7 @@ from absolutcoder.subagents import (  # noqa: F401 - SECRET_PATHS is re-exported
 )
 
 MEMORY_PATH = "/AbsolutCoder.md"
+SKILLS_SOURCE = "/.absolutcoder/skills/"
 
 _DELEGATION = (
     "Delegate investigation and multi-step edits to the general-purpose worker with the task "
@@ -111,6 +112,8 @@ def build_agent(
     }
     if interrupt_on is not None:
         kwargs["interrupt_on"] = interrupt_on
+    if (root / ".absolutcoder" / "skills").is_dir():
+        kwargs["skills"] = [SKILLS_SOURCE]
     try:
         return create_deep_agent(**kwargs)
     except (ImportError, ValueError) as error:

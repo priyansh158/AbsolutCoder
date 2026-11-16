@@ -356,3 +356,105 @@ def test_main_extra_tools_do_not_reach_workers(tmp_path):
     for role in roles:
         assert bound[role], role
         assert "dummy_lookup" not in _flat(bound[role]), role
+
+
+def _custom_repo(tmp_path, text, name="reviewer.md"):
+    repo = tmp_path / "repo"
+    folder = repo / ".absolutcoder" / "agents"
+    folder.mkdir(parents=True)
+    (folder / name).write_text(text, encoding="utf-8")
+    return repo
+
+
+def _run_custom(tmp_path, monkeypatch, text, final_reply):
+    # Repl builds its own web tools; use test doubles so no HTTP client is created.
+    monkeypatch.setattr("absolutcoder.repl.make_web_tools", lambda **_kw: _fake_web_tools())
+    repo = _custom_repo(tmp_path, text)
+    bound: list = []
+    main = _delegating_main(task_call("reviewer", "check it", "t1"))
+    reviewer = scripted_model(lambda _m: AIMessage(content=final_reply), bound=bound)
+    repl = Repl(
+        repo,
+        Config(main_model="openai:main-test", subagent_model="openai:worker-test", auto_run=True),
+        chat_model=main,
+        model_factory=role_models({"reviewer": reviewer}, default=_ok_model()),
+        console=Console(file=io.StringIO(), force_terminal=False, no_color=True, width=200),
+    )
+    snapshot = repl.run_turn("go")
+    assert snapshot is not None
+    return bound, snapshot.values["messages"]
+
+
+def test_custom_agent_is_callable_by_task(tmp_path, monkeypatch):
+    bound, messages = _run_custom(
+        tmp_path,
+        monkeypatch,
+        "---\ndescription: Reviews code.\ntools: [read, search]\n---\nYou review.\n",
+        "review findings",
+    )
+    assert _flat(bound) == {"ls", "read_file", "glob", "grep"}
+    reports = _task_messages(messages)
+    assert len(reports) == 1 and "review findings" in str(reports[0].content)
+
+
+def test_custom_web_agent_gets_only_web_tools(tmp_path, monkeypatch):
+    bound, messages = _run_custom(
+        tmp_path,
+        monkeypatch,
+        "---\ndescription: Looks things up.\ntools: [web]\n---\nYou research.\n",
+        "found it",
+    )
+    assert _flat(bound) == {"web_fetch", "web_search"}
+    content = str(_task_messages(messages)[0].content)
+    assert content.startswith('<untrusted_web_content source="reviewer">')
+    assert "found it" in content
+
+
+def test_skills_source_passed_only_when_dir_exists(tmp_path, monkeypatch):
+    import absolutcoder.agent as agent_module
+
+    captured: list[dict] = []
+
+    def recorder(**kwargs):
+        captured.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(agent_module, "create_deep_agent", recorder)
+    config = Config(main_model="openai:main-test", subagent_model="openai:worker-test")
+    kwargs = dict(
+        chat_model=_ok_model(),
+        model_factory=role_models({}, default=_ok_model()),
+        web_tools=_fake_web_tools(),
+    )
+    build_agent(tmp_path, config, None, **kwargs)
+    assert "skills" not in captured[-1]
+    (tmp_path / ".absolutcoder" / "skills").mkdir(parents=True)
+    build_agent(tmp_path, config, None, **kwargs)
+    assert captured[-1]["skills"] == ["/.absolutcoder/skills/"]
+
+
+def test_skill_is_offered_to_the_main_model(tmp_path):
+    skill = tmp_path / ".absolutcoder" / "skills" / "release-notes"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: release-notes\ndescription: Write release notes from the git log.\n---\n"
+        "# Release notes\nSteps.\n",
+        encoding="utf-8",
+    )
+    seen: list = []
+
+    def main(messages):
+        seen.append(list(messages))
+        return AIMessage(content="done")
+
+    agent = build_agent(
+        tmp_path,
+        Config(main_model="openai:main-test", subagent_model="openai:worker-test", auto_run=True),
+        None,
+        chat_model=scripted_model(main),
+        model_factory=role_models({}, default=_ok_model()),
+        web_tools=_fake_web_tools(),
+    )
+    agent.invoke({"messages": [{"role": "user", "content": "go"}]})
+    assert seen[0][0].type == "system"
+    assert "release-notes" in seen[0][0].text
