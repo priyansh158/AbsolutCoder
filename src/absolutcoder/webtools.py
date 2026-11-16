@@ -31,11 +31,14 @@ MAX_BODY_BYTES = 2_000_000
 MAX_REDIRECTS = 5
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _CLOSE_RE = re.compile(r"</untrusted_web_content", re.IGNORECASE)
+# Characters that must never appear inside the source attribute.
+_SOURCE_UNSAFE_RE = re.compile(r'[<>"\s\x00-\x1f\x7f-\x9f  ]')
+_BAD_URL_CHARS_RE = re.compile(r"[\s\x00-\x1f\x7f-\x9f]")
 
 
 def wrap_untrusted(text: str, source: str) -> str:
     text = _CLOSE_RE.sub("&lt;/untrusted_web_content", text)
-    source = source.replace('"', "%22")
+    source = _SOURCE_UNSAFE_RE.sub(lambda m: "".join(f"%{b:02X}" for b in m.group().encode()), source)
     return f'{UNTRUSTED_OPEN} source="{source}">\n{text}\n{UNTRUSTED_CLOSE}\n{UNTRUSTED_NOTE}'
 
 
@@ -63,6 +66,8 @@ def _is_public(address: str) -> bool:
 
 
 def check_url(url: str, *, resolver: Callable[[str], list[str]] | None = None) -> None:
+    if _BAD_URL_CHARS_RE.search(url):
+        raise WebToolError("URL contains whitespace or control characters")
     try:
         parts = urlsplit(url)
         host = parts.hostname
@@ -89,7 +94,7 @@ def check_url(url: str, *, resolver: Callable[[str], list[str]] | None = None) -
     else:
         try:
             addresses = (resolver or _default_resolver)(host)
-        except OSError as exc:
+        except (OSError, UnicodeError, ValueError) as exc:
             raise WebToolError(f"could not resolve host {host}: {exc}") from exc
         if not addresses:
             raise WebToolError(f"could not resolve host {host}")
@@ -212,11 +217,25 @@ def _decode(body: bytes, response: httpx.Response) -> str:
         return body.decode("utf-8", errors="replace")
 
 
+def _peer_is_public(response) -> bool | None:
+    """Whether the connected peer address is public; None when unknown."""
+    try:
+        stream = response.extensions.get("network_stream")
+        addr = stream.get_extra_info("server_addr") if stream is not None else None
+        if not addr:
+            return None
+        return _is_public(str(addr[0]))
+    except Exception:  # noqa: BLE001 - unknown, not a failure
+        return None
+
+
 def _fetch(url: str, client: httpx.Client, resolver, max_chars: int) -> str:
     current = url.strip()
     for _hop in range(MAX_REDIRECTS + 1):
         check_url(current, resolver=resolver)
         with client.stream("GET", current) as response:
+            if _peer_is_public(response) is False:
+                raise WebToolError("refusing: connection went to a non-public address")
             if response.status_code in _REDIRECT_STATUSES:
                 location = response.headers.get("location")
                 if not location:
@@ -261,14 +280,14 @@ def make_web_tools(
     max_chars: int = 20000,
 ) -> list[BaseTool]:
     http = client or httpx.Client(
-        timeout=20.0, follow_redirects=False, headers={"User-Agent": "absolutcoder/0.1"}
+        timeout=20.0, follow_redirects=False, trust_env=False, headers={"User-Agent": "absolutcoder/0.1"}
     )
     search_backend = search_fn or _default_search
 
     def web_fetch(url: str) -> str:
         try:
             return _fetch(url, http, resolver, max_chars)
-        except (WebToolError, httpx.HTTPError) as exc:
+        except Exception as exc:  # noqa: BLE001 - never raise to the model
             return f"Error: {exc}"
 
     def web_search(query: str, max_results: int = 5) -> str:
