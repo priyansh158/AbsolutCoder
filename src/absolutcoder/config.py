@@ -7,7 +7,7 @@ import os
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 
-from absolutcoder.models import ProviderSettings, normalize_model_id
+from absolutcoder.models import ProviderSettings, effective_api, normalize_model_id
 
 
 def data_dir() -> Path:
@@ -49,14 +49,19 @@ def load_config(path: Path | str) -> Config:
     """Read a config file. Model strings are returned as stored."""
 
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("config top level must be an object")
+    for key in ("providers", "agent_models"):
+        if payload.get(key) is not None and not isinstance(payload[key], dict):
+            raise ValueError(f"{key} must be an object")
     defaults = Config(main_model="", subagent_model="")
     providers: dict[str, ProviderSettings] = {}
     for name, value in (payload.get("providers") or {}).items():
         if not isinstance(value, dict):
             raise ValueError(f"providers.{name} must be an object")
-        providers[name.lower()] = ProviderSettings(
-            **{k: v for k, v in value.items() if k in _PROVIDER_FIELDS}
-        )
+        entry = ProviderSettings(**{k: v for k, v in value.items() if k in _PROVIDER_FIELDS})
+        effective_api(name.lower(), entry)
+        providers[name.lower()] = entry
     return Config(
         main_model=payload["main_model"],
         subagent_model=payload["subagent_model"],

@@ -83,3 +83,23 @@ def test_cli_reports_incomplete_config(tmp_path):
     assert "Config error" in completed.stderr
     assert "main_model" in completed.stderr
     assert "Traceback" not in completed.stderr
+
+
+def test_cli_reports_non_object_providers(tmp_path):
+    scripts, executable = _executable()
+    payload = {"main_model": "openai:a", "subagent_model": "openai:b", "providers": []}
+    (tmp_path / "config.json").write_text(json.dumps(payload), encoding="utf-8")
+    env = os.environ.copy()
+    env["PATH"] = str(scripts) + os.pathsep + env.get("PATH", "")
+    env["ABSOLUTCODER_HOME"] = str(tmp_path)
+    completed = subprocess.run(
+        [str(executable), "hello"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        stdin=subprocess.DEVNULL,
+    )
+    assert completed.returncode == 1
+    assert "Config error" in completed.stderr
+    assert "Traceback" not in completed.stderr

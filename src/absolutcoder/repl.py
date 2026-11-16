@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -14,7 +15,7 @@ from absolutcoder.agent import build_agent
 from absolutcoder.attachments import build_user_content
 from absolutcoder.config import Config, config_path, resolve_model, save_config
 from absolutcoder.git_policy import TurnFlags, protect_context_file
-from absolutcoder.models import ModelFactory, ProviderMissing
+from absolutcoder.models import ModelFactory, ProviderMissing, missing_keys
 from absolutcoder.sessions import (
     Session,
     checkpoint_saver,
@@ -44,6 +45,7 @@ class Repl:
             config,
             main_model=resolve_model(config.main_model),
             subagent_model=resolve_model(config.subagent_model),
+            agent_models={k: resolve_model(v) for k, v in config.agent_models.items()},
         )
         self.chat_model = chat_model
         self.model_factory = model_factory
@@ -53,6 +55,13 @@ class Repl:
         protect_context_file(self.repo)
         self.backend = GuardedShellBackend(root_dir=self.repo, virtual_mode=True, inherit_env=True)
         self.checkpointer = checkpoint_saver()
+        self.turn_vet_log: list[dict] = []
+        self._failures: list[str] = []
+        self._quiet = True  # the caller prints a failed start itself
+        agent = self._try_build(self.config)
+        self._quiet = False
+        if agent is None:
+            raise ProviderMissing("\n".join(self._failures))
         self.session = create_session(
             self.repo,
             self.config.main_model,
@@ -60,8 +69,7 @@ class Repl:
             auto_run=self.config.auto_run,
         )
         self.thread_id = self.session.id
-        self.turn_vet_log: list[dict] = []
-        self.agent = self._build()
+        self.agent = agent
 
     def loop(self) -> None:
         self.console.print("AbsolutCoder. Commands: /model, /subagent, /auto, /resume, /attach, /exit")
@@ -102,7 +110,7 @@ class Repl:
         except GraphBubbleUp:
             raise
         except Exception as exc:
-            self.console.print(f"Error: {exc}")
+            self.console.print(f"Error: {exc}", markup=False, highlight=False)
             return None
         finally:
             self.turn_vet_log = self.backend.vet_log[start:]
@@ -114,20 +122,24 @@ class Repl:
             if not argument:
                 self.console.print("Usage: /model <model-id>")
                 return
-            self._retarget(main_model=resolve_model(argument))
+            model_id = self._resolve_or_report(argument)
+            if model_id is not None:
+                self._retarget(main_model=model_id)
             return
         if command == "/subagent":
             if not argument:
                 self.console.print("Usage: /subagent <model-id>")
                 return
-            self._retarget(subagent_model=resolve_model(argument))
+            model_id = self._resolve_or_report(argument)
+            if model_id is not None:
+                self._retarget(subagent_model=model_id)
             return
         if command == "/auto":
             enabled = self._auto_value(argument)
             if enabled is None:
                 return
-            self._retarget(auto_run=enabled)
-            self.console.print(f"auto_run {'on' if enabled else 'off'}")
+            if self._retarget(auto_run=enabled):
+                self.console.print(f"auto_run {'on' if enabled else 'off'}")
             return
         if command == "/resume":
             self._resume(argument)
@@ -141,7 +153,40 @@ class Repl:
             return
         self.console.print("Commands: /model, /subagent, /auto, /resume, /attach, /exit")
 
-    def _retarget(self, *, main_model: str | None = None, subagent_model: str | None = None, auto_run: bool | None = None) -> None:
+    def _resolve_or_report(self, argument: str) -> str | None:
+        try:
+            return resolve_model(argument)
+        except ValueError as error:
+            self._report(f"Invalid model id: {error}")
+            return None
+
+    def _report(self, message: str) -> None:
+        self._failures.append(message)
+        if not self._quiet:
+            # soft_wrap keeps the install command on one line so it can be copied.
+            self.console.print(message, markup=False, highlight=False, soft_wrap=True)
+
+    def _try_build(self, config: Config):
+        """Check keys and build the agent; print and return None on any failure."""
+
+        self._failures = []
+        if self.model_factory is None:
+            try:
+                missing = missing_keys(config, os.environ)
+            except ValueError as error:
+                self._report(f"Invalid model id: {error}")
+                return None
+            if missing:
+                for entry in missing:
+                    self._report(f"{entry} is not set. Set it and try again.")
+                return None
+        try:
+            return self._build(config)
+        except ProviderMissing as error:
+            self._report(str(error))
+            return None
+
+    def _retarget(self, *, main_model: str | None = None, subagent_model: str | None = None, auto_run: bool | None = None) -> bool:
         previous = self.config
         updated = replace(
             previous,
@@ -149,11 +194,9 @@ class Repl:
             subagent_model=previous.subagent_model if subagent_model is None else subagent_model,
             auto_run=previous.auto_run if auto_run is None else auto_run,
         )
-        try:
-            agent = self._build(updated)
-        except ProviderMissing as error:
-            self.console.print(str(error))
-            return
+        agent = self._try_build(updated)
+        if agent is None:
+            return False
         self.config = updated
         self.agent = agent
         save_config(config_path(), self.config)
@@ -164,6 +207,7 @@ class Repl:
             auto_run=self.config.auto_run,
         )
         self.thread_id = self.session.id
+        return True
 
     def _resume(self, argument: str) -> None:
         sessions = list_sessions(self.repo)
@@ -190,10 +234,8 @@ class Repl:
             subagent_model=loaded.subagent_model,
             auto_run=loaded.auto_run,
         )
-        try:
-            agent = self._build(adopted)
-        except ProviderMissing as error:
-            self.console.print(str(error))
+        agent = self._try_build(adopted)
+        if agent is None:
             return
         self.session = loaded
         self.thread_id = loaded.id

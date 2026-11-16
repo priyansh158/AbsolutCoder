@@ -8,7 +8,12 @@ from pathlib import Path
 from langchain_core.messages import AIMessage
 from rich.console import Console
 
-from absolutcoder.config import Config
+from dataclasses import replace
+
+import pytest
+
+from absolutcoder.config import Config, config_path, save_config
+from absolutcoder.models import ProviderMissing
 from absolutcoder.repl import Repl
 from absolutcoder.sessions import create_session, list_sessions, load_session
 from tests.support import role_models, scripted_model, tool_call, tool_names_since_last_human
@@ -187,6 +192,151 @@ def test_resume_with_unavailable_provider_prints_hint(tmp_path):
     snapshot = repl.run_turn("still there?")
     assert snapshot is not None
     assert "ok" in _flatten(snapshot.values.get("messages", []))
+
+
+_ANTHROPIC_ERROR = ImportError(
+    "Initializing ChatAnthropic requires the langchain-anthropic package. "
+    "Please install it with `pip install langchain-anthropic`"
+)
+
+
+def _factory_repl(tmp_path, fail, *, auto_run=True):
+    """A Repl whose main model also comes from the factory; ``fail(model_id)`` may raise."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    models = role_models(
+        {
+            "main": scripted_model(lambda _m: AIMessage(content="ok")),
+            "general-purpose": scripted_model(lambda _m: AIMessage(content="worker")),
+        }
+    )
+
+    def factory(role, model_id):
+        fail(model_id)
+        return models(role, model_id)
+
+    output = io.StringIO()
+    config = Config(main_model="openai:main-test", subagent_model="openai:worker-test", auto_run=auto_run)
+    repl = Repl(
+        repo,
+        config,
+        model_factory=factory,
+        console=Console(file=output, force_terminal=False, no_color=True, width=100),
+    )
+    return repl, output
+
+
+def _assert_unchanged(repl, output, before, config_text):
+    text = output.getvalue()
+    assert "Traceback" not in text
+    assert repl.thread_id == before["thread_id"]
+    assert repl.session == before["session"]
+    assert repl.config == before["config"]
+    assert config_path().read_text(encoding="utf-8") == config_text
+    snapshot = repl.run_turn("still there?")
+    assert snapshot is not None
+    assert "ok" in _flatten(snapshot.values.get("messages", []))
+
+
+def _snapshot(repl):
+    save_config(config_path(), repl.config)
+    return (
+        {"thread_id": repl.thread_id, "session": repl.session, "config": repl.config},
+        config_path().read_text(encoding="utf-8"),
+    )
+
+
+def test_install_hint_keeps_its_extra_in_console(tmp_path):
+    def fail(model_id):
+        if model_id.startswith("anthropic:"):
+            raise _ANTHROPIC_ERROR
+
+    repl, output = _factory_repl(tmp_path, fail)
+    repl.handle_line("/model anthropic:x")
+    text = output.getvalue()
+    assert 'pip install "absolutcoder[anthropic]"' in text
+    assert "langchain-anthropic package" in text
+
+
+def test_model_switch_with_unknown_provider_keeps_session(tmp_path):
+    def fail(model_id):
+        if model_id.startswith("antropic:"):
+            raise ValueError("Unable to infer model provider for model='antropic:x'. Specify it.")
+
+    repl, output = _factory_repl(tmp_path, fail)
+    before, text = _snapshot(repl)
+    repl.handle_line("/model antropic:x")
+    repl.handle_line("/subagent antropic:x")
+    assert "Unknown model provider" in output.getvalue()
+    _assert_unchanged(repl, output, before, text)
+
+
+def test_model_switch_with_invalid_id_keeps_session(tmp_path):
+    repl, output = _factory_repl(tmp_path, lambda model_id: None)
+    before, text = _snapshot(repl)
+    repl.handle_line("/model a b:x")
+    repl.handle_line("/subagent a b:x")
+    assert "Invalid model id" in output.getvalue()
+    _assert_unchanged(repl, output, before, text)
+
+
+def test_resume_with_missing_key_prints_variable(tmp_path, monkeypatch):
+    repl, output = _factory_repl(tmp_path, lambda model_id: None)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    repl.model_factory = None
+    result = repl._try_build(replace(repl.config, main_model="anthropic:x"))
+    assert result is None
+    assert "ANTHROPIC_API_KEY is not set" in output.getvalue()
+
+
+def test_auto_does_not_report_success_when_rebuild_fails(tmp_path):
+    state = {"fail": False}
+
+    def fail(model_id):
+        if state["fail"]:
+            raise _ANTHROPIC_ERROR
+
+    repl, output = _factory_repl(tmp_path, fail, auto_run=False)
+    before, text = _snapshot(repl)
+    state["fail"] = True
+    repl.handle_line("/auto on")
+    assert "auto_run on" not in output.getvalue()
+    state["fail"] = False
+    _assert_unchanged(repl, output, before, text)
+
+
+def test_failed_start_leaves_no_session_row(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def factory(role, model_id):
+        raise ImportError(
+            "Initializing ChatGroq requires the langchain-groq package. "
+            "Please install it with `pip install langchain-groq`"
+        )
+
+    with pytest.raises(ProviderMissing, match="langchain-groq"):
+        Repl(
+            repo,
+            Config(main_model="groq:x", subagent_model="groq:x"),
+            model_factory=factory,
+            console=_console(),
+        )
+    assert list_sessions(repo) == []
+
+
+def test_agent_model_ids_are_normalised(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    repl = Repl(
+        repo,
+        Config(main_model="a", subagent_model="b", agent_models={"general-purpose": "c"}),
+        chat_model=scripted_model(lambda _m: AIMessage(content="ok")),
+        model_factory=_worker(),
+        console=_console(),
+    )
+    assert repl.config.agent_models == {"general-purpose": "openai:c"}
 
 
 def _flatten(messages) -> str:

@@ -32,7 +32,7 @@ class ProviderSettings:
 
     kind: str | None = None
     base_url: str | None = None
-    api: str = "responses"  # "responses" | "chat"
+    api: str | None = None  # "responses" | "chat"; None picks a default
     api_key_env: str | None = None
 
 
@@ -60,6 +60,18 @@ def provider_of(model_id: str) -> str:
     return normalize_model_id(model_id).partition(":")[0]
 
 
+def effective_api(provider: str, settings: ProviderSettings) -> str:
+    """Resolve ``responses`` or ``chat``; compatible servers default to chat."""
+
+    if settings.api is not None:
+        if settings.api not in ("responses", "chat"):
+            raise ValueError(f"providers.{provider}.api must be 'responses' or 'chat'")
+        return settings.api
+    if provider != "openai" or settings.base_url:
+        return "chat"
+    return "responses"
+
+
 def build_model(
     model_id: str, providers: Mapping[str, ProviderSettings]
 ) -> BaseChatModel | str:
@@ -70,11 +82,9 @@ def build_model(
     settings = providers.get(provider)
     if settings is None:
         return normalized
-    if settings.kind == "openai":
-        pass
-    elif provider == "openai" and (settings.base_url or settings.api == "chat"):
-        pass
-    else:
+    api = effective_api(provider, settings)
+    builds_instance = settings.kind == "openai" or (provider == "openai" and api == "chat")
+    if not builds_instance:
         return normalized
 
     from langchain.chat_models import init_chat_model
@@ -82,16 +92,14 @@ def build_model(
     extra: dict[str, str] = {}
     if settings.base_url:
         extra["base_url"] = settings.base_url
-    if settings.api_key_env:
-        value = os.environ.get(settings.api_key_env, "").strip()
+    if provider != "openai" or settings.base_url:
         # Never let ChatOpenAI fall back to OPENAI_API_KEY for a custom endpoint.
-        extra["api_key"] = value or "not-set"
-    elif not os.environ.get("OPENAI_API_KEY", "").strip():
-        extra["api_key"] = "not-needed"
+        value = os.environ.get(settings.api_key_env, "").strip() if settings.api_key_env else ""
+        extra["api_key"] = value or ("not-set" if settings.api_key_env else "not-needed")
     return init_chat_model(
         model=rest,
         model_provider="openai",
-        use_responses_api=(settings.api == "responses"),
+        use_responses_api=(api == "responses"),
         **extra,
     )
 
@@ -113,9 +121,11 @@ def missing_keys(config: Config, environ: Mapping[str, str]) -> list[str]:
     missing: list[str] = []
     for provider in seen:
         settings = config.providers.get(provider)
-        if settings is not None:
-            if settings.api_key_env and not _is_set(environ, settings.api_key_env):
+        if settings is not None and settings.api_key_env:
+            if not _is_set(environ, settings.api_key_env):
                 missing.append(settings.api_key_env)
+        elif settings is not None and settings.base_url:
+            continue
         elif provider == "openai":
             if not _is_set(environ, "OPENAI_API_KEY"):
                 missing.append("OPENAI_API_KEY")
@@ -130,13 +140,19 @@ def missing_keys(config: Config, environ: Mapping[str, str]) -> list[str]:
     return missing
 
 
+def missing_package(error: ImportError) -> str | None:
+    """Name of the package langchain says is missing, if the message names one."""
+
+    match = _PACKAGE_RE.search(str(error))
+    return None if match is None else match.group(1)
+
+
 def install_hint(error: ImportError) -> str | None:
     """Turn langchain's missing-package message into an install command."""
 
-    match = _PACKAGE_RE.search(str(error))
-    if match is None:
+    package = missing_package(error)
+    if package is None:
         return None
-    package = match.group(1)
     extra = _EXTRAS.get(package)
     if extra is not None:
         return f'pip install "absolutcoder[{extra}]"'

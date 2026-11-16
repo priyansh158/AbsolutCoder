@@ -36,7 +36,7 @@ def main(argv: list[str] | None = None) -> None:
 
     try:
         config = ensure_config()
-    except (ValueError, KeyError, TypeError, AttributeError) as error:
+    except (ValueError, KeyError) as error:
         detail = f"missing key {error.args[0]}" if isinstance(error, KeyError) else error
         print(f"Config error: {detail}", file=sys.stderr)
         raise SystemExit(1)

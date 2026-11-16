@@ -8,6 +8,7 @@ from absolutcoder.config import Config, load_config, save_config
 from absolutcoder.models import (
     ProviderSettings,
     build_model,
+    effective_api,
     install_hint,
     missing_keys,
     normalize_model_id,
@@ -133,4 +134,90 @@ def test_provider_names_are_lowercased_on_load(tmp_path):
     assert list(load_config(path).providers) == ["local"]
     path.write_text(json.dumps({**base, "providers": {"local": "x"}}))
     with pytest.raises(ValueError, match="providers.local must be an object"):
+        load_config(path)
+
+
+def test_openai_key_never_sent_to_alias_endpoint(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-real")
+    providers = {
+        "local": ProviderSettings(kind="openai", base_url="http://example.com/v1", api="chat")
+    }
+    model = build_model("local:llama3", providers)
+    assert model.openai_api_key.get_secret_value() == "not-needed"
+
+
+def test_openai_key_never_sent_to_overridden_openai_base_url(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-real")
+    providers = {"openai": ProviderSettings(base_url="http://example.com/v1")}
+    model = build_model("gpt-x", providers)
+    assert model.openai_api_key.get_secret_value() == "not-needed"
+
+
+def test_alias_defaults_to_chat_completions(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    providers = {"local": ProviderSettings(kind="openai", base_url="http://localhost:1/v1")}
+    model = build_model("local:llama3", providers)
+    assert model.use_responses_api is False
+    assert effective_api("openai", ProviderSettings()) == "responses"
+    assert effective_api("openai", ProviderSettings(base_url="http://x/v1")) == "chat"
+    assert effective_api("openai", ProviderSettings(api="chat")) == "chat"
+    with pytest.raises(ValueError, match="providers.local.api must be"):
+        effective_api("local", ProviderSettings(api="rest"))
+
+
+def test_invalid_api_value_is_a_config_error(tmp_path):
+    path = tmp_path / "config.json"
+    base = {"main_model": "openai:a", "subagent_model": "openai:b"}
+    path.write_text(json.dumps({**base, "providers": {"local": {"kind": "openai", "api": "rest"}}}))
+    with pytest.raises(ValueError, match="providers.local.api must be 'responses' or 'chat'"):
+        load_config(path)
+
+
+def test_unset_api_is_saved_as_null(tmp_path):
+    path = tmp_path / "config.json"
+    save_config(
+        path,
+        Config(main_model="local:a", subagent_model="local:a", providers={"local": ProviderSettings(kind="openai")}),
+    )
+    assert json.loads(path.read_text())["providers"]["local"]["api"] is None
+
+
+def test_provider_entry_does_not_disable_builtin_key_check():
+    config = Config(
+        main_model="openai:a",
+        subagent_model="openai:a",
+        providers={"openai": ProviderSettings(api="chat")},
+    )
+    assert missing_keys(config, {}) == ["OPENAI_API_KEY"]
+    config = Config(
+        main_model="anthropic:a",
+        subagent_model="anthropic:a",
+        providers={"anthropic": ProviderSettings()},
+    )
+    assert missing_keys(config, {}) == ["ANTHROPIC_API_KEY"]
+    config = Config(
+        main_model="openai:a",
+        subagent_model="openai:a",
+        providers={"openai": ProviderSettings(base_url="http://x/v1")},
+    )
+    assert missing_keys(config, {}) == []
+
+
+def test_missing_package_name():
+    from absolutcoder.models import missing_package
+
+    message = "Initializing ChatGroq requires the langchain-groq package."
+    assert missing_package(ImportError(message)) == "langchain-groq"
+    assert missing_package(ImportError("boom")) is None
+
+
+def test_non_object_sections_are_config_errors(tmp_path):
+    path = tmp_path / "config.json"
+    base = {"main_model": "openai:a", "subagent_model": "openai:b"}
+    for key in ("providers", "agent_models"):
+        path.write_text(json.dumps({**base, key: []}))
+        with pytest.raises(ValueError, match=f"{key} must be an object"):
+            load_config(path)
+    path.write_text("[]")
+    with pytest.raises(ValueError, match="top level"):
         load_config(path)

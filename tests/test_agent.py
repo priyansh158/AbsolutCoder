@@ -128,4 +128,28 @@ def test_missing_provider_package_becomes_hint(tmp_path):
     config = Config(main_model="groq:x", subagent_model="groq:x")
     with pytest.raises(ProviderMissing) as caught:
         build_agent(tmp_path, config, None, model_factory=factory)
-    assert "pip install langchain-groq" in str(caught.value)
+    assert str(caught.value) == (
+        "The langchain-groq package for this model is not installed. "
+        "Install it with: pip install langchain-groq"
+    )
+
+
+def test_unknown_provider_becomes_provider_missing(tmp_path):
+    def factory(role, model_id):
+        raise ValueError("Unable to infer model provider for model='antropic:x'. Please specify.")
+
+    config = Config(main_model="antropic:x", subagent_model="antropic:x")
+    with pytest.raises(ProviderMissing, match="Unknown model provider in 'antropic:x'"):
+        build_agent(tmp_path, config, None, model_factory=factory)
+    # A string id that langchain cannot resolve is converted the same way.
+    with pytest.raises(ProviderMissing, match="Unknown model provider in 'antropic:x'"):
+        build_agent(tmp_path, config, None)
+
+
+def test_other_factory_errors_become_provider_missing(tmp_path):
+    def factory(role, model_id):
+        raise RuntimeError("Missing credentials")
+
+    config = Config(main_model="openai:x", subagent_model="openai:x")
+    with pytest.raises(ProviderMissing, match="Could not set up openai:x: Missing credentials"):
+        build_agent(tmp_path, config, None, model_factory=factory)

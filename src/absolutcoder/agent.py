@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from deepagents import FilesystemPermission, create_deep_agent
@@ -11,7 +12,13 @@ from langgraph.graph.state import CompiledStateGraph
 
 from absolutcoder.config import Config
 from absolutcoder.git_policy import execute_needs_approval, protect_context_file
-from absolutcoder.models import ModelFactory, ProviderMissing, build_model, install_hint
+from absolutcoder.models import (
+    ModelFactory,
+    ProviderMissing,
+    build_model,
+    install_hint,
+    missing_package,
+)
 from absolutcoder.shell import GuardedShellBackend, RepoFilesystemBackend
 
 MEMORY_PATH = "/AbsolutCoder.md"
@@ -69,13 +76,41 @@ def build_agent(
     protect_context_file(root)
     routed = workspace_backend(root, backend)
     factory = model_factory or default_model_factory(config)
-    try:
-        return _compile(root, config, checkpointer, routed, chat_model, factory)
-    except ImportError as error:
+    return _compile(root, config, checkpointer, routed, chat_model, factory)
+
+
+def _provider_error(error: Exception, model_id: str) -> ProviderMissing | None:
+    """Map a model-construction failure to ProviderMissing, or None if unrecognised."""
+
+    if isinstance(error, ImportError):
         hint = install_hint(error)
         if hint is None:
-            raise
-        raise ProviderMissing(f"{error}\nInstall it with: {hint}") from error
+            return None
+        package = missing_package(error)
+        return ProviderMissing(
+            f"The {package} package for this model is not installed. Install it with: {hint}"
+        )
+    if isinstance(error, ValueError) and str(error).startswith("Unable to infer model provider"):
+        return ProviderMissing(
+            f"Unknown model provider in {model_id!r}. Use provider:model, for example "
+            "openai:gpt-x or anthropic:claude-x, or define the provider under "
+            '"providers" in config.json.'
+        )
+    return None
+
+
+def _construct(factory: ModelFactory, role: str, model_id: str):
+    """Call the model factory; every failure becomes ProviderMissing."""
+
+    try:
+        return factory(role, model_id)
+    except ProviderMissing:
+        raise
+    except Exception as error:
+        converted = _provider_error(error, model_id)
+        if converted is None:
+            converted = ProviderMissing(f"Could not set up {model_id}: {error}")
+        raise converted from error
 
 
 def default_model_factory(config: Config) -> ModelFactory:
@@ -88,10 +123,11 @@ def default_model_factory(config: Config) -> ModelFactory:
 
 
 def _compile(root, config, checkpointer, routed, chat_model, factory) -> CompiledStateGraph:
-    main_model = chat_model if chat_model is not None else factory("main", config.main_model)
-    worker_model = factory(
-        "general-purpose", config.agent_models.get("general-purpose", config.subagent_model)
+    worker_id = config.agent_models.get("general-purpose", config.subagent_model)
+    main_model = (
+        chat_model if chat_model is not None else _construct(factory, "main", config.main_model)
     )
+    worker_model = _construct(factory, "general-purpose", worker_id)
     interrupt_on = None if config.auto_run else {"execute": _execute_interrupt()}
     kwargs = {
         "model": main_model,
@@ -115,7 +151,15 @@ def _compile(root, config, checkpointer, routed, chat_model, factory) -> Compile
     }
     if interrupt_on is not None:
         kwargs["interrupt_on"] = interrupt_on
-    return create_deep_agent(**kwargs)
+    try:
+        return create_deep_agent(**kwargs)
+    except (ImportError, ValueError) as error:
+        # String ids are resolved here; only recognised model errors are converted.
+        named = re.search(r"model='([^']*)'", str(error))
+        converted = _provider_error(error, named.group(1) if named else config.main_model)
+        if converted is None:
+            raise
+        raise converted from error
 
 
 def workspace_backend(root: Path | str, shell: GuardedShellBackend | None = None) -> CompositeBackend:
