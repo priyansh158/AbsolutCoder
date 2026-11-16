@@ -40,9 +40,11 @@ class Config:
     max_rounds: int = 5
     web_max_chars: int = 20000
     max_background_tasks: int = 4
+    verify_timeout: int = 1800  # seconds the check command may run
 
 
 _PROVIDER_FIELDS = {f.name for f in fields(ProviderSettings)}
+_POSITIVE_INTS = ("max_rounds", "web_max_chars", "max_background_tasks", "verify_timeout")
 
 
 def load_config(path: Path | str) -> Config:
@@ -55,6 +57,13 @@ def load_config(path: Path | str) -> Config:
         if payload.get(key) is not None and not isinstance(payload[key], dict):
             raise ValueError(f"{key} must be an object")
     defaults = Config(main_model="", subagent_model="")
+    for key in ("main_model", "subagent_model"):
+        if key in payload and not isinstance(payload[key], str):
+            raise ValueError(f"{key} must be a string")
+    counts = {key: payload.get(key, getattr(defaults, key)) for key in _POSITIVE_INTS}
+    for key, value in counts.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{key} must be a positive integer")
     providers: dict[str, ProviderSettings] = {}
     for name, value in (payload.get("providers") or {}).items():
         if not isinstance(value, dict):
@@ -70,11 +79,7 @@ def load_config(path: Path | str) -> Config:
         agent_models=dict(payload.get("agent_models") or {}),
         shell=payload.get("shell", defaults.shell),
         verify_command=payload.get("verify_command", defaults.verify_command),
-        max_rounds=payload.get("max_rounds", defaults.max_rounds),
-        web_max_chars=payload.get("web_max_chars", defaults.web_max_chars),
-        max_background_tasks=payload.get(
-            "max_background_tasks", defaults.max_background_tasks
-        ),
+        **counts,
     )
 
 

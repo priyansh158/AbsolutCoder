@@ -78,8 +78,8 @@ class Repl:
         self.pending_attachments: list[Path] = []
         self.last_turn_interrupted = False
         self.last_turn_failed = False
-        # While --auto is in force: the auto_run value config.json keeps.
-        self.saved_auto_run: bool | None = None
+        # Settings given for this run only (--auto, --until-timeout): field -> the value config.json keeps.
+        self.run_only: dict[str, object] = {}
         self._no_terminal_noted = False
         self._task_stopped = False
         protect_context_file(self.repo)
@@ -157,6 +157,8 @@ class Repl:
 
     def loop(self) -> None:
         self.console.print(f"AbsolutCoder. {_COMMANDS}")
+        if self.config.verify_command:
+            self._say(f"verify: {self.config.verify_command} (runs after every request; /verify off to stop)")
         while True:
             self.service_tasks()
             try:
@@ -270,10 +272,15 @@ class Repl:
             self._service_after_turn()
             return result
 
+        limit = max(1, self.config.max_rounds)
+
         def check():
             self._say(f"verify: {command}")
             self.backend.flags = flags
-            return self.backend.execute(command)
+            result = self.backend.execute(command, timeout=self.config.verify_timeout)
+            if result.exit_code != 0:
+                self._say(f"verify: failed (exit {result.exit_code}), round {rounds} of {limit}")
+            return result
 
         try:
             outcome = run_until_verified(
@@ -555,7 +562,7 @@ class Repl:
         self.config = updated
         self.agent = agent
         if auto_run is not None:
-            self.saved_auto_run = None  # /auto chose a value to keep
+            self.run_only.pop("auto_run", None)  # /auto chose a value to keep
         self._save()
         self.session = update_session(
             self.session.id,
@@ -672,10 +679,9 @@ class Repl:
             self.error_console.print(_NO_TERMINAL, markup=False, highlight=False)
 
     def _save(self) -> None:
-        """Write the settings; a run-only --auto is not written."""
+        """Write the settings; values given for this run only are written as they were."""
 
-        saved = self.config if self.saved_auto_run is None else replace(self.config, auto_run=self.saved_auto_run)
-        save_config(config_path(), saved)
+        save_config(config_path(), replace(self.config, **self.run_only))
 
     def _auto_value(self, argument: str) -> bool | None:
         lowered = argument.lower()
@@ -709,10 +715,14 @@ def run_cli(args, config: Config | None = None, *, repl_factory=Repl) -> int:
     repo = Path.cwd()
     if config is None:
         config = ensure_config()
-    auto = bool(getattr(args, "auto", False))
-    saved_auto_run = config.auto_run
-    if auto:
+    run_only: dict[str, object] = {}
+    if getattr(args, "auto", False):
+        run_only["auto_run"] = config.auto_run
         config = replace(config, auto_run=True)
+    until_timeout = getattr(args, "until_timeout", None)
+    if until_timeout is not None:
+        run_only["verify_timeout"] = config.verify_timeout
+        config = replace(config, verify_timeout=until_timeout)
     task = getattr(args, "task", None)
     if task:
         until = getattr(args, "until", None)
@@ -730,8 +740,8 @@ def run_cli(args, config: Config | None = None, *, repl_factory=Repl) -> int:
     except ShellNotFound as error:
         print(f"Config error: shell: {error}", file=sys.stderr)
         return 1
-    if auto and hasattr(repl, "saved_auto_run"):
-        repl.saved_auto_run = saved_auto_run
+    if run_only and isinstance(getattr(repl, "run_only", None), dict):
+        repl.run_only.update(run_only)
     if task and hasattr(repl, "error_console"):
         repl.error_console = Console(stderr=True)
     attachments = [Path(item) for item in getattr(args, "attach", [])]

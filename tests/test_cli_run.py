@@ -154,6 +154,40 @@ def test_auto_flag_is_not_saved_by_later_setting_changes(tmp_path, monkeypatch):
     assert repl.config.auto_run is True
 
 
+def test_until_timeout_overrides_for_one_run(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    seen = []
+
+    class FakeRepl:
+        def __init__(self, repo, config):
+            seen.append(config)
+            self.pending_attachments = []
+
+        def run_task(self, text, paths=None):
+            return None
+
+    config = Config(main_model="openai:a", subagent_model="openai:b", verify_timeout=1800)
+    args = build_parser().parse_args(["go", "--until", "make", "--until-timeout", "42"])
+    run_cli(args, config, repl_factory=FakeRepl)
+    assert seen[0].verify_timeout == 42
+    run_cli(build_parser().parse_args(["go"]), config, repl_factory=FakeRepl)
+    assert seen[1].verify_timeout == 1800
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["go", "--until-timeout", "0"])
+
+
+def test_until_timeout_is_not_saved(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    save_config(config_path(), _CONFIG)
+    made: list = []
+    args = build_parser().parse_args(["--until-timeout", "42"])
+    run_cli(args, None, repl_factory=_real_factory(made, input_fn=lambda _p="": "/exit"))
+    repl = made[0]
+    assert repl.config.verify_timeout == 42
+    repl.handle_line("/verify make test")
+    assert json.loads(config_path().read_text(encoding="utf-8"))["verify_timeout"] == 1800
+
+
 def test_help_epilog_names_commands_config_and_flags(capsys):
     with pytest.raises(SystemExit):
         build_parser().parse_args(["--help"])

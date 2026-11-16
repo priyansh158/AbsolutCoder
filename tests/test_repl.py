@@ -722,6 +722,42 @@ def test_verify_loop_feeds_failure_back(tmp_path, monkeypatch):
     assert any("The check command failed (exit code 1)" in text for text in human_texts)
 
 
+def test_check_uses_verify_timeout_and_reports_each_failing_round(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    repl, output = _loop_repl(repo, lambda _m: AIMessage(content="done"), max_rounds=3, verify_timeout=77)
+    command = _python_check(repl, "raise SystemExit(4)")
+    repl.config = replace(repl.config, verify_command=command)
+    timeouts = []
+    real_execute = repl.backend.execute
+
+    def execute(cmd, *, timeout=None):
+        timeouts.append(timeout)
+        return real_execute(cmd, timeout=timeout)
+
+    monkeypatch.setattr(repl.backend, "execute", execute)
+    outcome = repl.run_task("fix it")
+    lines = output.getvalue().splitlines()
+    assert outcome.passed is False
+    assert timeouts == [77, 77, 77]
+    assert [line for line in lines if line.startswith("verify: failed")] == [
+        "verify: failed (exit 4), round 1 of 3",
+        "verify: failed (exit 4), round 2 of 3",
+        "verify: failed (exit 4), round 3 of 3",
+    ]
+
+
+def test_loop_start_names_the_check_command(tmp_path):
+    repl, output = _plain_repl(tmp_path, input_fn=lambda _p="": "/exit")
+    repl.loop()
+    assert "verify:" not in output.getvalue()
+    repl, output = _plain_repl(tmp_path, input_fn=lambda _p="": "/exit")
+    repl.config = replace(repl.config, verify_command="pytest -q")
+    repl.loop()
+    assert "verify: pytest -q (runs after every request; /verify off to stop)" in output.getvalue().splitlines()
+
+
 def test_verify_follow_up_cannot_grant_push(tmp_path, monkeypatch, git_repo):
     _no_web(monkeypatch)
     repo = git_repo(tmp_path / "repo")

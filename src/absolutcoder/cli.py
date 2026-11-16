@@ -53,6 +53,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Stop the --until loop after N turns.",
     )
     parser.add_argument(
+        "--until-timeout",
+        type=_positive_int,
+        metavar="N",
+        help="Give the check command N seconds per run (this run only; default verify_timeout, 1800).",
+    )
+    parser.add_argument(
         "--auto",
         action="store_true",
         help="Run commands without asking, for this run only (not saved). The git policy still applies.",

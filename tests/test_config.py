@@ -39,3 +39,27 @@ def test_save_and_load_preserves_models_and_auto_run(tmp_path):
     assert loaded.auto_run is True
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["auto_run"] is True
+
+
+def _write(tmp_path, **fields):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"main_model": "openai:a", "subagent_model": "openai:b", **fields}), encoding="utf-8")
+    return path
+
+
+def test_verify_timeout_defaults_and_loads(tmp_path):
+    assert load_config(_write(tmp_path)).verify_timeout == 1800
+    assert load_config(_write(tmp_path, verify_timeout=60)).verify_timeout == 60
+
+
+@pytest.mark.parametrize("key", ["verify_timeout", "max_rounds", "web_max_chars", "max_background_tasks"])
+@pytest.mark.parametrize("value", [0, -1, "5", 2.5, True, None])
+def test_numeric_settings_must_be_positive_integers(tmp_path, key, value):
+    with pytest.raises(ValueError, match=key):
+        load_config(_write(tmp_path, **{key: value}))
+
+
+@pytest.mark.parametrize("key", ["main_model", "subagent_model"])
+def test_model_ids_must_be_strings(tmp_path, key):
+    with pytest.raises(ValueError, match=key):
+        load_config(_write(tmp_path, **{key: 5}))
