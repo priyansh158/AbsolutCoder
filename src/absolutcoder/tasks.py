@@ -192,6 +192,12 @@ class TaskManager:
             notices, self._notices = self._notices, []
         return notices
 
+    def requeue_notices(self, notices: list[str]) -> None:
+        """Put drained notices back at the front of the queue (a turn failed before delivering them)."""
+
+        with self._lock:
+            self._notices = list(notices) + self._notices
+
     def wait(self, task_id: str, timeout: float | None = None) -> TaskRecord:
         """Block until the task is not queued or running; return it as it is then."""
 

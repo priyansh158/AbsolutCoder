@@ -12,6 +12,7 @@ dependencies = [
     "httpx",
     "pyyaml",
     "ddgs",
+    "prompt_toolkit",
 ]
 
 [project.optional-dependencies]

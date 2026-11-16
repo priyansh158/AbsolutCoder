@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
@@ -12,14 +14,15 @@ from langgraph.errors import GraphBubbleUp
 from langgraph.types import Command
 from rich.console import Console
 
-from absolutcoder.agent import build_agent
+from absolutcoder.agent import build_agent, build_role_graph
 from absolutcoder.agent_files import load_roster
 from absolutcoder.attachments import build_user_content
 from absolutcoder.config import Config, config_path, resolve_model, save_config
 from absolutcoder.git_policy import PolicyDenied, TurnFlags, protect_context_file
 from absolutcoder.loops import VerifyOutcome, parse_interval, run_interval_loop, run_until_verified
 from absolutcoder.models import ModelFactory, ProviderMissing, missing_keys
-from absolutcoder.render import StreamRenderer
+from absolutcoder.prompting import background_output, make_input_fn
+from absolutcoder.render import StreamRenderer, output_lock
 from absolutcoder.sessions import (
     Session,
     checkpoint_saver,
@@ -29,11 +32,17 @@ from absolutcoder.sessions import (
     update_session,
 )
 from absolutcoder.shell import GuardedShellBackend, ShellNotFound
+from absolutcoder.tasks import TaskManager, TaskRecord, make_task_tools
 from absolutcoder.webtools import make_web_tools
 
-_COMMANDS = "Commands: /model, /subagent, /auto, /resume, /attach, /agents, /verify, /loop, /exit"
+_COMMANDS = "Commands: /model, /subagent, /auto, /resume, /attach, /agents, /tasks, /verify, /loop, /exit"
 _LOOP_USAGE = "Usage: /loop <N>(s|m|h) <prompt>"
+_TASKS_USAGE = "Usage: /tasks [show <id> | cancel <id>]"
+_TASKS_OFF = "Background tasks are off in this mode."
+_UPDATES_HEADER = "[Background task updates — reported by the program, not typed by the user]"
+_REJECTED = {"type": "reject", "message": "User rejected the command."}
 _FAILURE_TAIL_LINES = 15
+_WAIT_STEP = 0.2  # seconds per join while leaving, so Ctrl+C is seen promptly
 
 
 class Repl:
@@ -49,6 +58,7 @@ class Repl:
         input_fn=None,
         console: Console | None = None,
         sleep_fn=time.sleep,
+        background: bool = True,
     ) -> None:
         self.repo = Path(repo).resolve()
         self.config = replace(
@@ -75,11 +85,31 @@ class Repl:
         self.agents, warnings = load_roster(self.repo)
         # Built once and reused by every rebuild, so no rebuild leaves a client behind.
         self.web_tools = make_web_tools(max_chars=self.config.web_max_chars)
+        self._output = output_lock(self.console)  # shared with every turn's renderer
+        self._closed: bool | None = None  # close() result once it has run
+        # The manager and its tools exist before the first build so every build,
+        # and every rebuild, gets the same tool objects; it learns the session id
+        # once the session row exists, before any task can start.
+        self.tasks: TaskManager | None = None
+        self._task_tools: list = []
+        if background:
+            self.tasks = TaskManager(
+                self._build_task_graph,
+                roles=lambda: self.agents,
+                session_id="",
+                repo=self.repo,
+                shell=self.config.shell,
+                max_workers=max(1, self.config.max_background_tasks),
+                on_event=self._task_event,
+            )
+            self._task_tools = make_task_tools(self.tasks, lambda: self.backend.flags)
         self._failures: list[str] = []
         self._quiet = True  # the caller prints a failed start itself
         agent = self._try_build(self.config)
         self._quiet = False
         if agent is None:
+            if self.tasks is not None:
+                self.tasks.shutdown()
             raise ProviderMissing("\n".join(self._failures))
         self.session = create_session(
             self.repo,
@@ -87,9 +117,24 @@ class Repl:
             self.config.subagent_model,
             auto_run=self.config.auto_run,
         )
+        if self.tasks is not None:
+            self.tasks.session_id = self.session.id
         self.thread_id = self.session.id
         self.agent = agent
         self._report_roster(warnings)
+
+    def _build_task_graph(self, role, backend):
+        """Build a background task's graph from the settings current when it starts."""
+
+        return build_role_graph(
+            self.repo,
+            self.config,
+            self.checkpointer,
+            role,
+            model_factory=self.model_factory,
+            backend=backend,
+            web_tools=self.web_tools,
+        )
 
     def _report_roster(self, warnings: list[str]) -> None:
         for warning in warnings:
@@ -106,12 +151,15 @@ class Repl:
     def loop(self) -> None:
         self.console.print(f"AbsolutCoder. {_COMMANDS}")
         while True:
+            self.service_tasks()
             try:
                 line = self._ask("absolut> ")
             except (EOFError, KeyboardInterrupt):
                 self.console.print()
+                self.close()
                 return
             if line.strip() in {"/exit", "/quit"}:
+                self.close()
                 return
             self.handle_line(line)
 
@@ -131,6 +179,10 @@ class Repl:
         and checkpointer stay in place so the caller can prompt again.
         ``flags`` default to what ``text`` asks for; a follow-up turn that
         carries command output passes the user's own flags instead.
+
+        Finished background tasks are reported in an extra text block ahead of
+        the user's text; the flags never come from it. If the turn fails before
+        that block reached the conversation, the notices go back on the queue.
         """
 
         self.last_turn_interrupted = False
@@ -140,12 +192,18 @@ class Repl:
         start = len(self.backend.vet_log)
         config = {"configurable": {"thread_id": self.thread_id}}
         self._renderer = None
+        notices = self.tasks.drain_notices() if self.tasks is not None else []
+        updates = _updates_block(notices)
         try:
             content = build_user_content(text, attachments)
+            if updates is not None:
+                content.insert(0, updates)
             return self._drive({"messages": [{"role": "user", "content": content}]}, config)
         except GraphBubbleUp:
+            self._requeue_undelivered(notices, updates, config)
             raise
         except KeyboardInterrupt:
+            self._requeue_undelivered(notices, updates, config)
             self.last_turn_interrupted = True
             if self._renderer is None:
                 self.console.print("interrupted", markup=False, highlight=False)
@@ -153,12 +211,29 @@ class Repl:
                 self._renderer.interrupted()
             return None
         except Exception as exc:
+            self._requeue_undelivered(notices, updates, config)
             if self._renderer is not None:
                 self._renderer.end_line()
             self.console.print(f"Error: {exc}", markup=False, highlight=False)
             return None
         finally:
             self.turn_vet_log = self.backend.vet_log[start:]
+
+    def _requeue_undelivered(self, notices: list[str], updates: dict | None, config) -> None:
+        """Put the notices back unless the failed turn's user message was already saved."""
+
+        if not notices:
+            return
+        try:
+            messages = self.agent.get_state(config).values.get("messages", [])
+            human = next((m for m in reversed(messages) if getattr(m, "type", None) == "human"), None)
+            content = getattr(human, "content", None)
+            first = content[0] if isinstance(content, list) and content else None
+            delivered = isinstance(first, dict) and first.get("text") == updates["text"]
+        except Exception:  # noqa: BLE001 - cannot tell: keep them rather than lose them
+            delivered = False
+        if not delivered:
+            self.tasks.requeue_notices(notices)
 
     def run_task(self, text: str, paths: list[Path] | None = None) -> VerifyOutcome | None:
         """Run one user request; with a check command, repeat until the check passes.
@@ -172,6 +247,7 @@ class Repl:
         command = self.config.verify_command
         if not command:
             self.run_turn(text, paths, flags=flags)
+            self._service_after_turn()
             return None
         rounds = 0
 
@@ -181,6 +257,7 @@ class Repl:
             result = self.run_turn(message, paths if rounds == 1 else [], flags=flags)
             if self.last_turn_interrupted:
                 raise KeyboardInterrupt
+            self._service_after_turn()
             return result
 
         def check():
@@ -211,6 +288,120 @@ class Repl:
             for line in outcome.last_output.splitlines()[-_FAILURE_TAIL_LINES:]:
                 self._say(line)
         return outcome
+
+    # --- background tasks -----------------------------------------------------
+
+    def _service_after_turn(self) -> None:
+        if not self.last_turn_interrupted:
+            self.service_tasks()
+
+    def service_tasks(self) -> None:
+        """Ask the approvals background tasks are waiting for; only at a prompt boundary.
+
+        Ctrl+C or end of input at one of these prompts rejects that task's
+        request and stops asking the others until the next boundary.
+        """
+
+        if self.tasks is None:
+            return
+        for record, interrupts in self.tasks.pending_approvals():
+            if not all(getattr(item, "id", None) for item in interrupts):
+                # Command(resume={id: ...}) cannot address it, so it could never continue.
+                self.tasks.cancel(record.id)
+                self._say(f"task {record.id}: Cannot resume: an approval request has no id.")
+                continue
+            stop = False
+            try:
+                decisions = self._decisions(
+                    interrupts,
+                    question=lambda command, r=record: f"task {r.id} [{r.agent}] wants to run: {command}",
+                )
+            except (KeyboardInterrupt, EOFError):
+                self.console.print()
+                decisions = _rejections(interrupts)
+                stop = True
+            try:
+                self.tasks.resume(record.id, decisions)
+            except (KeyError, ValueError, RuntimeError):
+                pass  # cancelled or shut down while the user was answering
+            if stop:
+                return
+
+    def _task_event(self, record: TaskRecord) -> None:
+        """Print one whole status line for a background task; runs on worker threads."""
+
+        if record.status == "queued":
+            return  # the start_task call line already shows it
+        status = "needs approval" if record.status == "needs_approval" else record.status
+        with self._output:
+            renderer = self._renderer
+            if renderer is not None:
+                renderer.end_line()
+            self.console.print(f"task {record.id} [{record.agent}] {status}", markup=False, highlight=False)
+
+    def close(self) -> bool:
+        """Stop the background tasks; False when the user left while some were still running.
+
+        Safe to call again: later calls print nothing and return the first result.
+        """
+
+        if self._closed is not None:
+            return self._closed
+        self._closed = True
+        if self.tasks is None:
+            return True
+        cancelled = self.tasks.shutdown()
+        if cancelled:
+            self._say(f"cancelled {cancelled} running task(s)")
+        self._closed = self._wait_for_tasks()
+        return self._closed
+
+    def _wait_for_tasks(self) -> bool:
+        busy = self._busy_task_ids()
+        if not busy:
+            return True
+        self._say(f"waiting for {len(busy)} background task(s) to stop (Ctrl+C to leave now)")
+        try:
+            while busy:
+                self.tasks.wait(busy[0], timeout=_WAIT_STEP)
+                busy = self._busy_task_ids()
+        except KeyboardInterrupt:
+            self._say(f"left {len(busy)} background task(s) still stopping")
+            return False
+        return True
+
+    def _busy_task_ids(self) -> list[str]:
+        return [r.id for r in self.tasks.list() if r.status in {"queued", "running"}]
+
+    def _tasks_command(self, argument: str) -> None:
+        if self.tasks is None:
+            self._say(_TASKS_OFF)
+            return
+        action, _, task_id = argument.partition(" ")
+        task_id = task_id.strip()
+        if not action:
+            records = self.tasks.list()
+            if not records:
+                self._say("No background tasks.")
+            for record in records:
+                self._say(_task_line(record))
+            return
+        if action not in {"show", "cancel"} or not task_id:
+            self._say(_TASKS_USAGE)
+            return
+        if action == "cancel":
+            self._say(f"Cancelled {task_id}." if self.tasks.cancel(task_id) else f"{task_id} is not running.")
+            return
+        try:
+            record = self.tasks.get(task_id)
+        except KeyError:
+            self._say(f"Unknown task {task_id}")
+            return
+        self._say(_task_line(record))
+        if record.status == "failed":
+            self._say(f"Error: {record.error}")
+        elif record.result:
+            self._say(record.result)
 
     def _say(self, text: str) -> None:
         self.console.print(text, markup=False, highlight=False)
@@ -291,6 +482,9 @@ class Repl:
             return
         if command == "/loop":
             self._loop(argument)
+            return
+        if command == "/tasks":
+            self._tasks_command(argument)
             return
         if command == "/agents":
             for definition in self.agents:
@@ -400,6 +594,7 @@ class Repl:
             chat_model=self.chat_model,
             model_factory=self.model_factory,
             backend=self.backend,
+            extra_tools=self._task_tools,
             agents=self.agents,
             web_tools=self.web_tools,
         )
@@ -427,25 +622,25 @@ class Repl:
             renderer.end_line()
             payload = Command(resume=_resume_map(interrupts, self._decisions(interrupts)))
 
-    def _decisions(self, interrupts) -> dict[str, dict]:
+    def _decisions(self, interrupts, *, question: Callable[[str], str] | None = None) -> dict[str, dict]:
+        """Ask y/n for each requested command; ``question(command)`` is the line shown first."""
+
         answered: dict[str, dict] = {}
         for item in interrupts:
             interrupt_id = getattr(item, "id", None)
             if not interrupt_id:
-                continue  # _drive refuses to resume when any interrupt lacks an id
-            value = item.value
-            actions = value.get("action_requests", []) if isinstance(value, dict) else []
+                continue  # callers refuse to resume when any interrupt lacks an id
             decisions = []
-            for action in actions:
-                command = ""
-                if isinstance(action, dict):
-                    command = str(action.get("args", {}).get("command", action.get("name", "")))
-                self.console.print(f"Run command? {command}")
+            for command in _requested_commands(item):
+                if question is None:
+                    self.console.print(f"Run command? {command}")
+                else:
+                    self._say(question(command))
                 answer = self._ask("[y/n] ").strip().lower()
                 if answer in {"y", "yes"}:
                     decisions.append({"type": "approve"})
                 else:
-                    decisions.append({"type": "reject", "message": "User rejected the command."})
+                    decisions.append(dict(_REJECTED))
             answered[interrupt_id] = {"decisions": decisions}
         return answered
 
@@ -488,7 +683,8 @@ def run_cli(args, config: Config | None = None, *, repl_factory=Repl) -> int:
         if max_rounds is not None:
             config = replace(config, max_rounds=max_rounds)
     try:
-        repl = repl_factory(repo, config)
+        # A one-shot run ends with its turn, so it gets no background tasks.
+        repl = _make_repl(repl_factory, repo, config, background=not task)
     except ProviderMissing as error:
         print(error, file=sys.stderr)
         return 1
@@ -496,12 +692,87 @@ def run_cli(args, config: Config | None = None, *, repl_factory=Repl) -> int:
         print(f"Config error: shell: {error}", file=sys.stderr)
         return 1
     attachments = [Path(item) for item in getattr(args, "attach", [])]
-    if task:
-        outcome = repl.run_task(task, paths=attachments)
-        return 2 if outcome is not None and not outcome.passed else 0
-    repl.pending_attachments.extend(attachments)
-    repl.loop()
-    return 0
+    clean = True
+    try:
+        if task:
+            outcome = repl.run_task(task, paths=attachments)
+            code = 2 if outcome is not None and not outcome.passed else 0
+        else:
+            repl.pending_attachments.extend(attachments)
+            _interactive_loop(repl)
+            code = 0
+    finally:
+        close = getattr(repl, "close", None)
+        if close is not None:
+            clean = close() is not False
+    if not clean:
+        # The user chose to leave while a task thread is still inside a model or
+        # shell call. Pool threads are joined at interpreter exit, which would
+        # hold the process open, so end it here.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(code)
+    return code
+
+
+def _make_repl(repl_factory, repo: Path, config: Config, *, background: bool):
+    """Call the factory, passing ``background`` when it takes that keyword."""
+
+    try:
+        parameters = inspect.signature(repl_factory).parameters.values()
+    except (TypeError, ValueError):
+        parameters = ()
+    accepts = any(p.name == "background" or p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters)
+    if accepts:
+        return repl_factory(repo, config, background=background)
+    return repl_factory(repo, config)
+
+
+def _interactive_loop(repl) -> None:
+    """Run the loop; on a terminal, read lines with prompt_toolkit and keep task output above the prompt."""
+
+    console = getattr(repl, "console", None)
+    if console is None:
+        repl.loop()
+        return
+    if getattr(repl, "input_fn", None) is input:  # nothing injected
+        repl.input_fn = make_input_fn(console)
+    with background_output(console):
+        repl.loop()
+
+
+def _task_line(record: TaskRecord) -> str:
+    return f"{record.id}  {record.agent}  {record.status}  {' '.join(record.prompt.split())[:60]}"
+
+
+def _updates_block(notices: list[str]) -> dict | None:
+    if not notices:
+        return None
+    return {"type": "text", "text": _UPDATES_HEADER + "\n" + "\n\n".join(notices)}
+
+
+def _requested_commands(interrupt) -> list[str]:
+    """The command (or tool name) of each action an approval interrupt asks about."""
+
+    value = getattr(interrupt, "value", None)
+    actions = value.get("action_requests", []) if isinstance(value, dict) else []
+    commands = []
+    for action in actions:
+        command = ""
+        if isinstance(action, dict):
+            command = str(action.get("args", {}).get("command", action.get("name", "")))
+        commands.append(command)
+    return commands
+
+
+def _rejections(interrupts) -> dict[str, dict]:
+    """Reject every action of every addressable interrupt."""
+
+    return {
+        item.id: {"decisions": [dict(_REJECTED) for _ in _requested_commands(item)]}
+        for item in interrupts
+        if getattr(item, "id", None)
+    }
 
 
 def _pending_interrupts(snapshot) -> list:

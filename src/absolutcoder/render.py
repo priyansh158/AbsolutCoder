@@ -8,9 +8,30 @@ yields. ``ns == ()`` is the main loop; a non-empty ``ns`` is a worker.
 from __future__ import annotations
 
 import json
+import threading
+from weakref import WeakKeyDictionary
 
 from langchain_core.messages import AIMessage, RemoveMessage, ToolMessage
 from rich.console import Console
+
+_OUTPUT_LOCKS: WeakKeyDictionary[Console, threading.RLock] = WeakKeyDictionary()
+_OUTPUT_LOCKS_GUARD = threading.Lock()
+
+
+def output_lock(console: Console) -> threading.RLock:
+    """The one lock every writer to ``console`` holds, so lines from other threads stay whole.
+
+    The renderer holds it for each write and for the open-line state; a writer
+    on another thread takes it, ends any open line with the current renderer's
+    ``end_line()`` and then prints its own whole line. It is re-entrant so that
+    call works while the lock is held.
+    """
+
+    with _OUTPUT_LOCKS_GUARD:
+        lock = _OUTPUT_LOCKS.get(console)
+        if lock is None:
+            lock = _OUTPUT_LOCKS[console] = threading.RLock()
+        return lock
 
 # Nodes of langchain's agent graph (main loop and workers alike).
 MODEL_NODE = "model"
@@ -84,6 +105,7 @@ class StreamRenderer:
 
     def __init__(self, console: Console, *, live: bool | None = None) -> None:
         self.console = console
+        self._output = output_lock(console)
         self.live = console.is_terminal if live is None else live
         self.errors: list[Exception] = []
         self._labels: dict[tuple, str] = {}
@@ -135,9 +157,10 @@ class StreamRenderer:
     def end_line(self) -> None:
         """End a streamed line that has no newline yet."""
 
-        if self._open_line:
-            self._open_line = False
-            self.console.print(markup=False, highlight=False)
+        with self._output:
+            if self._open_line:
+                self._open_line = False
+                self.console.print(markup=False, highlight=False)
 
     # --- parts ------------------------------------------------------------------
 
@@ -159,8 +182,9 @@ class StreamRenderer:
         text = _chunk_text(message.content)
         if not text:
             return
-        self._open_line = True
-        self.console.print(text, end="", markup=False, highlight=False, soft_wrap=True)
+        with self._output:
+            self._open_line = True
+            self.console.print(text, end="", markup=False, highlight=False, soft_wrap=True)
         if message.id:
             self._shown_ids.add(message.id)
         self._streamed += text
@@ -264,10 +288,12 @@ class StreamRenderer:
             self._last_text = text
 
     def _line(self, text: str) -> None:
-        self.end_line()
-        self._streamed = ""
-        self._print(text)
+        with self._output:
+            self.end_line()
+            self._streamed = ""
+            self._print(text)
 
     def _print(self, text: str) -> None:
-        self.console.print(text, markup=False, highlight=False)
+        with self._output:
+            self.console.print(text, markup=False, highlight=False)
 

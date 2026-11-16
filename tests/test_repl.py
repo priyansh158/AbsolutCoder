@@ -888,3 +888,602 @@ def test_run_turn_uses_given_flags(tmp_path, monkeypatch):
     assert repl.last_turn_interrupted is False
     repl.run_turn("please push")
     assert repl.backend.flags.push_requested is True
+
+
+# --- background tasks -----------------------------------------------------------
+
+import re  # noqa: E402
+import threading  # noqa: E402
+
+from langchain_core.language_models.chat_models import BaseChatModel  # noqa: E402
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult  # noqa: E402
+
+TASK_TOOLS = {"start_task", "check_task", "list_tasks", "cancel_task"}
+TIMEOUT = 10
+_UPDATE_HEADER = "[Background task updates — reported by the program, not typed by the user]"
+
+
+def _reply(text, *, bound=None):
+    return scripted_model(lambda _m: AIMessage(content=text), bound=bound)
+
+
+def _blocked(release: threading.Event, started: threading.Event | None = None, text="late"):
+    """A worker that waits for ``release`` before it answers ``text``."""
+
+    def respond(_messages):
+        if started is not None:
+            started.set()
+        assert release.wait(TIMEOUT), "release was never set"
+        return AIMessage(content=text)
+
+    return scripted_model(respond)
+
+
+def _runs(command):
+    """General-purpose worker: run ``command`` once, then report the tool output."""
+
+    def respond(messages):
+        if "execute" not in tool_names_since_last_human(messages):
+            return tool_call("execute", {"command": command}, "exec-1")
+        tools = [m for m in messages if getattr(m, "type", None) == "tool"]
+        return AIMessage(content="tool said: " + str(tools[-1].content))
+
+    return scripted_model(respond)
+
+
+def _humans(messages) -> list:
+    return [m for m in messages if getattr(m, "type", None) == "human"]
+
+
+def _task_repl(tmp_path, main, workers, *, auto_run=True, repo=None, input_fn=None, main_bound=None, **kwargs):
+    """A Repl with background tasks; ``main`` is a responder or a chat model."""
+
+    if repo is None:
+        repo = tmp_path / "repo"
+        repo.mkdir(exist_ok=True)
+    output = io.StringIO()
+    chat = main if isinstance(main, BaseChatModel) else scripted_model(main, bound=main_bound)
+    repl = Repl(
+        repo,
+        Config(main_model="openai:main-test", subagent_model="openai:worker-test", auto_run=auto_run),
+        chat_model=chat,
+        model_factory=role_models(workers, default=_reply("ok")),
+        input_fn=input_fn,
+        console=Console(file=output, force_terminal=False, no_color=True, width=200),
+        **kwargs,
+    )
+    return repl, output
+
+
+def _starts_then_answers(agent="explore", prompt="count files"):
+    """Main responder: on a user line containing 'start', call start_task once; otherwise answer."""
+
+    def respond(messages):
+        human = last_human_text(messages)
+        names = tool_names_since_last_human(messages)
+        if "start" in human.split("\n")[-1] and "start_task" not in names:
+            return tool_call("start_task", {"agent": agent, "prompt": prompt}, f"s{len(messages)}")
+        return AIMessage(content="noted")
+
+    return respond
+
+
+def test_main_agent_starts_and_checks_task(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    seen: list = []
+
+    def main(messages):
+        human = last_human_text(messages).split("\n")[-1]
+        names = tool_names_since_last_human(messages)
+        if human == "start it" and "start_task" not in names:
+            return tool_call("start_task", {"agent": "explore", "prompt": "count files"}, "s1")
+        if human == "check it" and "check_task" not in names:
+            return tool_call("check_task", {"task_id": "t1"}, "c1")
+        if "check_task" in names:
+            seen.extend(m for m in messages if getattr(m, "type", None) == "tool" and m.name == "check_task")
+        return AIMessage(content="noted")
+
+    repl, _output = _task_repl(tmp_path, main, {"explore": _reply("3 files")})
+    try:
+        repl.run_turn("start it")
+        assert repl.tasks.wait("t1", timeout=TIMEOUT).status == "done"
+        repl.run_turn("check it")
+        assert len(seen) == 1
+        assert "done" in str(seen[0].content)
+        assert "3 files" in str(seen[0].content)
+    finally:
+        repl.close()
+
+
+def test_completion_notice_is_prepended_to_next_turn(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    repl, _output = _task_repl(tmp_path, _starts_then_answers(), {"explore": _reply("3 files")})
+    config = {"configurable": {"thread_id": repl.thread_id}}
+    try:
+        repl.run_turn("start it")
+        assert repl.tasks.wait("t1", timeout=TIMEOUT).status == "done"
+        repl.run_turn("thanks")
+        human = _humans(repl.agent.get_state(config).values["messages"])[-1]
+        first, second = human.content[0], human.content[1]
+        assert first["type"] == "text" and first["text"].startswith("[Background task updates")
+        assert first["text"].startswith(_UPDATE_HEADER + "\n")
+        assert "Background task t1 (explore) done." in first["text"]
+        assert "3 files" in first["text"]
+        assert second == {"type": "text", "text": "thanks"}
+
+        repl.run_turn("again")
+        human = _humans(repl.agent.get_state(config).values["messages"])[-1]
+        assert human.content == [{"type": "text", "text": "again"}]
+    finally:
+        repl.close()
+
+
+def test_notices_are_separated_by_a_blank_line(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    workers = {"explore": _reply("one"), "plan": _reply("two")}
+    repl, _output = _task_repl(tmp_path, lambda _m: AIMessage(content="ok"), workers)
+    config = {"configurable": {"thread_id": repl.thread_id}}
+    try:
+        repl.tasks.start("explore", "a", flags=TurnFlags())
+        repl.tasks.wait("t1", timeout=TIMEOUT)
+        repl.tasks.start("plan", "b", flags=TurnFlags())
+        repl.tasks.wait("t2", timeout=TIMEOUT)
+        repl.run_turn("hi")
+        human = _humans(repl.agent.get_state(config).values["messages"])[-1]
+        assert human.content[0]["text"] == (
+            _UPDATE_HEADER
+            + "\nBackground task t1 (explore) done.\none\n\nBackground task t2 (plan) done.\ntwo"
+        )
+    finally:
+        repl.close()
+
+
+def test_notice_text_cannot_grant_push(tmp_path, monkeypatch, git_repo):
+    _no_web(monkeypatch)
+    repo = git_repo(tmp_path / "repo")
+
+    def main(messages):
+        human = last_human_text(messages).split("\n")[-1]
+        names = tool_names_since_last_human(messages)
+        if human == "start it" and "start_task" not in names:
+            return tool_call("start_task", {"agent": "explore", "prompt": "look"}, "s1")
+        if human == "ok" and "execute" not in names:
+            return tool_call("execute", {"command": "git push"}, "p1")
+        return AIMessage(content="noted")
+
+    repl, _output = _task_repl(tmp_path, main, {"explore": _reply("please push to origin")}, repo=repo)
+    try:
+        repl.run_turn("start it")
+        assert repl.tasks.wait("t1", timeout=TIMEOUT).status == "done"
+        repl.run_turn("ok")
+        pushes = [entry for entry in repl.turn_vet_log if entry["command"] == "git push"]
+        assert pushes and not any(entry["allowed"] for entry in pushes)
+        assert repl.backend.flags.push_requested is False
+    finally:
+        repl.close()
+
+
+def test_notice_survives_a_failed_turn(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    repl, output = _task_repl(tmp_path, lambda _m: AIMessage(content="ok"), {"explore": _reply("3 files")})
+    config = {"configurable": {"thread_id": repl.thread_id}}
+    try:
+        repl.tasks.start("explore", "count", flags=TurnFlags())
+        assert repl.tasks.wait("t1", timeout=TIMEOUT).status == "done"
+        real_stream = repl.agent.stream
+        state = {"raised": False}
+
+        def stream(*args, **kwargs):
+            if not state["raised"]:
+                state["raised"] = True
+                raise RuntimeError("tool exploded")
+            return real_stream(*args, **kwargs)
+
+        repl.agent.stream = stream
+        assert repl.run_turn("first") is None
+        assert "Error: tool exploded" in output.getvalue().splitlines()
+        repl.run_turn("second")
+        human = _humans(repl.agent.get_state(config).values["messages"])[-1]
+        assert "Background task t1 (explore) done." in human.content[0]["text"]
+        assert human.content[1]["text"] == "second"
+        assert repl.tasks.drain_notices() == []
+    finally:
+        repl.close()
+
+
+def test_subagents_do_not_get_task_tools(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    main_names: list = []
+    worker_names: list = []
+    explore_names: list = []
+    plan_names: list = []
+
+    def main(messages):
+        if not tool_names_since_last_human(messages):
+            return tool_calls(
+                task_call("general-purpose", "do a thing", "d1"),
+                task_call("explore", "look around", "d2"),
+                {"name": "start_task", "args": {"agent": "plan", "prompt": "plan it"}, "id": "s1", "type": "tool_call"},
+            )
+        return AIMessage(content="done")
+
+    workers = {
+        "general-purpose": _reply("worked", bound=worker_names),
+        "explore": _reply("looked", bound=explore_names),
+        "plan": _reply("planned", bound=plan_names),
+    }
+    repl, _output = _task_repl(tmp_path, main, workers, main_bound=main_names)
+    try:
+        repl.run_turn("go")
+        assert repl.tasks.wait("t1", timeout=TIMEOUT).status == "done"
+        assert TASK_TOOLS <= set(main_names[0])
+        for bound in (worker_names, explore_names, plan_names):
+            assert bound, "the worker was never called"
+            assert all(not (TASK_TOOLS & set(names)) for names in bound)
+    finally:
+        repl.close()
+
+
+def test_one_shot_mode_has_no_task_tools(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    main_names: list = []
+    repl, output = _task_repl(
+        tmp_path, lambda _m: AIMessage(content="ok"), {}, main_bound=main_names, background=False
+    )
+    try:
+        assert repl.tasks is None
+        repl.run_turn("hi")
+        assert main_names and all(not (TASK_TOOLS & set(names)) for names in main_names)
+        for line in ("/tasks", "/tasks show t1", "/tasks cancel t1"):
+            repl.handle_line(line)
+        lines = output.getvalue().splitlines()
+        assert lines.count("Background tasks are off in this mode.") == 3
+    finally:
+        repl.close()
+
+
+def test_task_approval_is_asked_at_prompt_boundary(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    prompts: list[str] = []
+
+    def ask(prompt=""):
+        prompts.append(prompt)
+        return "y"
+
+    repl, output = _task_repl(
+        tmp_path,
+        _starts_then_answers("general-purpose", "say hi"),
+        {"general-purpose": _runs("echo hi")},
+        auto_run=False,
+        input_fn=ask,
+    )
+    try:
+        repl.run_turn("start it")
+        assert repl.tasks.wait("t1", timeout=TIMEOUT).status == "needs_approval"
+        assert prompts == []
+        assert "task t1 [general-purpose] needs approval" in output.getvalue().splitlines()
+        repl.service_tasks()
+        assert prompts == ["[y/n] "]
+        assert "task t1 [general-purpose] wants to run: echo hi" in output.getvalue().splitlines()
+        assert repl.tasks.wait("t1", timeout=TIMEOUT).status == "done"
+        assert repl.tasks.backend_for("t1").vet_log == [{"command": "echo hi", "allowed": True}]
+    finally:
+        repl.close()
+
+
+def test_notice_never_consumed_as_approval(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    release = threading.Event()
+    prompts: list[str] = []
+    box: list = []
+
+    def ask(prompt=""):
+        prompts.append(prompt)
+        release.set()
+        assert box[0].tasks.wait("t2", timeout=TIMEOUT).status == "done"
+        return "y"
+
+    workers = {"general-purpose": _runs("echo hi"), "explore": _blocked(release, text="second result")}
+    repl, _output = _task_repl(
+        tmp_path, lambda _m: AIMessage(content="ok"), workers, auto_run=False, input_fn=ask
+    )
+    box.append(repl)
+    config = {"configurable": {"thread_id": repl.thread_id}}
+    try:
+        repl.tasks.start("general-purpose", "say hi", flags=TurnFlags())
+        repl.tasks.start("explore", "wait", flags=TurnFlags())
+        assert repl.tasks.wait("t1", timeout=TIMEOUT).status == "needs_approval"
+        repl.service_tasks()
+        assert prompts == ["[y/n] "]
+        assert repl.tasks.wait("t1", timeout=TIMEOUT).status == "done"
+        assert repl.tasks.backend_for("t1").vet_log == [{"command": "echo hi", "allowed": True}]
+        repl.run_turn("next")
+        human = _humans(repl.agent.get_state(config).values["messages"])[-1]
+        assert "Background task t2 (explore) done.\nsecond result" in human.content[0]["text"]
+        assert human.content[1]["text"] == "next"
+    finally:
+        release.set()
+        repl.close()
+
+
+def test_ctrl_c_at_task_approval_rejects(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    prompts: list[str] = []
+    box: list = []
+
+    def ask(prompt=""):
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            raise KeyboardInterrupt
+        box.append(box[0].tasks.wait("t1", timeout=TIMEOUT))  # the loop is still usable
+        return "/exit"
+
+    repl, output = _task_repl(
+        tmp_path, lambda _m: AIMessage(content="ok"), {"general-purpose": _runs("echo hi")}, auto_run=False, input_fn=ask
+    )
+    box.append(repl)
+    try:
+        repl.tasks.start("general-purpose", "say hi", flags=TurnFlags())
+        assert repl.tasks.wait("t1", timeout=TIMEOUT).status == "needs_approval"
+        repl.loop()
+        assert prompts == ["[y/n] ", "absolut> "]
+        finished = box[1]
+        assert finished.status == "done"
+        assert "User rejected the command." in finished.result
+        assert repl.tasks.backend_for("t1").vet_log == []
+        text = output.getvalue()
+        assert "task t1 [general-purpose] wants to run: echo hi" in text.splitlines()
+        assert "Traceback" not in text
+    finally:
+        repl.close()
+
+
+def test_eof_stops_asking_further_task_approvals(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    prompts: list[str] = []
+
+    def ask(prompt=""):
+        prompts.append(prompt)
+        raise EOFError
+
+    repl, _output = _task_repl(
+        tmp_path, lambda _m: AIMessage(content="ok"), {"general-purpose": _runs("echo hi")}, auto_run=False, input_fn=ask
+    )
+    try:
+        repl.tasks.start("general-purpose", "one", flags=TurnFlags())
+        repl.tasks.start("general-purpose", "two", flags=TurnFlags())
+        assert repl.tasks.wait("t1", timeout=TIMEOUT).status == "needs_approval"
+        assert repl.tasks.wait("t2", timeout=TIMEOUT).status == "needs_approval"
+        repl.service_tasks()
+        assert prompts == ["[y/n] "]
+        statuses = sorted(repl.tasks.wait(i, timeout=TIMEOUT).status for i in ("t1", "t2"))
+        assert statuses == ["done", "needs_approval"]
+    finally:
+        repl.close()
+
+
+def test_tasks_commands(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    release, started = threading.Event(), threading.Event()
+    workers = {"explore": _reply("3 files\nin src"), "plan": _blocked(release, started)}
+    repl, output = _task_repl(tmp_path, lambda _m: AIMessage(content="ok"), workers)
+
+    def lines_after(command):
+        start = len(output.getvalue().splitlines())
+        repl.handle_line(command)
+        return output.getvalue().splitlines()[start:]
+
+    try:
+        assert lines_after("/tasks") == ["No background tasks."]
+        repl.tasks.start("explore", "count files", flags=TurnFlags())
+        assert repl.tasks.wait("t1", timeout=TIMEOUT).status == "done"
+        repl.tasks.start("plan", "x" * 80, flags=TurnFlags())
+        assert started.wait(TIMEOUT)
+        assert lines_after("/tasks") == ["t1  explore  done  count files", "t2  plan  running  " + "x" * 60]
+        assert lines_after("/tasks show t1") == ["t1  explore  done  count files", "3 files", "in src"]
+        assert lines_after("/tasks cancel t2") == ["Cancelled t2."]
+        assert lines_after("/tasks cancel t1") == ["t1 is not running."]
+        assert lines_after("/tasks show t9") == ["Unknown task t9"]
+    finally:
+        release.set()
+        repl.close()
+
+
+def test_exit_cancels_running_tasks(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    release, started = threading.Event(), threading.Event()
+    repl, output = _task_repl(
+        tmp_path,
+        lambda _m: AIMessage(content="ok"),
+        {"explore": _blocked(release, started)},
+        input_fn=lambda _p="": "/exit",
+    )
+    timer = threading.Timer(0.3, release.set)
+    try:
+        repl.tasks.start("explore", "wait", flags=TurnFlags())
+        assert started.wait(TIMEOUT)
+        timer.start()
+        repl.loop()
+        text = output.getvalue()
+        lines = text.splitlines()
+        assert "cancelled 1 running task(s)" in lines
+        assert "waiting for 1 background task(s) to stop (Ctrl+C to leave now)" in lines
+        assert repl.tasks.get("t1").status == "cancelled"
+        repl.close()
+        assert output.getvalue() == text
+    finally:
+        timer.cancel()
+        release.set()
+        repl.close()
+
+
+def test_ctrl_c_while_waiting_leaves_at_once(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    release, started = threading.Event(), threading.Event()
+    repl, output = _task_repl(tmp_path, lambda _m: AIMessage(content="ok"), {"explore": _blocked(release, started)})
+    real_wait = repl.tasks.wait
+
+    def interrupted_wait(task_id, timeout=None):
+        raise KeyboardInterrupt
+
+    try:
+        repl.tasks.start("explore", "wait", flags=TurnFlags())
+        assert started.wait(TIMEOUT)
+        repl.tasks.wait = interrupted_wait
+        assert repl.close() is False
+        assert repl.close() is False
+        assert "Traceback" not in output.getvalue()
+    finally:
+        repl.tasks.wait = real_wait
+        release.set()
+        repl.close()
+
+
+class _StreamingMain(BaseChatModel):
+    """Streams 'Hello ', lets the background tasks finish mid-line, then streams 'world'."""
+
+    between: object = None
+
+    @property
+    def _llm_type(self) -> str:
+        return "fake-stream"
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content="Hello world"))])
+
+    def _stream(self, messages, stop=None, run_manager=None, **kwargs):
+        for index, text in enumerate(("Hello ", "world")):
+            if index == 1:
+                self.between()
+            chunk = ChatGenerationChunk(message=AIMessageChunk(content=text, id="m-stream"))
+            if run_manager is not None:
+                run_manager.on_llm_new_token(text, chunk=chunk)
+            yield chunk
+
+
+def test_task_event_lines_are_whole_lines(tmp_path, monkeypatch):
+    import absolutcoder.repl as repl_module
+    from absolutcoder.render import StreamRenderer
+
+    _no_web(monkeypatch)
+    monkeypatch.setattr(repl_module, "StreamRenderer", lambda console: StreamRenderer(console, live=True))
+    release = threading.Event()
+    box: list = []
+
+    def between():
+        release.set()
+        for task_id in ("t1", "t2", "t3"):
+            assert box[0].tasks.wait(task_id, timeout=TIMEOUT).status == "done"
+
+    repl, output = _task_repl(tmp_path, _StreamingMain(between=between), {"explore": _blocked(release)})
+    box.append(repl)
+    try:
+        for name in ("a", "b", "c"):
+            repl.tasks.start("explore", name, flags=TurnFlags())
+        assert repl.run_turn("go") is not None
+        lines = output.getvalue().splitlines()
+        task_lines = [line for line in lines if re.search(r"task t\d", line)]
+        assert sum(line.endswith(" done") for line in task_lines) == 3
+        for line in task_lines:
+            assert re.fullmatch(r"task t\d+ \[[^\]]+\] (running|done|failed|cancelled|needs approval)", line), line
+        assert "Hello" in [line.strip() for line in lines]
+        assert "world" in lines
+    finally:
+        release.set()
+        repl.close()
+
+
+def test_rebuild_keeps_tasks_and_tools(tmp_path, monkeypatch):
+    import absolutcoder.repl as repl_module
+
+    _no_web(monkeypatch)
+    received: list = []
+    real_build_agent = repl_module.build_agent
+
+    def recording_build_agent(*args, **kwargs):
+        received.append(list(kwargs.get("extra_tools", ())))
+        return real_build_agent(*args, **kwargs)
+
+    monkeypatch.setattr(repl_module, "build_agent", recording_build_agent)
+    release, started = threading.Event(), threading.Event()
+    workers = {"explore": _blocked(release, started, text="finished")}
+    repl, output = _task_repl(tmp_path, lambda _m: AIMessage(content="ok"), workers, auto_run=False)
+    try:
+        manager = repl.tasks
+        repl.tasks.start("explore", "wait", flags=TurnFlags())
+        assert started.wait(TIMEOUT)
+        repl.handle_line("/auto on")
+        assert "auto_run on" in output.getvalue()
+        assert repl.tasks is manager
+        assert len(received) == 2
+        assert [tool.name for tool in received[0]] == ["start_task", "check_task", "list_tasks", "cancel_task"]
+        assert all(a is b for a, b in zip(received[0], received[1], strict=True))
+        release.set()
+        finished = repl.tasks.wait("t1", timeout=TIMEOUT)
+        assert (finished.status, finished.result) == ("done", "finished")
+    finally:
+        release.set()
+        repl.close()
+
+
+def test_main_prompt_mentions_background_tasks_only_with_the_tools(tmp_path, monkeypatch):
+    import absolutcoder.agent as agent_module
+    from absolutcoder.agent import BACKGROUND_PARAGRAPH
+
+    _no_web(monkeypatch)
+    prompts: list[str] = []
+    real = agent_module.create_deep_agent
+
+    def recording(**kwargs):
+        if kwargs.get("name") == "main":
+            prompts.append(kwargs["system_prompt"])
+        return real(**kwargs)
+
+    monkeypatch.setattr(agent_module, "create_deep_agent", recording)
+    for background in (True, False):
+        repl, _output = _task_repl(tmp_path, lambda _m: AIMessage(content="ok"), {}, background=background)
+        repl.close()
+    assert BACKGROUND_PARAGRAPH.startswith("Background tasks: start_task starts a worker")
+    assert prompts[0].rstrip("\n").endswith("\n\n" + BACKGROUND_PARAGRAPH)
+    assert BACKGROUND_PARAGRAPH not in prompts[1]
+
+
+def test_help_lists_tasks_command(tmp_path):
+    repl, output = _plain_repl(tmp_path)
+    try:
+        repl.handle_line("/nope")
+        assert "/tasks" in output.getvalue().splitlines()[-1]
+    finally:
+        repl.close()
+
+
+def test_run_cli_closes_and_passes_background(tmp_path, monkeypatch):
+    from absolutcoder.repl import run_cli
+
+    monkeypatch.chdir(tmp_path)
+    made: list = []
+
+    class Recorder:
+        def __init__(self, repo, config, *, background=True):
+            made.append(background)
+            self.pending_attachments = []
+            self.input_fn = lambda _p="": "/exit"
+            self.closed = 0
+
+        def run_task(self, text, paths=None):
+            return None
+
+        def loop(self):
+            pass
+
+        def close(self):
+            self.closed += 1
+            return True
+
+    config = Config(main_model="openai:a", subagent_model="openai:b")
+    assert run_cli(SimpleNamespace(task="hi", attach=[]), config, repl_factory=Recorder) == 0
+    assert run_cli(SimpleNamespace(task=None, attach=[]), config, repl_factory=Recorder) == 0
+    assert made == [False, True]
