@@ -1,4 +1,4 @@
-"""Config files round-trip, and only OpenAI model ids are accepted."""
+"""Config files round-trip, and provider-prefixed model ids are accepted."""
 
 import json
 
@@ -15,9 +15,14 @@ def test_openai_prefix_is_preserved():
     assert resolve_model("openai:gpt-6.1-sol") == "openai:gpt-6.1-sol"
 
 
-def test_other_provider_is_rejected():
-    with pytest.raises(ValueError):
-        resolve_model("anthropic:claude-sonnet-5")
+def test_malformed_provider_is_rejected():
+    for bad in (":x", "a b:x", "openai:"):
+        with pytest.raises(ValueError):
+            resolve_model(bad)
+
+
+def test_other_provider_is_accepted():
+    assert resolve_model("anthropic:claude-x") == "anthropic:claude-x"
 
 
 def test_save_and_load_preserves_models_and_auto_run(tmp_path):

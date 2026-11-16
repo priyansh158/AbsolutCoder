@@ -1,13 +1,13 @@
-"""Load and save AbsolutCoder settings, and resolve OpenAI model ids."""
+"""Load and save AbsolutCoder settings, and resolve provider model ids."""
 
 from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 
-OPENAI_PROVIDER = "openai"
+from absolutcoder.models import ProviderSettings, normalize_model_id
 
 
 def data_dir() -> Path:
@@ -33,21 +33,47 @@ class Config:
     main_model: str
     subagent_model: str
     auto_run: bool = False
+    providers: dict[str, ProviderSettings] = field(default_factory=dict)
+    agent_models: dict[str, str] = field(default_factory=dict)
+    shell: str = "auto"
+    verify_command: str | None = None
+    max_rounds: int = 5
+    web_max_chars: int = 20000
+    max_background_tasks: int = 4
+
+
+_PROVIDER_FIELDS = {f.name for f in fields(ProviderSettings)}
 
 
 def load_config(path: Path | str) -> Config:
     """Read a config file. Model strings are returned as stored."""
 
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    defaults = Config(main_model="", subagent_model="")
+    providers = {
+        name: ProviderSettings(
+            **{k: v for k, v in (value or {}).items() if k in _PROVIDER_FIELDS}
+        )
+        for name, value in (payload.get("providers") or {}).items()
+    }
     return Config(
         main_model=payload["main_model"],
         subagent_model=payload["subagent_model"],
         auto_run=bool(payload.get("auto_run", False)),
+        providers=providers,
+        agent_models=dict(payload.get("agent_models") or {}),
+        shell=payload.get("shell", defaults.shell),
+        verify_command=payload.get("verify_command", defaults.verify_command),
+        max_rounds=payload.get("max_rounds", defaults.max_rounds),
+        web_max_chars=payload.get("web_max_chars", defaults.web_max_chars),
+        max_background_tasks=payload.get(
+            "max_background_tasks", defaults.max_background_tasks
+        ),
     )
 
 
 def save_config(path: Path | str, config: Config) -> None:
-    """Write both model fields and auto_run."""
+    """Write every config field."""
 
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -55,23 +81,9 @@ def save_config(path: Path | str, config: Config) -> None:
 
 
 def resolve_model(model_id: str) -> str:
-    """Normalize a model id to ``openai:<id>``.
+    """Normalize a model id to ``provider:model``; a bare id means OpenAI."""
 
-    A value with no provider prefix is treated as an OpenAI model. Any other
-    provider prefix is rejected. This version does not call other providers.
-    """
-
-    text = model_id.strip()
-    if not text:
-        raise ValueError("model id is empty")
-    if ":" in text:
-        provider, _, rest = text.partition(":")
-        if provider.lower() != OPENAI_PROVIDER or not rest.strip():
-            raise ValueError(
-                f"Only OpenAI models are supported, got provider {provider!r}"
-            )
-        return f"{OPENAI_PROVIDER}:{rest.strip()}"
-    return f"{OPENAI_PROVIDER}:{text}"
+    return normalize_model_id(model_id)
 
 
 def ensure_config(path: Path | str | None = None, *, input_fn=input, output_fn=print) -> Config:
@@ -80,12 +92,16 @@ def ensure_config(path: Path | str | None = None, *, input_fn=input, output_fn=p
     target = Path(path) if path is not None else config_path()
     if target.exists():
         config = load_config(target)
-        return Config(
+        return replace(
+            config,
             main_model=resolve_model(config.main_model),
             subagent_model=resolve_model(config.subagent_model),
-            auto_run=config.auto_run,
+            agent_models={k: resolve_model(v) for k, v in config.agent_models.items()},
         )
-    output_fn("First launch: enter the OpenAI model ids for AbsolutCoder.")
+    output_fn(
+        "First launch: enter the model ids for AbsolutCoder "
+        "(a bare id means OpenAI; use provider:model for others)."
+    )
     main_model = resolve_model(input_fn("Main model id: "))
     subagent_model = resolve_model(input_fn("Subagent model id: "))
     config = Config(main_model=main_model, subagent_model=subagent_model, auto_run=False)

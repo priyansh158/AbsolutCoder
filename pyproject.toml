@@ -1,7 +1,7 @@
 [project]
 name = "absolutcoder"
 version = "0.1.0"
-description = "Local terminal coding agent on Deep Agents and LangGraph"
+description = "Local terminal coding agent on Deep Agents and LangGraph, for any model provider"
 requires-python = ">=3.12"
 dependencies = [
     "deepagents",
@@ -13,6 +13,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
+anthropic = ["langchain-anthropic"]
+google = ["langchain-google-genai"]
+ollama = ["langchain-ollama"]
+all = ["langchain-anthropic", "langchain-google-genai", "langchain-ollama"]
 
 [project.scripts]
 absolut = "absolutcoder.cli:main"
