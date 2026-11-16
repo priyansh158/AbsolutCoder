@@ -313,3 +313,24 @@ def test_interrupted_ends_line_and_says_so():
     renderer.interrupted()
     assert output.getvalue().splitlines() == ["half a", "interrupted"]
     _clean(renderer)
+
+
+def test_final_answer_equal_to_earlier_narration_is_printed_again():
+    for live in (True, False):
+        renderer, output = _renderer(live)
+        if live:
+            renderer.feed(_msg(AIMessageChunk(content="Done.", id="n1")))
+        renderer.feed(_upd("model", [_call("ls", {"path": "/"}, "c1", message_id="n1", content="Done.")]))
+        renderer.feed(_upd("tools", [ToolMessage(content="a", tool_call_id="c1", name="ls", id="r1")]))
+        renderer.finish(_snapshot(AIMessage(content="Done.", id="m2")))
+        assert output.getvalue().splitlines().count("Done.") == 2, (live, output.getvalue())
+        _clean(renderer)
+
+
+def test_summarization_tokens_inside_the_model_node_are_not_printed():
+    renderer, output = _renderer(True)
+    part = _msg(AIMessageChunk(content="summary text", id="s1"))
+    part["data"][1]["lc_source"] = "summarization"
+    renderer.feed(part)
+    assert "summary text" not in output.getvalue()
+    _clean(renderer)

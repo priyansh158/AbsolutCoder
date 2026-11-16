@@ -25,6 +25,7 @@ from absolutcoder.git_policy import TurnFlags
 from absolutcoder.render import message_text
 from absolutcoder.shell import GuardedShellBackend
 from absolutcoder.subagents import AgentDef
+from absolutcoder.webtools import UNTRUSTED_CLOSE, UNTRUSTED_NOTE, UNTRUSTED_OPEN
 
 TASK_STATUSES = ("queued", "running", "needs_approval", "done", "failed", "cancelled")
 
@@ -122,19 +123,22 @@ class TaskManager:
             )
             task = _Task(record=record, role=roles[agent])
             self._tasks[record.id] = task
-            try:
-                task.backend = GuardedShellBackend(
-                    root_dir=self.repo, flags=flags, shell=self.shell, agent_label=f"task {record.id}"
-                )
-            except Exception as error:  # noqa: BLE001 - reported on the record, never raised
-                failure = str(error)
-            else:
-                failure = None
-                task.future = self._pool.submit(self._run, task, payload)
             snapshot = replace(record)
+        # Announced before the pool can report any later status.
         self._emit(snapshot)
-        if failure is not None:
-            self._finish(task, "failed", error=failure)
+        try:
+            # Outside the lock: the constructor runs git subprocesses.
+            backend = GuardedShellBackend(
+                root_dir=self.repo, flags=flags, shell=self.shell, agent_label=f"task {record.id}"
+            )
+        except Exception as error:  # noqa: BLE001 - reported on the record, never raised
+            self._finish(task, "failed", error=str(error))
+            return self.get(record.id)
+        with self._lock:
+            task.backend = backend
+            # cancel() or shutdown() may have settled it meanwhile; then it never starts.
+            if task.record.status == "queued" and not task.cancel.is_set() and not self._closed:
+                task.future = self._pool.submit(self._run, task, payload)
         return self.get(record.id)
 
     def get(self, task_id: str) -> TaskRecord:
@@ -347,9 +351,14 @@ def _body(record: TaskRecord) -> str:
         text = "Cancelled."
     else:
         text = record.result or ""
-    if len(text) > _NOTICE_LIMIT:
-        text = text[:_NOTICE_LIMIT] + "\n[truncated]"
-    return text
+    if len(text) <= _NOTICE_LIMIT:
+        return text
+    kept = text[:_NOTICE_LIMIT] + "\n[truncated]"
+    if kept.count(UNTRUSTED_OPEN) > kept.count(UNTRUSTED_CLOSE):
+        # The cut fell inside a web-content block: close it again, so later
+        # text never reads as part of the untrusted region.
+        kept += "\n" + UNTRUSTED_CLOSE + "\n" + UNTRUSTED_NOTE
+    return kept
 
 
 def _pending_interrupts(state) -> list:

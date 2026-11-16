@@ -291,6 +291,9 @@ class StreamRenderer:
         with self._output:
             self.end_line()
             self._streamed = ""
+            # Any line ends the text a repeated answer is compared with;
+            # _print_text sets it again after a text line.
+            self._last_text = None
             self._print(text)
 
     def _print(self, text: str) -> None:

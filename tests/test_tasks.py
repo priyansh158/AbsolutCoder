@@ -554,3 +554,44 @@ def test_list_tasks_when_empty(make_manager):
 def test_tool_names_and_order(make_manager):
     names = [t.name for t in make_task_tools(make_manager({}), lambda: TurnFlags())]
     assert names == ["start_task", "check_task", "list_tasks", "cancel_task"]
+
+
+def test_long_wrapped_result_keeps_its_closing_tag(make_manager):
+    from absolutcoder.webtools import UNTRUSTED_CLOSE, UNTRUSTED_NOTE, UNTRUSTED_OPEN, wrap_untrusted
+
+    report = wrap_untrusted("y" * 10_000, "https://example.com/page")
+    manager = make_manager({"explore": _reply(report)})
+    tools = {t.name: t for t in make_task_tools(manager, lambda: TurnFlags())}
+    manager.start("explore", "read the page", flags=TurnFlags())
+    manager.wait("t1", timeout=TIMEOUT)
+    (notice_text,) = manager.drain_notices()
+    checked = tools["check_task"].invoke({"task_id": "t1"})
+    for text in (notice_text, checked):
+        body = text.split("\n", 1)[1]
+        assert body.startswith(UNTRUSTED_OPEN)
+        assert body.endswith(UNTRUSTED_CLOSE + "\n" + UNTRUSTED_NOTE)
+        assert body.count(UNTRUSTED_CLOSE) == 1
+        assert "[truncated]" in body
+        assert len(body) < 4300
+    assert manager.get("t1").result == report
+
+
+def test_queued_is_announced_first_and_the_backend_is_made_outside_the_lock(make_manager, monkeypatch):
+    import absolutcoder.tasks as tasks_module
+
+    seen: list[str] = []
+    box: list = []
+    real_backend = tasks_module.GuardedShellBackend
+
+    def backend(*args, **kwargs):
+        assert not box[0]._lock.locked()
+        assert seen == ["queued"]
+        return real_backend(*args, **kwargs)
+
+    monkeypatch.setattr(tasks_module, "GuardedShellBackend", backend)
+    manager = make_manager({"explore": _reply("fine")}, on_event=lambda r: seen.append(r.status))
+    box.append(manager)
+    manager.start("explore", "go", flags=TurnFlags())
+    assert manager.wait("t1", timeout=TIMEOUT).status == "done"
+    assert seen[0] == "queued"
+    assert seen.index("running") < seen.index("done")
