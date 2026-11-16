@@ -84,8 +84,8 @@ def build_model(
         extra["base_url"] = settings.base_url
     if settings.api_key_env:
         value = os.environ.get(settings.api_key_env, "").strip()
-        if value:
-            extra["api_key"] = value
+        # Never let ChatOpenAI fall back to OPENAI_API_KEY for a custom endpoint.
+        extra["api_key"] = value or "not-set"
     elif not os.environ.get("OPENAI_API_KEY", "").strip():
         extra["api_key"] = "not-needed"
     return init_chat_model(

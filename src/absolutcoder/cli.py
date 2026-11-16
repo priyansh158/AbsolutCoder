@@ -29,21 +29,24 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if not _has_api_key():
-        print(
-            "OPENAI_API_KEY is not set. Set it to your OpenAI API key and run absolut again.",
-            file=sys.stderr,
-        )
+    import os
+
+    from absolutcoder.config import ensure_config
+    from absolutcoder.models import missing_keys
+
+    try:
+        config = ensure_config()
+    except ValueError as error:
+        print(f"Config error: {error}", file=sys.stderr)
+        raise SystemExit(1)
+    missing = missing_keys(config, os.environ)
+    if missing:
+        for entry in missing:
+            print(f"{entry} is not set. Set it and run absolut again.", file=sys.stderr)
         raise SystemExit(1)
     from absolutcoder.repl import run_cli
 
-    raise SystemExit(run_cli(args))
-
-
-def _has_api_key() -> bool:
-    import os
-
-    return bool(os.environ.get("OPENAI_API_KEY", "").strip())
+    raise SystemExit(run_cli(args, config=config))
 
 
 if __name__ == "__main__":

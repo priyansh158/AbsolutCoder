@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from absolutcoder.config import Config, load_config, save_config
 from absolutcoder.models import (
     ProviderSettings,
@@ -99,3 +101,36 @@ def test_new_fields_round_trip(tmp_path):
     )
     save_config(path, original)
     assert load_config(path) == original
+
+
+def test_unset_alias_key_never_falls_back_to_openai_key(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-real")
+    monkeypatch.delenv("MY_KEY", raising=False)
+    providers = {
+        "local": ProviderSettings(
+            kind="openai", base_url="http://localhost:1/v1", api="chat", api_key_env="MY_KEY"
+        )
+    }
+    model = build_model("local:llama3", providers)
+    assert model.openai_api_key.get_secret_value() == "not-set"
+
+
+def test_alias_key_is_read_from_its_variable(monkeypatch):
+    monkeypatch.setenv("MY_KEY", "k1")
+    providers = {
+        "local": ProviderSettings(
+            kind="openai", base_url="http://localhost:1/v1", api="chat", api_key_env="MY_KEY"
+        )
+    }
+    model = build_model("local:llama3", providers)
+    assert model.openai_api_key.get_secret_value() == "k1"
+
+
+def test_provider_names_are_lowercased_on_load(tmp_path):
+    path = tmp_path / "config.json"
+    base = {"main_model": "openai:a", "subagent_model": "openai:b"}
+    path.write_text(json.dumps({**base, "providers": {"Local": {"kind": "openai"}}}))
+    assert list(load_config(path).providers) == ["local"]
+    path.write_text(json.dumps({**base, "providers": {"local": "x"}}))
+    with pytest.raises(ValueError, match="providers.local must be an object"):
+        load_config(path)

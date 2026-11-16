@@ -50,12 +50,13 @@ def load_config(path: Path | str) -> Config:
 
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     defaults = Config(main_model="", subagent_model="")
-    providers = {
-        name: ProviderSettings(
-            **{k: v for k, v in (value or {}).items() if k in _PROVIDER_FIELDS}
+    providers: dict[str, ProviderSettings] = {}
+    for name, value in (payload.get("providers") or {}).items():
+        if not isinstance(value, dict):
+            raise ValueError(f"providers.{name} must be an object")
+        providers[name.lower()] = ProviderSettings(
+            **{k: v for k, v in value.items() if k in _PROVIDER_FIELDS}
         )
-        for name, value in (payload.get("providers") or {}).items()
-    }
     return Config(
         main_model=payload["main_model"],
         subagent_model=payload["subagent_model"],

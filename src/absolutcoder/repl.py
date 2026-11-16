@@ -266,13 +266,14 @@ class Repl:
             return self.input_fn()
 
 
-def run_cli(args) -> int:
+def run_cli(args, config: Config | None = None) -> int:
     """Run one task, or open the terminal loop, from the current repo."""
 
     from absolutcoder.config import ensure_config
 
     repo = Path.cwd()
-    config = ensure_config()
+    if config is None:
+        config = ensure_config()
     repl = Repl(repo, config)
     attachments = [Path(item) for item in getattr(args, "attach", [])]
     if getattr(args, "task", None):
