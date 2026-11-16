@@ -32,13 +32,14 @@ from absolutcoder.sessions import (
     update_session,
 )
 from absolutcoder.shell import GuardedShellBackend, ShellNotFound
-from absolutcoder.skills import global_skills_dir, install_skill, list_skills, remove_skill
+from absolutcoder.skills import global_skills_dir, install_skill, list_skills, remove_skill, skill_body
 from absolutcoder.tasks import TaskManager, TaskRecord, make_task_tools
 from absolutcoder.webtools import make_web_tools
 
 _COMMANDS = "Commands: /model, /subagent, /auto, /resume, /attach, /agents, /tasks, /skills, /verify, /loop, /exit, /quit"
 _SKILLS_ADD_USAGE = "Usage: /skills add <folder>"
 _SKILLS_REMOVE_USAGE = "Usage: /skills remove <name>"
+_SKILLS_USAGE = "Usage: /skills [add <folder> | remove <name>]"
 _BUILTIN_COMMANDS = frozenset(
     {"/model", "/subagent", "/auto", "/resume", "/attach", "/agents", "/tasks", "/skills",
      "/verify", "/loop", "/exit", "/quit"}
@@ -211,7 +212,7 @@ class Repl:
         paths: list[Path] | None = None,
         *,
         flags: TurnFlags | None = None,
-        skill: str | None = None,
+        skill_block: str | None = None,
     ):
         """Run one user turn on the current thread and return the graph state.
 
@@ -223,8 +224,8 @@ class Repl:
         Finished background tasks are reported in an extra text block ahead of
         the user's text; the flags never come from it. If the turn fails before
         that block reached the conversation, the notices go back on the queue.
-        ``skill`` names a skill whose instructions the skills middleware adds
-        to this turn (the ``pinned_skills`` state key); flags never come from it.
+        ``skill_block`` is a skill's instructions, sent as a text block between
+        the notices and the request; flags never come from it.
         """
 
         self.last_turn_interrupted = False
@@ -240,11 +241,13 @@ class Repl:
         updates = _updates_block(notices)
         try:
             content = build_user_content(text, attachments)
+            if skill_block is not None:
+                content.insert(0, {"type": "text", "text": skill_block})
             if updates is not None:
                 content.insert(0, updates)
-            payload: dict = {"messages": [{"role": "user", "content": content}]}
-            if skill:
-                payload["pinned_skills"] = [skill]
+            # skills_metadata is checkpointed; None makes the skills middleware
+            # reload the list from disk, so installs and removals show at once.
+            payload: dict = {"messages": [{"role": "user", "content": content}], "skills_metadata": None}
             return self._drive(payload, config)
         except GraphBubbleUp:
             self._requeue_undelivered(notices, updates, config)
@@ -284,20 +287,20 @@ class Repl:
             self.tasks.requeue_notices(notices)
 
     def run_task(
-        self, text: str, paths: list[Path] | None = None, *, skill: str | None = None
+        self, text: str, paths: list[Path] | None = None, *, skill_block: str | None = None
     ) -> VerifyOutcome | None:
         """Run one user request; with a check command, repeat until the check passes.
 
         Every turn of the request, including the follow-ups that carry check
-        output, runs with the flags of the user's own message. ``skill`` is
-        loaded on the first turn only.
+        output, runs with the flags of the user's own message. ``skill_block``
+        goes with the first turn only.
         """
 
         self._task_stopped = False
         flags = TurnFlags.from_message(text)
         command = self.config.verify_command
         if not command:
-            self.run_turn(text, paths, flags=flags, skill=skill)
+            self.run_turn(text, paths, flags=flags, skill_block=skill_block)
             self._service_after_turn()
             return None
         rounds = 0
@@ -306,7 +309,10 @@ class Repl:
             nonlocal rounds
             rounds += 1
             result = self.run_turn(
-                message, paths if rounds == 1 else [], flags=flags, skill=skill if rounds == 1 else None
+                message,
+                paths if rounds == 1 else [],
+                flags=flags,
+                skill_block=skill_block if rounds == 1 else None,
             )
             if self.last_turn_interrupted:
                 raise KeyboardInterrupt
@@ -557,11 +563,17 @@ class Repl:
             self._skills_command(argument)
             return
         name = command[1:]
-        if command not in _BUILTIN_COMMANDS and any(s.name == name for s in list_skills(self.repo)):
+        skill = next((s for s in list_skills(self.repo) if s.name == name), None)
+        if command not in _BUILTIN_COMMANDS and skill is not None:
             if not argument:
                 self._say(f"Usage: /{name} <request>")
                 return
-            self.run_task(argument, skill=name)
+            body = skill_body(skill)
+            if not body:
+                self._say(f"Could not load the {name} skill.")
+                return
+            block = f"[Instructions of the {name} skill, loaded because the user typed /{name}]\n{body}"
+            self.run_task(argument, skill_block=block)
             return
         self.console.print(_COMMANDS)
 
@@ -569,6 +581,8 @@ class Repl:
         action, _, rest = argument.partition(" ")
         rest = rest.strip()
         if action == "add":
+            if len(rest) >= 2 and rest[0] == rest[-1] and rest[0] in "'\"":
+                rest = rest[1:-1].strip()
             if not rest:
                 self._say(_SKILLS_ADD_USAGE)
                 return
@@ -577,8 +591,8 @@ class Repl:
             except ValueError as error:
                 self._say(f"Could not add skill: {error}")
                 return
-            self._say(f"Installed {info.name} into {global_skills_dir()}")
-            self._rebuild()
+            self._say(f"Installed {info.name} into {global_skills_dir()} (global: loads in every project).")
+            self._rebuild_after_skill_change()
             return
         if action == "remove":
             if not rest:
@@ -592,24 +606,32 @@ class Repl:
             if not removed:
                 self._say(f"No global skill named {rest}.")
                 return
-            self._say(f"Removed {rest}.")
-            self._rebuild()
+            self._say(f"Removed {rest} (it no longer loads in any project).")
+            self._rebuild_after_skill_change()
+            return
+        if argument:
+            self._say(_SKILLS_USAGE)
             return
         skills = list_skills(self.repo)
         if not skills:
             self._say("No skills. Add one with /skills add <folder>.")
         for skill in skills:
             description = " ".join(skill.description.split())[:100]
-            self._say(f"{skill.name}  [{skill.scope}]  {description}")
+            note = (
+                f" (type its name in a request; /{skill.name} is a built-in command)"
+                if f"/{skill.name}" in _BUILTIN_COMMANDS
+                else ""
+            )
+            self._say(f"{skill.name}  [{skill.scope}]  {description}{note}")
 
-    def _rebuild(self) -> bool:
-        """Build a fresh graph from the current settings; keep the old one if that fails."""
+    def _rebuild_after_skill_change(self) -> None:
+        """Rebuild so the new skill folders are routed; keep the old graph if that fails."""
 
         agent = self._try_build(self.config)
         if agent is None:
-            return False
+            self._say("The change is saved but not live in this session yet.")
+            return
         self.agent = agent
-        return True
 
     def _resolve_or_report(self, argument: str) -> str | None:
         try:

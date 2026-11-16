@@ -148,6 +148,17 @@ def list_skills(repo: Path) -> list[SkillInfo]:
     return [merged[name] for name in sorted(merged)]
 
 
+def skill_body(info: SkillInfo) -> str:
+    """The text of the skill's ``SKILL.md`` after its frontmatter; ``""`` when it cannot be read."""
+
+    text = _read_skill_file(info.folder)
+    if text is None or _frontmatter(text) is None:
+        return ""
+    lines = text.splitlines()
+    closing = next(i for i in range(1, len(lines)) if lines[i].rstrip() == "---")
+    return "\n".join(lines[closing + 1 :]).strip()
+
+
 def skill_sources(repo: Path) -> list[tuple[str, str]]:
     """deepagents skill sources, global first so the project wins on a shared name."""
 

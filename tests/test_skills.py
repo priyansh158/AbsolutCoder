@@ -13,6 +13,7 @@ from absolutcoder.skills import (
     install_skill,
     list_skills,
     remove_skill,
+    skill_body,
     skill_paths_note,
     skill_sources,
 )
@@ -391,3 +392,16 @@ def test_remove_skill(tmp_path):
     assert remove_skill("demo") is False
     with pytest.raises(ValueError):
         remove_skill("../x")
+
+
+def test_skill_body_is_the_text_after_the_frontmatter(repo):
+    _skill(global_skills_dir(), "alpha", body="\n# Steps\nDo it.\n---\nmore\n")
+    (info,) = list_skills(repo)
+    assert skill_body(info) == "# Steps\nDo it.\n---\nmore"
+
+
+def test_skill_body_is_empty_when_unreadable(repo):
+    _skill(global_skills_dir(), "alpha")
+    (info,) = list_skills(repo)
+    (info.folder / "SKILL.md").unlink()
+    assert skill_body(info) == ""

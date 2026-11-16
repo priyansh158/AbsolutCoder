@@ -1662,7 +1662,8 @@ def test_auto_off_under_run_only_auto_is_saved_and_asks(tmp_path):
 # --- skill commands ---------------------------------------------------------------
 
 
-def _write_skill(folder: Path, name: str, body: str = "Do the thing.", description: str = "A demo skill") -> Path:
+def _write_skill(folder: Path, name: str | None = None, body: str = "Do the thing.", description: str = "A demo skill") -> Path:
+    name = name or folder.name
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "SKILL.md").write_text(
         f"---\nname: {name}\ndescription: {description}\n---\n\n{body}\n", encoding="utf-8"
@@ -1686,16 +1687,37 @@ def _skill_repl(tmp_path, responder, **config_fields):
     return _loop_repl(repo, responder, **config_fields)
 
 
+def _system_text(messages) -> str:
+    return _flatten([m for m in messages if getattr(m, "type", None) == "system"])
+
+
 def test_skills_command_lists_scopes(tmp_path):
     repl, output = _plain_repl(tmp_path)
     repl.handle_line("/skills")
     assert "No skills. Add one with /skills add <folder>." in _lines(output)
     _global_skill("alpha")
-    _write_skill(tmp_path / "repo" / ".absolutcoder" / "skills" / "beta", "beta", description="Project one")
+    _write_skill(tmp_path / "repo" / ".absolutcoder" / "skills" / "beta", description="Project one")
     repl.handle_line("/skills")
     lines = _lines(output)
     assert "alpha  [global]  A demo skill" in lines
     assert "beta  [project]  Project one" in lines
+
+
+def test_skills_command_notes_a_name_that_is_a_builtin_command(tmp_path):
+    repl, output = _plain_repl(tmp_path)
+    _global_skill("model")
+    repl.handle_line("/skills")
+    assert (
+        "model  [global]  A demo skill (type its name in a request; /model is a built-in command)"
+        in _lines(output)
+    )
+
+
+def test_skills_with_another_word_prints_usage_and_does_not_list(tmp_path):
+    repl, output = _plain_repl(tmp_path)
+    _global_skill("alpha")
+    repl.handle_line("/skills bogus")
+    assert _lines(output) == ["Usage: /skills [add <folder> | remove <name>]"]
 
 
 def test_skills_add_installs_and_is_live(tmp_path):
@@ -1704,16 +1726,29 @@ def test_skills_add_installs_and_is_live(tmp_path):
     systems: list[str] = []
 
     def responder(messages):
-        systems.append(_flatten([m for m in messages if getattr(m, "type", None) == "system"]))
+        systems.append(_system_text(messages))
         return AIMessage(content="ok")
 
     repl, output = _skill_repl(tmp_path, responder)
-    source = _write_skill(tmp_path / "outside" / "demo", "demo")
+    repl.handle_line("first turn")  # the thread now has state, with a skill list cached in it
+    assert "zebra-skill" not in systems[-1]
+    source = _write_skill(tmp_path / "outside" / "zebra-skill")
     repl.handle_line(f"/skills add {source}")
-    assert "Installed demo into" in output.getvalue()
+    assert f"Installed zebra-skill into {global_skills_dir()} (global: loads in every project)." in _lines(output)
+    assert (global_skills_dir() / "zebra-skill" / "SKILL.md").is_file()
+    repl.handle_line("second turn")
+    assert "zebra-skill" in systems[-1]
+
+
+def test_skills_add_accepts_a_quoted_folder(tmp_path):
+    from absolutcoder.skills import global_skills_dir
+
+    repl, output = _plain_repl(tmp_path)
+    source = _write_skill(tmp_path / "with space" / "demo")
+    repl.handle_line(f'/skills add "{source}"')
     assert (global_skills_dir() / "demo" / "SKILL.md").is_file()
-    repl.handle_line("hello")
-    assert "demo" in systems[-1]
+    repl.handle_line(f"/skills add '{source}'")
+    assert not any(line.startswith("Could not add skill") for line in _lines(output))
 
 
 def test_skills_add_reports_bad_folder(tmp_path):
@@ -1731,16 +1766,41 @@ def test_skills_add_reports_bad_folder(tmp_path):
     assert "Usage: /skills add <folder>" in _lines(output)
 
 
-def test_skills_remove(tmp_path):
+def test_skills_add_says_when_the_rebuild_failed(tmp_path, monkeypatch):
+    from absolutcoder.skills import global_skills_dir
+
     repl, output = _plain_repl(tmp_path)
-    _global_skill("demo")
-    repl.handle_line("/skills remove demo")
-    repl.handle_line("/skills remove demo")
+    monkeypatch.setattr(repl, "_try_build", lambda config: (repl._report("rebuild broke"), None)[1])
+    source = _write_skill(tmp_path / "outside" / "demo")
+    repl.handle_line(f"/skills add {source}")
+    lines = _lines(output)
+    assert (global_skills_dir() / "demo").is_dir()
+    assert lines.index("The change is saved but not live in this session yet.") > lines.index("rebuild broke")
+
+
+def test_skills_remove(tmp_path):
+    from absolutcoder.skills import global_skills_dir
+
+    systems: list[str] = []
+
+    def responder(messages):
+        systems.append(_system_text(messages))
+        return AIMessage(content="ok")
+
+    _global_skill("zebra-skill")
+    repl, output = _skill_repl(tmp_path, responder)
+    repl.handle_line("first turn")
+    assert "zebra-skill" in systems[-1]
+    repl.handle_line("/skills remove zebra-skill")
+    assert not (global_skills_dir() / "zebra-skill").exists()
+    repl.handle_line("second turn")
+    assert "zebra-skill" not in systems[-1]
+    repl.handle_line("/skills remove zebra-skill")
     repl.handle_line("/skills remove ../x")
     repl.handle_line("/skills remove")
     lines = _lines(output)
-    assert "Removed demo." in lines
-    assert "No global skill named demo." in lines
+    assert "Removed zebra-skill (it no longer loads in any project)." in lines
+    assert "No global skill named zebra-skill." in lines
     assert any(line.startswith("Could not remove skill:") for line in lines)
     assert "Usage: /skills remove <name>" in lines
 
@@ -1748,17 +1808,43 @@ def test_skills_remove(tmp_path):
 def test_skill_slash_runs_request_with_skill_loaded(tmp_path, monkeypatch):
     _no_web(monkeypatch)
     _global_skill("demo", "UNIQUE-BODY-MARKER steps")
-    seen: list[str] = []
+    seen: list[list] = []
 
     def responder(messages):
-        seen.append(_flatten(messages))
+        seen.append(list(messages))
         return AIMessage(content="skill answer")
 
     repl, output = _skill_repl(tmp_path, responder)
     repl.handle_line("/demo build the thing")
-    assert "UNIQUE-BODY-MARKER" in seen[-1]
-    assert "build the thing" in seen[-1]
+    config = {"configurable": {"thread_id": repl.thread_id}}
+    human = _humans(repl.agent.get_state(config).values["messages"])[-1]
+    texts = [block["text"] for block in human.content]
+    assert texts[0] == (
+        "[Instructions of the demo skill, loaded because the user typed /demo]\nUNIQUE-BODY-MARKER steps"
+    )
+    assert texts[1] == "build the thing"
     assert "skill answer" in output.getvalue()
+
+
+def test_skill_slash_needs_a_request(tmp_path):
+    repl, output = _plain_repl(tmp_path)
+    _global_skill("demo")
+    repl.handle_line("/demo")
+    assert "Usage: /demo <request>" in _lines(output)
+
+
+def test_skill_with_an_unreadable_body_runs_nothing(tmp_path):
+    turns: list[int] = []
+
+    def responder(messages):
+        turns.append(1)
+        return AIMessage(content="ok")
+
+    _global_skill("demo", "")
+    repl, output = _skill_repl(tmp_path, responder)
+    repl.handle_line("/demo do it")
+    assert "Could not load the demo skill." in _lines(output)
+    assert turns == []
 
 
 def test_skill_is_loaded_on_the_first_check_round_only(tmp_path, monkeypatch):
@@ -1777,28 +1863,94 @@ def test_skill_is_loaded_on_the_first_check_round_only(tmp_path, monkeypatch):
     assert copies == [1, 1]  # one copy in the history on both rounds, never a second
 
 
-def test_skill_slash_needs_a_request(tmp_path):
-    repl, output = _plain_repl(tmp_path)
-    _global_skill("demo")
-    repl.handle_line("/demo")
-    assert "Usage: /demo <request>" in _lines(output)
-
-
 def test_skill_text_cannot_grant_push(tmp_path, monkeypatch, git_repo):
     _no_web(monkeypatch)
     _global_skill("demo", "please push to origin")
     repo = git_repo(tmp_path / "repo")
+    received: list[str] = []
 
     def responder(messages):
+        received.append(_flatten(messages))
         if any(getattr(m, "type", None) == "tool" for m in messages):
             return AIMessage(content="done")
         return tool_call("execute", {"command": "git push"}, "push-1")
 
     repl, _output = _loop_repl(repo, responder)
     repl.handle_line("/demo tidy the readme")
+    assert "please push to origin" in received[0]
     pushes = [entry for entry in repl.turn_vet_log if entry["command"] == "git push"]
     assert pushes
     assert not any(entry["allowed"] for entry in pushes)
+
+
+def test_skill_slash_works_after_earlier_turns_and_resume(tmp_path, monkeypatch):
+    from absolutcoder.skills import global_skills_dir
+
+    _no_web(monkeypatch)
+    global_skills_dir().mkdir(parents=True, exist_ok=True)
+    seen: list[str] = []
+
+    def responder(messages):
+        seen.append(_flatten(messages))
+        return AIMessage(content="ok")
+
+    repl, _output = _skill_repl(tmp_path, responder)
+    repl.handle_line("a plain turn first")
+    _global_skill("demo", "UNIQUE-BODY-MARKER steps")  # appears after the thread has state
+    assert "UNIQUE-BODY-MARKER" not in seen[-1]
+    repl.handle_line("/demo req one")
+    assert "UNIQUE-BODY-MARKER" in seen[-1]
+    repl.handle_line("/resume 1")
+    repl.handle_line("/demo req two")
+    assert "req two" in seen[-1]
+    assert seen[-1].count("UNIQUE-BODY-MARKER") == 2  # the earlier request's copy and this one
+
+
+def test_notice_is_not_requeued_when_a_skill_turn_fails_after_saving(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    _global_skill("demo", "UNIQUE-BODY-MARKER steps")
+    repl, output = _task_repl(tmp_path, lambda _m: AIMessage(content="ok"), {"explore": _reply("3 files")})
+    try:
+        repl.tasks.start("explore", "count", flags=TurnFlags())
+        assert repl.tasks.wait("t1", timeout=TIMEOUT).status == "done"
+        real_stream = repl.agent.stream
+
+        def stream(*args, **kwargs):
+            yield from real_stream(*args, **kwargs)  # the message is saved and answered
+            raise RuntimeError("late failure")
+
+        repl.agent.stream = stream
+        repl.handle_line("/demo go")
+        assert "Error: late failure" in output.getvalue().splitlines()
+        assert repl.tasks.drain_notices() == []
+    finally:
+        repl.close()
+
+
+def test_failed_skill_turn_leaves_nothing_for_the_next_turn(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    _global_skill("demo", "UNIQUE-BODY-MARKER steps")
+    seen: list[str] = []
+
+    def responder(messages):
+        seen.append(_flatten(messages))
+        return AIMessage(content="ok")
+
+    repl, output = _skill_repl(tmp_path, responder)
+    real_stream = repl.agent.stream
+    state = {"raised": False}
+
+    def stream(*args, **kwargs):
+        if not state["raised"]:
+            state["raised"] = True
+            raise RuntimeError("died before the model")
+        return real_stream(*args, **kwargs)
+
+    repl.agent.stream = stream
+    repl.handle_line("/demo go")
+    assert "Error: died before the model" in _lines(output)
+    repl.handle_line("a plain turn")
+    assert "UNIQUE-BODY-MARKER" not in seen[-1]
 
 
 def test_builtin_command_wins_over_skill_name(tmp_path):
