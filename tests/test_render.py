@@ -354,3 +354,94 @@ def test_tools_used_collects_main_and_worker_tools():
     renderer.feed(_upd("model", [several], ns=WORKER_NS))
     assert renderer.tools_used == {"read_file", "write_file", "task", "grep", "execute"}
     _clean(renderer)
+
+
+def _usage(inp, out, cached=0):
+    usage = {"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out}
+    if cached:
+        usage["input_token_details"] = {"cache_read": cached}
+    return usage
+
+
+def _token_lines(output):
+    return [line for line in output.getvalue().splitlines() if line.startswith("tokens:")]
+
+
+def test_token_line_sums_main_and_worker():
+    renderer, output = _renderer(False)
+    main = AIMessage(content="answer", id="m1", usage_metadata=_usage(1200, 50, cached=1000))
+    worker = AIMessage(content="found", id="w1", usage_metadata=_usage(300, 40))
+    renderer.feed(_msg(worker, ns=WORKER_NS, agent="explore"))
+    renderer.feed(_msg(main))
+    renderer.finish(_snapshot(main))
+    assert renderer.usage == {"input": 1500, "cached": 1000, "output": 90, "calls": 2}
+    assert _token_lines(output) == ["tokens: 1,500 in (1,000 cached), 90 out, 2 model calls"]
+    assert output.getvalue().splitlines()[-1].startswith("tokens:")
+    _clean(renderer)
+
+
+def test_message_seen_twice_is_counted_once():
+    renderer, output = _renderer(False)
+    message = AIMessage(content="answer", id="m1", usage_metadata=_usage(100, 10))
+    renderer.feed(_msg(message))
+    renderer.feed(_upd("model", [message]))
+    renderer.finish(_snapshot(message))
+    assert renderer.usage == {"input": 100, "cached": 0, "output": 10, "calls": 1}
+    assert _token_lines(output) == ["tokens: 100 in (0 cached), 10 out, 1 model call"]
+    _clean(renderer)
+
+
+def test_streamed_chunks_count_once_with_final_usage():
+    renderer, output = _renderer(True)
+    renderer.feed(_msg(AIMessageChunk(content="Hel", id="m1")))
+    renderer.feed(_msg(AIMessageChunk(content="lo", id="m1")))
+    renderer.feed(_msg(AIMessageChunk(content="", id="m1", usage_metadata=_usage(500, 20, cached=400))))
+    done = AIMessage(content="Hello", id="m1", usage_metadata=_usage(500, 20, cached=400))
+    renderer.feed(_upd("model", [done]))
+    renderer.finish(_snapshot(done))
+    assert renderer.usage == {"input": 500, "cached": 400, "output": 20, "calls": 1}
+    assert _token_lines(output) == ["tokens: 500 in (400 cached), 20 out, 1 model call"]
+    _clean(renderer)
+
+
+def test_no_token_line_without_usage():
+    renderer, output = _renderer(False)
+    message = AIMessage(content="plain", id="m1")
+    renderer.feed(_msg(message))
+    renderer.feed(_upd("model", [message]))
+    renderer.finish(_snapshot(message))
+    assert renderer.usage == {"input": 0, "cached": 0, "output": 0, "calls": 0}
+    assert _token_lines(output) == []
+    _clean(renderer)
+
+
+def test_singular_model_call():
+    renderer, output = _renderer(False)
+    message = AIMessage(content="a", id="m1", usage_metadata=_usage(10, 2))
+    renderer.feed(_upd("model", [message]))
+    renderer.finish(_snapshot(message))
+    assert _token_lines(output) == ["tokens: 10 in (0 cached), 2 out, 1 model call"]
+    _clean(renderer)
+
+
+def test_interrupted_prints_tokens_after_interrupted():
+    renderer, output = _renderer(True)
+    renderer.feed(_msg(AIMessageChunk(content="half", id="m1", usage_metadata=_usage(10, 2))))
+    renderer.interrupted()
+    assert output.getvalue().splitlines() == [
+        "half",
+        "interrupted",
+        "tokens: 10 in (0 cached), 2 out, 1 model call",
+    ]
+    _clean(renderer)
+
+
+def test_message_without_id_counts_each_time_and_internal_calls_count():
+    renderer, _output = _renderer(False)
+    anonymous = AIMessage(content="x", usage_metadata=_usage(10, 1))
+    renderer.feed(_upd("model", [anonymous]))
+    renderer.feed(_upd("model", [anonymous]))
+    summary = AIMessageChunk(content="s", id="s1", usage_metadata=_usage(100, 5))
+    renderer.feed(_msg(summary, node="SummarizationMiddleware.before_model"))
+    assert renderer.usage == {"input": 120, "cached": 0, "output": 7, "calls": 3}
+    _clean(renderer)

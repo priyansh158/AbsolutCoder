@@ -96,6 +96,27 @@ def _git_repo(path: Path) -> Path:
     return path
 
 
+def test_turn_prints_token_line_when_models_report_usage(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    output = io.StringIO()
+    reply = AIMessage(
+        content="ok",
+        usage_metadata={"input_tokens": 1200, "output_tokens": 30, "total_tokens": 1230},
+    )
+    repl = Repl(
+        repo,
+        Config(main_model="openai:main-test", subagent_model="openai:worker-test", auto_run=True),
+        chat_model=scripted_model(lambda _messages: reply),
+        model_factory=_worker(),
+        input_fn=lambda _prompt="": "hello",
+        console=Console(file=output, force_terminal=False, no_color=True, width=100),
+    )
+    repl.run_turn("hello")
+    lines = [line for line in output.getvalue().splitlines() if line.strip()]
+    assert lines[-1] == "tokens: 1,200 in (0 cached), 30 out, 1 model call"
+
+
 def test_stream_exception_stays_in_the_session(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()

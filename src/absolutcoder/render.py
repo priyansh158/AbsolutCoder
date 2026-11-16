@@ -114,6 +114,8 @@ class StreamRenderer:
         self._shown_ids: set[str] = set()  # main message ids already on screen
         self._shown_calls: set[tuple] = set()  # (ns, AI message id, index of the call)
         self._shown_results: set[str] = set()  # ToolMessage ids
+        self._usage_by_id: dict[str, tuple[int, int, int]] = {}  # message id -> (input, cached, output)
+        self._anonymous_usage: list[tuple[int, int, int]] = []  # messages without an id
         self._streamed = ""  # text streamed for the current main message
         self._last_text: str | None = None
         self._open_line = False
@@ -150,10 +152,12 @@ class StreamRenderer:
                 self._print_text(message.id, text)
             break
         self.end_line()
+        self._print_usage()
 
     def interrupted(self) -> None:
         self.end_line()
         self._print("interrupted")
+        self._print_usage()
 
     def end_line(self) -> None:
         """End a streamed line that has no newline yet."""
@@ -169,6 +173,7 @@ class StreamRenderer:
         if not isinstance(data, (tuple, list)) or len(data) != 2:
             return
         message, metadata = data
+        self._count_usage(message)  # every model call is spend, whatever is displayed
         if not isinstance(metadata, dict):
             return
         if ns:
@@ -206,8 +211,10 @@ class StreamRenderer:
             for message in messages:
                 if isinstance(message, ToolMessage):
                     self._on_result(ns, message)
-                elif isinstance(message, AIMessage) and node == MODEL_NODE and not rewrite:
-                    self._on_ai(ns, message)
+                elif isinstance(message, AIMessage) and not rewrite:
+                    self._count_usage(message)
+                    if node == MODEL_NODE:
+                        self._on_ai(ns, message)
 
     def _on_ai(self, ns: tuple, message: AIMessage) -> None:
         if not ns:
@@ -233,6 +240,51 @@ class StreamRenderer:
         else:
             self._print_text(message.id, text)
         self._streamed = ""
+
+    def _count_usage(self, message) -> None:
+        """Record the token usage of one AI message, once per message id."""
+
+        if not isinstance(message, AIMessage):
+            return
+        usage = message.usage_metadata
+        if not isinstance(usage, dict):
+            return
+        details = usage.get("input_token_details")
+        cached = details.get("cache_read") if isinstance(details, dict) else 0
+        figures = (
+            int(usage.get("input_tokens") or 0),
+            int(cached or 0),
+            int(usage.get("output_tokens") or 0),
+        )
+        if not message.id:
+            self._anonymous_usage.append(figures)
+            return
+        seen = self._usage_by_id.get(message.id)
+        if seen is not None:
+            figures = tuple(max(old, new) for old, new in zip(seen, figures))
+        self._usage_by_id[message.id] = figures
+
+    @property
+    def usage(self) -> dict[str, int]:
+        """Token totals for this turn: input, cached (part of input), output, model calls."""
+
+        rows = [*self._usage_by_id.values(), *self._anonymous_usage]
+        return {
+            "input": sum(row[0] for row in rows),
+            "cached": sum(row[1] for row in rows),
+            "output": sum(row[2] for row in rows),
+            "calls": len(rows),
+        }
+
+    def _print_usage(self) -> None:
+        usage = self.usage
+        if usage["calls"] == 0 or usage["input"] + usage["output"] == 0:
+            return
+        calls = usage["calls"]
+        self._print(
+            f"tokens: {usage['input']:,} in ({usage['cached']:,} cached), "
+            f"{usage['output']:,} out, {calls} model call{'' if calls == 1 else 's'}"
+        )
 
     def _on_call(self, ns: tuple, call: dict) -> None:
         call_id = call.get("id")
