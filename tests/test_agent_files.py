@@ -1,5 +1,7 @@
 """Worker roles loaded from markdown files."""
 
+from pathlib import Path
+
 import pytest
 
 from absolutcoder.agent_files import AgentFileError, load_agent_dir, load_roster, parse_agent_file
@@ -124,3 +126,37 @@ def test_bom_and_crlf_are_tolerated(tmp_path):
     assert definition.description == "Windows file."
     assert definition.groups == ("read",)
     assert definition.prompt == "Line one.\nLine two."
+
+
+_HOSTILE = {
+    "bad-date": b"---\nname: okay\ndescription: x\nwhen: 2001-13-45\n---\nprompt\n",
+    "deep-nesting": b"---\ndescription: " + b"[" * 5000 + b"\n---\nprompt\n",
+    "not-utf8": b"---\ndescription: \xff\xfe\n---\nprompt\n",
+}
+
+
+@pytest.mark.parametrize("case", sorted(_HOSTILE))
+def test_hostile_yaml_is_a_warning_not_a_crash(tmp_path, case):
+    path = tmp_path / "hostile.md"
+    path.write_bytes(_HOSTILE[case])
+    with pytest.raises(AgentFileError):
+        parse_agent_file(path)
+    definitions, warnings = load_agent_dir(tmp_path, "repo")
+    assert definitions == []
+    assert len(warnings) == 1 and warnings[0].startswith("hostile.md: ")
+
+
+def test_unreadable_directory_is_a_warning(tmp_path, monkeypatch):
+    def boom(self, pattern):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(Path, "glob", boom)
+    definitions, warnings = load_agent_dir(tmp_path, "repo")
+    assert definitions == []
+    assert len(warnings) == 1 and warnings[0].startswith(f"{tmp_path.name}: cannot read folder")
+
+
+def test_name_with_trailing_newline_is_rejected(tmp_path):
+    path = _write(tmp_path, "case.md", '---\nname: "ab\\n"\ndescription: x\n---\nprompt\n')
+    with pytest.raises(AgentFileError):
+        parse_agent_file(path)

@@ -34,12 +34,12 @@ def _split_frontmatter(text: str) -> tuple[str, str]:
 def _load_meta(path: Path) -> tuple[dict, str]:
     try:
         text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as error:
+    except Exception as error:
         raise AgentFileError(f"cannot read file: {error}") from error
     header, body = _split_frontmatter(text)
     try:
         meta = yaml.safe_load(header)
-    except yaml.YAMLError as error:
+    except Exception as error:
         raise AgentFileError(f"invalid YAML in frontmatter: {error}") from error
     if not isinstance(meta, dict):
         raise AgentFileError("frontmatter must be a YAML mapping")
@@ -64,7 +64,7 @@ def _parse_tools(raw) -> tuple[str, ...]:
 def _build(path: Path, source: str) -> tuple[AgentDef, dict]:
     meta, body = _load_meta(path)
     name = meta.get("name", path.stem)
-    if not isinstance(name, str) or not _NAME_RE.match(name):
+    if not isinstance(name, str) or not _NAME_RE.fullmatch(name):
         raise AgentFileError(f"invalid name {name!r}: use {_NAME_RE.pattern}")
     description = meta.get("description")
     if not isinstance(description, str) or not description.strip():
@@ -104,17 +104,24 @@ def parse_agent_file(path: Path, source: str = "repo") -> AgentDef:
 def load_agent_dir(directory: Path, source: str) -> tuple[list[AgentDef], list[str]]:
     """Load every ``*.md`` file in ``directory``; bad files become warnings."""
 
-    if not directory.is_dir():
-        return [], []
+    try:
+        if not directory.is_dir():
+            return [], []
+        paths = sorted(directory.glob("*.md"))
+    except OSError as error:
+        return [], [f"{directory.name}: cannot read folder: {error}"]
     definitions: list[AgentDef] = []
     warnings: list[str] = []
     seen: set[str] = set()
-    for path in sorted(directory.glob("*.md")):
-        if not path.is_file():
+    for path in paths:
+        try:
+            if not path.is_file():
+                continue
+        except OSError:
             continue
         try:
             definition, meta = _build(path, source)
-        except AgentFileError as error:
+        except Exception as error:  # file content is untrusted; never crash startup
             warnings.append(f"{path.name}: {error}")
             continue
         if definition.name in seen:
