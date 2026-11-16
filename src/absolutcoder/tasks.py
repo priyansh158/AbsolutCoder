@@ -1,7 +1,8 @@
 """Background tasks: worker roles that run on a thread pool while the user keeps talking.
 
 Each task has its own graph, its own checkpoint thread and its own guarded
-shell backend, so it keeps the permissions of the turn that started it. A task
+shell backend, so it keeps the permissions of the turn that started it. The
+graph is built on the pool thread, so starting a task never waits for it. A task
 that needs a shell approval parks (``needs_approval``) instead of holding a
 pool thread, and continues on the pool once the main loop resumes it.
 """
@@ -32,6 +33,15 @@ _NOTIFY = frozenset({"done", "failed", "cancelled"})
 _NOTICE_LIMIT = 4000
 
 
+class TaskLimitReached(RuntimeError):
+    """``start`` refused: too many tasks are already queued, running or waiting."""
+
+    def __init__(self, unfinished: int, limit: int) -> None:
+        super().__init__(f"{unfinished} background tasks are already running or waiting (limit {limit}).")
+        self.unfinished = unfinished
+        self.limit = limit
+
+
 @dataclass
 class TaskRecord:
     id: str
@@ -46,6 +56,7 @@ class TaskRecord:
 @dataclass
 class _Task:
     record: TaskRecord
+    role: AgentDef
     cancel: threading.Event = field(default_factory=threading.Event)
     backend: GuardedShellBackend | None = None
     graph: CompiledStateGraph | None = None
@@ -74,7 +85,9 @@ class TaskManager:
         self.repo = Path(repo)
         self.shell = shell
         self.max_workers = max_workers
+        self.limit = 2 * max_workers  # unfinished tasks allowed at once
         self._on_event = on_event
+        self._before_settle: Callable[[], None] | None = None  # test seam: after the stream, before settling
         self._lock = threading.Lock()
         self._changed = threading.Condition(self._lock)
         self._tasks: dict[str, _Task] = {}
@@ -89,9 +102,13 @@ class TaskManager:
         roles = {role.name: role for role in self._roles()}
         if agent not in roles:
             raise ValueError(f"Unknown worker {agent!r}. Available: {', '.join(roles)}")
+        payload = {"messages": [{"role": "user", "content": prompt}]}
         with self._lock:
             if self._closed:
                 raise RuntimeError("task manager is shut down")
+            unfinished = sum(1 for task in self._tasks.values() if task.record.status in _UNFINISHED)
+            if unfinished >= self.limit:
+                raise TaskLimitReached(unfinished, self.limit)
             self._count += 1
             number = self._count
             record = TaskRecord(
@@ -103,22 +120,21 @@ class TaskManager:
                 error=None,
                 thread_id=f"{self.session_id}:task:{number}",
             )
-            task = _Task(record=record)
+            task = _Task(record=record, role=roles[agent])
             self._tasks[record.id] = task
+            try:
+                task.backend = GuardedShellBackend(
+                    root_dir=self.repo, flags=flags, shell=self.shell, agent_label=f"task {record.id}"
+                )
+            except Exception as error:  # noqa: BLE001 - reported on the record, never raised
+                failure = str(error)
+            else:
+                failure = None
+                task.future = self._pool.submit(self._run, task, payload)
             snapshot = replace(record)
         self._emit(snapshot)
-        try:
-            task.backend = GuardedShellBackend(
-                root_dir=self.repo, flags=flags, shell=self.shell, agent_label=f"task {record.id}"
-            )
-            task.graph = self._build(roles[agent], task.backend)
-        except Exception as error:  # noqa: BLE001 - reported on the record, never raised
-            self._finish(task, "failed", error=str(error))
-            return self.get(record.id)
-        payload = {"messages": [{"role": "user", "content": prompt}]}
-        with self._lock:
-            if task.record.status == "queued" and not self._closed:
-                task.future = self._pool.submit(self._run, task, payload)
+        if failure is not None:
+            self._finish(task, "failed", error=failure)
         return self.get(record.id)
 
     def get(self, task_id: str) -> TaskRecord:
@@ -130,6 +146,8 @@ class TaskManager:
             return [replace(task.record) for task in self._tasks.values()]
 
     def backend_for(self, task_id: str) -> GuardedShellBackend:
+        """The task's shell backend; KeyError for an unknown task or one whose backend could not be made."""
+
         with self._lock:
             backend = self._task(task_id).backend
         if backend is None:
@@ -221,40 +239,63 @@ class TaskManager:
             self._emit(snapshot)
         config = {"configurable": {"thread_id": task.record.thread_id}}
         try:
-            with closing(task.graph.stream(payload, config, stream_mode="updates")) as parts:
+            graph = self._graph_for(task)
+            if graph is None:
+                self._finish(task, "cancelled")
+                return
+            with closing(graph.stream(payload, config, stream_mode="updates")) as parts:
                 for _part in parts:
                     if task.cancel.is_set():
                         break
             if task.cancel.is_set():
                 self._finish(task, "cancelled")
                 return
-            state = task.graph.get_state(config)
+            if self._before_settle is not None:
+                self._before_settle()
+            state = graph.get_state(config)
             interrupts = _pending_interrupts(state)
             if interrupts:
-                self._park(task, interrupts)
+                self._finish(task, "needs_approval", interrupts=interrupts)
                 return
             self._finish(task, "done", result=_final_text(state.values.get("messages", [])))
         except Exception as error:  # noqa: BLE001 - a pool thread must never raise
             self._finish(task, "failed", error=str(error))
 
-    def _park(self, task: _Task, interrupts: list) -> None:
-        with self._lock:
-            if task.record.status != "running":
-                return
-            task.interrupts = interrupts
-            task.record.status = "needs_approval"
-            snapshot = replace(task.record)
-            self._changed.notify_all()
-        self._emit(snapshot)
+    def _graph_for(self, task: _Task) -> CompiledStateGraph | None:
+        """Build the task's graph on first run (on this pool thread); None when cancelled meanwhile."""
 
-    def _finish(self, task: _Task, status: str, *, result: str | None = None, error: str | None = None) -> None:
+        with self._lock:
+            graph, backend = task.graph, task.backend
+        if graph is None:
+            graph = self._build(task.role, backend)
+            with self._lock:
+                task.graph = graph
+        return None if task.cancel.is_set() else graph
+
+    def _finish(
+        self,
+        task: _Task,
+        status: str,
+        *,
+        result: str | None = None,
+        error: str | None = None,
+        interrupts: list | None = None,
+    ) -> None:
+        """Settle an unfinished task as ``status``: parked, or finished with a notice.
+
+        Once ``cancel`` has returned True for a task its flag is set, and the
+        flag is read here under the lock, so such a task always ends ``cancelled``.
+        """
+
         with self._lock:
             if task.record.status not in _UNFINISHED:
                 return
+            if task.cancel.is_set():
+                status, result, error, interrupts = "cancelled", None, None, None
             task.record.status = status
             task.record.result = result
             task.record.error = error
-            task.interrupts = []
+            task.interrupts = list(interrupts or [])
             snapshot = replace(task.record)
             if status in _NOTIFY and not task.quiet:
                 self._notices.append(notice(snapshot))
@@ -322,8 +363,6 @@ def _final_text(messages) -> str:
 def make_task_tools(manager: TaskManager, current_flags: Callable[[], TurnFlags]) -> list[BaseTool]:
     """The main model's tools for background tasks: start, check, list and cancel."""
 
-    limit = 2 * manager.max_workers
-
     @tool
     def start_task(agent: str, prompt: str) -> str:
         """Start a worker role in the background and return at once.
@@ -333,9 +372,6 @@ def make_task_tools(manager: TaskManager, current_flags: Callable[[], TurnFlags]
         """
 
         try:
-            unfinished = sum(1 for record in manager.list() if record.status in _UNFINISHED)
-            if unfinished >= limit:
-                return f"Error: {unfinished} background tasks are already running or waiting (limit {limit})."
             record = manager.start(agent, prompt, flags=current_flags())
         except Exception as error:  # noqa: BLE001 - tools answer with text, never raise
             return f"Error: {error}"

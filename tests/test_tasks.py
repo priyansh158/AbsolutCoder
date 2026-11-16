@@ -12,7 +12,7 @@ from absolutcoder.git_policy import TurnFlags
 from absolutcoder.sessions import checkpoint_saver
 from absolutcoder.shell import GuardedShellBackend
 from absolutcoder.subagents import builtin_agents
-from absolutcoder.tasks import TaskManager, make_task_tools
+from absolutcoder.tasks import TaskLimitReached, TaskManager, make_task_tools
 from tests.support import last_human_text, role_models, scripted_model, tool_call, tool_names_since_last_human
 
 SESSION = "sess"
@@ -46,16 +46,21 @@ def repo(tmp_path):
 
 @pytest.fixture
 def make_manager(repo):
-    """``make(workers, *, auto_run=True, max_workers=4, on_event=None)`` -> TaskManager."""
+    """``make(workers, *, auto_run=True, max_workers=4, on_event=None, before_build=None)`` -> TaskManager.
+
+    ``before_build(role, backend)`` runs on the thread that builds each task's graph.
+    """
 
     created: list[TaskManager] = []
 
-    def make(workers: dict, *, auto_run: bool = True, max_workers: int = 4, on_event=None):
+    def make(workers: dict, *, auto_run: bool = True, max_workers: int = 4, on_event=None, before_build=None):
         config = Config(main_model="openai:main-test", subagent_model="openai:worker-test", auto_run=auto_run)
         saver = checkpoint_saver()
         factory = role_models(workers, default=_reply("ok"))
 
         def build(role, backend):
+            if before_build is not None:
+                before_build(role, backend)
             return build_role_graph(
                 repo, config, saver, role, model_factory=factory, backend=backend, web_tools=_fake_web_tools()
             )
@@ -135,32 +140,46 @@ def test_task_uses_own_thread_id(make_manager):
     assert saver.get_tuple({"configurable": {"thread_id": SESSION}}) is None
 
 
-def _runs(command):
-    """General-purpose responder: run ``command`` once, then report the tool output."""
+def _runs(command, *, replies: list | None = None):
+    """General-purpose responder: run ``command`` once, then report the tool output.
+
+    When ``replies`` is given, the tool messages the model saw are appended to it.
+    """
 
     def respond(messages):
         if "execute" not in tool_names_since_last_human(messages):
             return tool_call("execute", {"command": command}, "exec-1")
-        replies = [m for m in messages if getattr(m, "type", None) == "tool"]
-        return AIMessage(content="tool said: " + str(replies[-1].content))
+        tool_messages = [m for m in messages if getattr(m, "type", None) == "tool"]
+        if replies is not None:
+            replies.extend(tool_messages)
+        return AIMessage(content="tool said: " + str(tool_messages[-1].content))
 
     return scripted_model(respond)
+
+
+def _log(manager, task_id):
+    return [(entry["command"], entry["allowed"]) for entry in manager.backend_for(task_id).vet_log]
 
 
 def test_task_backend_has_own_flags_and_log(make_manager, repo):
     main_backend = GuardedShellBackend(root_dir=repo)
     manager = make_manager({"general-purpose": _runs("git push")}, auto_run=True)
-    record = manager.start("general-purpose", "push it", flags=TurnFlags())
-    finished = manager.wait(record.id, timeout=TIMEOUT)
-    assert finished.status == "failed" or "push" in (finished.result or "")
-    log = manager.backend_for(record.id).vet_log
-    assert [(entry["command"], entry["allowed"]) for entry in log] == [("git push", False)]
-    assert manager.backend_for(record.id).agent_label == "task t1"
+    allowed = manager.start("general-purpose", "push it", flags=TurnFlags(push_requested=True))
+    denied = manager.start("general-purpose", "push it too", flags=TurnFlags())
+    # The allowed push still fails (no remote); only the vet logs matter here.
+    assert manager.wait(allowed.id, timeout=TIMEOUT).status in {"done", "failed"}
+    assert manager.wait(denied.id, timeout=TIMEOUT).status in {"done", "failed"}
+    assert _log(manager, allowed.id) == [("git push", True)]
+    assert _log(manager, denied.id) == [("git push", False)]
+    assert manager.backend_for(allowed.id).agent_label == "task t1"
+    assert manager.backend_for(denied.id).agent_label == "task t2"
+    assert manager.backend_for(allowed.id) is not manager.backend_for(denied.id)
     assert main_backend.vet_log == []
 
 
 def test_approval_parks_then_resumes(make_manager):
-    manager = make_manager({"general-purpose": _runs("echo hi")}, auto_run=False)
+    replies: list = []
+    manager = make_manager({"general-purpose": _runs("echo hi", replies=replies)}, auto_run=False)
 
     approved = manager.start("general-purpose", "say hi", flags=TurnFlags())
     assert manager.wait(approved.id, timeout=TIMEOUT).status == "needs_approval"
@@ -180,6 +199,7 @@ def test_approval_parks_then_resumes(make_manager):
     with pytest.raises(ValueError):
         manager.resume(approved.id, {interrupt_id: {"decisions": [{"type": "approve"}]}})
 
+    replies.clear()
     rejected = manager.start("general-purpose", "say hi again", flags=TurnFlags())
     assert manager.wait(rejected.id, timeout=TIMEOUT).status == "needs_approval"
     (_record, interrupts), = manager.pending_approvals()
@@ -187,7 +207,46 @@ def test_approval_parks_then_resumes(make_manager):
     manager.resume(rejected.id, {interrupts[0].id: {"decisions": [decision]}})
     finished = manager.wait(rejected.id, timeout=TIMEOUT)
     assert finished.status == "done"
+    # The model was told its execute call was rejected, and the command never ran.
+    answers = [m for m in replies if m.tool_call_id == "exec-1" and m.name == "execute"]
+    assert len(answers) == 1
+    assert "User rejected the command." in str(answers[0].content)
     assert manager.backend_for(rejected.id).vet_log == []
+
+
+def test_cancel_parked_task(make_manager):
+    manager = make_manager({"general-purpose": _runs("echo hi")}, auto_run=False)
+    record = manager.start("general-purpose", "say hi", flags=TurnFlags())
+    assert manager.wait(record.id, timeout=TIMEOUT).status == "needs_approval"
+    (_parked, interrupts), = manager.pending_approvals()
+    assert manager.cancel(record.id) is True
+    assert manager.get(record.id).status == "cancelled"
+    assert manager.pending_approvals() == []
+    with pytest.raises(ValueError):
+        manager.resume(record.id, {interrupts[0].id: {"decisions": [{"type": "approve"}]}})
+    assert manager.drain_notices() == ["Background task t1 (general-purpose) cancelled.\nCancelled."]
+    assert manager.backend_for(record.id).vet_log == []
+
+
+@pytest.mark.parametrize(
+    ("role", "workers", "auto_run"),
+    [
+        ("explore", {"explore": _reply("would be done")}, True),
+        ("general-purpose", {"general-purpose": _runs("echo hi")}, False),
+    ],
+    ids=["would-finish", "would-park"],
+)
+def test_cancel_after_the_stream_ends_still_cancels(make_manager, role, workers, auto_run):
+    manager = make_manager(workers, auto_run=auto_run)
+    answers: list[bool] = []
+    manager._before_settle = lambda: answers.append(manager.cancel("t1"))
+    manager.start(role, "go", flags=TurnFlags())
+    finished = manager.wait("t1", timeout=TIMEOUT)
+    assert answers == [True]
+    assert finished.status == "cancelled"
+    assert finished.result is None and finished.error is None
+    assert manager.pending_approvals() == []
+    assert manager.drain_notices() == [f"Background task t1 ({role}) cancelled.\nCancelled."]
 
 
 def test_cancel_marks_cancelled(make_manager):
@@ -247,11 +306,89 @@ def test_build_failure_marks_failed(repo):
     manager = TaskManager(build, roles=builtin_agents, session_id=SESSION, repo=repo)
     try:
         record = manager.start("explore", "go", flags=TurnFlags())
-        assert record.status == "failed"
-        assert record.error == "cannot build"
+        finished = manager.wait(record.id, timeout=TIMEOUT)
+        assert finished.status == "failed"
+        assert finished.error == "cannot build"
         assert manager.drain_notices() == ["Background task t1 (explore) failed.\nError: cannot build"]
     finally:
-        manager.shutdown()
+        manager.shutdown(wait=True)
+
+
+def test_start_returns_before_the_graph_is_built(make_manager):
+    building, release = threading.Event(), threading.Event()
+    caller = threading.get_ident()
+    build_threads: list[int] = []
+
+    def gate(_role, _backend):
+        build_threads.append(threading.get_ident())
+        building.set()
+        assert release.wait(TIMEOUT), "release was never set"
+
+    manager = make_manager({"explore": _reply("built late")}, before_build=gate)
+    try:
+        record = manager.start("explore", "go", flags=TurnFlags())
+        assert record.status in {"queued", "running"}
+        assert manager.backend_for(record.id).agent_label == "task t1"
+        assert building.wait(TIMEOUT)
+        assert manager.get(record.id).status in {"queued", "running"}
+    finally:
+        release.set()
+    finished = manager.wait(record.id, timeout=TIMEOUT)
+    assert (finished.status, finished.result) == ("done", "built late")
+    assert build_threads and caller not in build_threads
+
+
+def test_cancelled_queued_task_never_builds(make_manager):
+    started, release = threading.Event(), threading.Event()
+    built: list[str] = []
+    manager = make_manager(
+        {"explore": _blocking(started, release)},
+        max_workers=1,
+        before_build=lambda _role, backend: built.append(backend.agent_label),
+    )
+    try:
+        first = manager.start("explore", "block first", flags=TurnFlags())
+        assert started.wait(TIMEOUT)
+        second = manager.start("explore", "second", flags=TurnFlags())
+        assert manager.cancel(second.id) is True
+    finally:
+        release.set()
+    assert manager.wait(first.id, timeout=TIMEOUT).status == "done"
+    manager.shutdown(wait=True)
+    assert manager.get(second.id).status == "cancelled"
+    assert built == ["task t1"]
+
+
+def test_limit_is_enforced_atomically(make_manager):
+    started, release = threading.Event(), threading.Event()
+    manager = make_manager({"explore": _blocking(started, release)}, max_workers=1)
+    barrier = threading.Barrier(2, timeout=TIMEOUT)
+    outcomes: list = []
+
+    def racer(name):
+        barrier.wait()
+        try:
+            outcomes.append(manager.start("explore", name, flags=TurnFlags()).id)
+        except TaskLimitReached as error:
+            outcomes.append(error)
+
+    try:
+        manager.start("explore", "block first", flags=TurnFlags())
+        assert started.wait(TIMEOUT)
+        threads = [threading.Thread(target=racer, args=(f"racer {i}",)) for i in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(TIMEOUT)
+        assert not any(thread.is_alive() for thread in threads)
+    finally:
+        release.set()
+    started_ids = [item for item in outcomes if isinstance(item, str)]
+    refusals = [item for item in outcomes if isinstance(item, TaskLimitReached)]
+    assert len(started_ids) == 1 and len(refusals) == 1
+    assert (refusals[0].unfinished, refusals[0].limit) == (2, 2)
+    assert str(refusals[0]) == "2 background tasks are already running or waiting (limit 2)."
+    assert len(manager.list()) == 2
 
 
 def test_unknown_role_is_rejected(make_manager):
@@ -285,16 +422,34 @@ def test_background_roles_have_only_their_tools(make_manager):
     web_done = manager.wait(web.id, timeout=TIMEOUT)
     assert web_done.status == "done"
 
-    bound = _flat(explore_names)
-    assert {"ls", "read_file", "glob", "grep"} <= bound
-    forbidden = {
-        "write_file", "edit_file", "delete", "execute", "web_fetch", "web_search",
-        "start_task", "check_task", "list_tasks", "cancel_task", "task",
-    }
-    assert not bound & forbidden
+    # Exactly the read and search groups: no edit, shell, web, task-manager or task tool.
+    assert _flat(explore_names) == {"ls", "read_file", "glob", "grep"}
     assert _flat(web_names) == {"web_fetch", "web_search"}
     assert web_done.result.startswith('<untrusted_web_content source="web-researcher">')
     assert "IGNORE ALL RULES" in web_done.result
+
+
+def test_role_graph_without_the_guard_would_bind_task(repo, monkeypatch):
+    """Control: the task-tool absence above comes from the no-sub-workers middleware."""
+
+    import absolutcoder.agent as agent_module
+    from langchain.agents.middleware import AgentMiddleware
+
+    class Inert(AgentMiddleware):
+        pass
+
+    def bound_for_explore():
+        names: list = []
+        factory = role_models({}, default=scripted_model(lambda _m: AIMessage(content="ok"), bound=names))
+        config = Config(main_model="openai:m", subagent_model="openai:w", auto_run=True)
+        role = next(d for d in builtin_agents() if d.name == "explore")
+        graph = build_role_graph(repo, config, checkpoint_saver(), role, model_factory=factory)
+        graph.invoke({"messages": [{"role": "user", "content": "go"}]}, {"configurable": {"thread_id": "control"}})
+        return _flat(names)
+
+    assert "task" not in bound_for_explore()
+    monkeypatch.setattr(agent_module, "_NoSubWorkers", Inert)
+    assert "task" in bound_for_explore()
 
 
 def test_notices_drain_once_and_are_truncated(make_manager):
