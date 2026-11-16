@@ -6,7 +6,7 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, AIMessageChunk
 from rich.console import Console
 
 from dataclasses import replace
@@ -556,21 +556,30 @@ def test_turn_output_shows_subagent_activity(tmp_path, monkeypatch):
     assert "explorer report" not in text
 
 
+def _interrupt_after_first_part(real_stream, exc):
+    """A stream that yields one real part, then raises ``exc``; later calls are real."""
+
+    state = {"raised": False}
+
+    def stream(*args, **kwargs):
+        if state["raised"]:
+            yield from real_stream(*args, **kwargs)
+            return
+        state["raised"] = True
+        yield next(iter(real_stream(*args, **kwargs)))
+        raise exc
+
+    return stream, state
+
+
 def test_keyboard_interrupt_mid_stream_keeps_session(tmp_path, monkeypatch):
     _no_web(monkeypatch)
     repl, output = _plain_repl(tmp_path)
     thread_id = repl.thread_id
-    real_stream = repl.agent.stream
-    state = {"raised": False}
-
-    def stream(*args, **kwargs):
-        if not state["raised"]:
-            state["raised"] = True
-            raise KeyboardInterrupt
-        return real_stream(*args, **kwargs)
-
+    stream, state = _interrupt_after_first_part(repl.agent.stream, KeyboardInterrupt())
     repl.agent.stream = stream
     assert repl.run_turn("first") is None
+    assert state["raised"] is True
     text = output.getvalue()
     assert "interrupted" in text.splitlines()
     assert "Traceback" not in text
@@ -578,6 +587,64 @@ def test_keyboard_interrupt_mid_stream_keeps_session(tmp_path, monkeypatch):
     assert repl.run_turn("second") is not None
     assert "ok" in output.getvalue().splitlines()
     assert repl.thread_id == thread_id
+
+
+def test_keyboard_interrupt_at_approval_prompt_keeps_session(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    repo = _git_repo(tmp_path / "repo")
+    state = {"interrupt": True}
+
+    def ask(prompt=""):
+        if state["interrupt"]:
+            state["interrupt"] = False
+            raise KeyboardInterrupt
+        return "y"
+
+    def responder(messages):
+        if "execute" not in tool_names_since_last_human(messages):
+            return tool_call("execute", {"command": "git status"}, "call-" + str(len(messages)))
+        return AIMessage(content="answer after " + tool_names_since_last_human(messages)[-1])
+
+    output = io.StringIO()
+    repl = Repl(
+        repo,
+        Config(main_model="openai:main-test", subagent_model="openai:worker-test", auto_run=False),
+        chat_model=scripted_model(responder),
+        model_factory=_worker(),
+        input_fn=ask,
+        console=Console(file=output, force_terminal=False, no_color=True, width=200),
+    )
+    thread_id = repl.thread_id
+    assert repl.run_turn("show git status") is None
+    text = output.getvalue()
+    assert "Run command? git status" in text
+    assert "interrupted" in text.splitlines()
+    assert "Traceback" not in text
+    assert repl.thread_id == thread_id
+    snapshot = repl.run_turn("try again")
+    assert snapshot is not None
+    assert "answer after execute" in output.getvalue().splitlines()
+    assert repl.thread_id == thread_id
+
+
+def test_stream_error_mid_line_starts_a_new_line(tmp_path, monkeypatch):
+    import absolutcoder.repl as repl_module
+    from absolutcoder.render import StreamRenderer
+
+    _no_web(monkeypatch)
+    monkeypatch.setattr(repl_module, "StreamRenderer", lambda console: StreamRenderer(console, live=True))
+    repl, output = _plain_repl(tmp_path)
+    chunk = AIMessageChunk(content="partial text", id="m1")
+
+    def stream(*_args, **_kwargs):
+        yield {"type": "messages", "ns": (), "data": (chunk, {"langgraph_node": "model"})}
+        raise RuntimeError("stream broke")
+
+    repl.agent.stream = stream
+    assert repl.run_turn("go") is None
+    lines = output.getvalue().splitlines()
+    assert "partial text" in lines
+    assert "Error: stream broke" in lines
 
 
 def test_approval_prompt_follows_tool_line(tmp_path, monkeypatch):

@@ -12,8 +12,9 @@ import json
 from langchain_core.messages import AIMessage, RemoveMessage, ToolMessage
 from rich.console import Console
 
-# Node that runs the chat model in langchain's agent graph (main loop and workers).
+# Nodes of langchain's agent graph (main loop and workers alike).
 MODEL_NODE = "model"
+TOOLS_NODE = "tools"
 
 _PATH_TOOLS = {"read_file", "write_file", "edit_file", "delete", "ls"}
 _PATTERN_TOOLS = {"glob", "grep"}
@@ -84,18 +85,21 @@ class StreamRenderer:
     def __init__(self, console: Console, *, live: bool | None = None) -> None:
         self.console = console
         self.live = console.is_terminal if live is None else live
+        self.errors: list[Exception] = []
         self._labels: dict[tuple, str] = {}
-        self._calls: dict[str, dict] = {}
-        self._shown_ids: set[str] = set()
-        self._shown_calls: set[str] = set()
-        self._shown_results: set[str] = set()
-        self._streamed: dict[str, str] = {}
+        self._calls: dict[str, dict] = {}  # tool_call_id -> most recent call with that id
+        self._shown_ids: set[str] = set()  # main message ids already on screen
+        self._shown_calls: set[tuple] = set()  # (ns, AI message id, index of the call)
+        self._shown_results: set[str] = set()  # ToolMessage ids
+        self._streamed = ""  # text streamed for the current main message
         self._last_text: str | None = None
         self._open_line = False
 
     # --- public ---------------------------------------------------------------
 
     def feed(self, part: dict) -> None:
+        """Render one part; never raises. A renderer bug is recorded in ``errors``."""
+
         try:
             if not isinstance(part, dict):
                 return
@@ -106,8 +110,8 @@ class StreamRenderer:
                 self._on_message(ns, part.get("data"))
             elif kind == "updates":
                 self._on_update(ns, part.get("data"))
-        except Exception:  # noqa: BLE001 - the display must never break a turn
-            return
+        except Exception as error:  # noqa: BLE001 - the display must never break a turn
+            self._record(error)
 
     def finish(self, snapshot) -> None:
         values = getattr(snapshot, "values", None)
@@ -116,11 +120,11 @@ class StreamRenderer:
             if not isinstance(message, AIMessage) or message.tool_calls:
                 continue
             text = message_text(message.content)
-            if message.id:
-                if message.id not in self._shown_ids:
-                    self._print_text(message.id, text)
-            elif text and text != self._last_text:
-                self._print_text(None, text)
+            shown = (message.id and message.id in self._shown_ids) or (
+                text and text == self._last_text
+            )
+            if not shown:
+                self._print_text(message.id, text)
             break
         self.end_line()
 
@@ -132,8 +136,8 @@ class StreamRenderer:
         """End a streamed line that has no newline yet."""
 
         if self._open_line:
-            self.console.print(markup=False, highlight=False)
             self._open_line = False
+            self.console.print(markup=False, highlight=False)
 
     # --- parts ------------------------------------------------------------------
 
@@ -155,12 +159,12 @@ class StreamRenderer:
         text = _chunk_text(message.content)
         if not text:
             return
-        self.console.print(text, end="", markup=False, highlight=False, soft_wrap=True)
         self._open_line = True
+        self.console.print(text, end="", markup=False, highlight=False, soft_wrap=True)
         if message.id:
             self._shown_ids.add(message.id)
-            self._streamed[message.id] = self._streamed.get(message.id, "") + text
-            self._last_text = self._streamed[message.id].strip()
+        self._streamed += text
+        self._last_text = self._streamed.strip()
 
     def _on_update(self, ns: tuple, data) -> None:
         if not isinstance(data, dict):
@@ -171,33 +175,43 @@ class StreamRenderer:
             messages = output.get("messages")
             if not isinstance(messages, list):
                 messages = [messages] if messages is not None else []
-            if any(isinstance(m, RemoveMessage) for m in messages):
-                continue  # a history rewrite, not new activity
+            rewrite = any(isinstance(m, RemoveMessage) for m in messages)
+            if rewrite and node != TOOLS_NODE:
+                continue  # a history replay (patching, summarisation), not new activity
             for message in messages:
-                if isinstance(message, AIMessage) and node == MODEL_NODE:
-                    self._on_ai(ns, message)
-                elif isinstance(message, ToolMessage):
+                if isinstance(message, ToolMessage):
                     self._on_result(ns, message)
+                elif isinstance(message, AIMessage) and node == MODEL_NODE and not rewrite:
+                    self._on_ai(ns, message)
 
     def _on_ai(self, ns: tuple, message: AIMessage) -> None:
-        if message.tool_calls:
-            for call in message.tool_calls:
-                self._on_call(ns, call)
-            return
-        if ns:
-            return
-        if message.id and message.id in self._shown_ids:
-            return
+        if not ns:
+            self._on_main_text(message)
+        for index, call in enumerate(message.tool_calls or []):
+            key = (ns, message.id, index) if message.id else None
+            if key is not None:
+                if key in self._shown_calls:
+                    continue
+                self._shown_calls.add(key)
+            self._on_call(ns, call)
+
+    def _on_main_text(self, message: AIMessage) -> None:
         text = message_text(message.content)
-        if text:
+        shown = (
+            (message.id and message.id in self._shown_ids)
+            or (text and text == self._streamed.strip())
+            or (not message.id and text and text == self._last_text)
+        )
+        if shown:
+            if message.id:
+                self._shown_ids.add(message.id)
+        else:
             self._print_text(message.id, text)
+        self._streamed = ""
 
     def _on_call(self, ns: tuple, call: dict) -> None:
         call_id = call.get("id")
         if call_id:
-            if call_id in self._shown_calls:
-                return
-            self._shown_calls.add(call_id)
             self._calls[call_id] = call
         name = str(call.get("name", ""))
         args = call.get("args") if isinstance(call.get("args"), dict) else {}
@@ -211,11 +225,11 @@ class StreamRenderer:
             self._line(f"  tool: {name}({summarize_call(name, args)})")
 
     def _on_result(self, ns: tuple, message: ToolMessage) -> None:
-        call_id = message.tool_call_id
-        if call_id in self._shown_results:
-            return
-        self._shown_results.add(call_id)
-        call = self._calls.get(call_id, {})
+        if message.id:
+            if message.id in self._shown_results:
+                return
+            self._shown_results.add(message.id)
+        call = self._calls.get(message.tool_call_id, {})
         name = message.name or str(call.get("name", "")) or "tool"
         if not ns and name == "task":
             args = call.get("args") if isinstance(call.get("args"), dict) else {}
@@ -230,6 +244,15 @@ class StreamRenderer:
 
     # --- output -----------------------------------------------------------------
 
+    def _record(self, error: Exception) -> None:
+        self.errors.append(error)
+        if len(self.errors) > 1:
+            return
+        try:
+            self._line(f"display error: {type(error).__name__}: {error}")
+        except Exception:  # noqa: BLE001 - the console itself failed; nothing more to show
+            self._open_line = False
+
     def _label(self, ns: tuple) -> str:
         return self._labels.get(ns, "worker")
 
@@ -242,7 +265,9 @@ class StreamRenderer:
 
     def _line(self, text: str) -> None:
         self.end_line()
+        self._streamed = ""
         self._print(text)
 
     def _print(self, text: str) -> None:
         self.console.print(text, markup=False, highlight=False)
+

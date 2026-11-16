@@ -139,6 +139,8 @@ class Repl:
                 self._renderer.interrupted()
             return None
         except Exception as exc:
+            if self._renderer is not None:
+                self._renderer.end_line()
             self.console.print(f"Error: {exc}", markup=False, highlight=False)
             return None
         finally:
