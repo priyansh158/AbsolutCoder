@@ -23,7 +23,7 @@ _NEGATION = re.compile(r"\b(don't|do not|never|without|no)\s*$")
 _SENTENCE_END = re.compile(r"[.!?](?=\s|$)|[;\n]")
 # "push" ends its clause, or is followed by a word that only finishes the request.
 _PUSH_ENDING = re.compile(
-    r"\s*(?:$|[.,;:!?)])|\s+(?:now|too|as well|afterwards|after|when done|once done|when finished)\b"
+    r"[^\S\n]*(?:$|[\n.,;:!?)])|\s+(?:now|too|as well|afterwards|after|when done|once done|when finished)\b"
 )
 _PUSH_OBJECTS = frozenset(
     {"it", "them", "everything", "branch", "branches", "commit", "commits", "change", "changes",
@@ -187,10 +187,14 @@ def protect_context_file(repo: Path | str) -> None:
 def execute_needs_approval(command: str) -> bool:
     """Ordinary shell commands ask first. Local git writes do not ask again.
 
-    A wrapper such as ``sh -c`` or ``env`` always asks.
+    A wrapper such as ``sh -c`` or ``env`` always asks, and so does a command
+    ``vet`` would refuse for nesting too deep.
     """
 
-    segments = [segment for segment in iter_vet_segments(command) if segment.strip()]
+    try:
+        segments = [segment for segment in iter_vet_segments(command) if segment.strip()]
+    except PolicyDenied:
+        return True
     if not segments:
         return True
     for segment in segments:
@@ -249,6 +253,8 @@ def iter_vet_segments(command: str) -> list[str]:
 def _walk_segments(command: str, depth: int = 0, wrapped: bool = False) -> list[tuple[str, bool]]:
     """``(segment, wrapped)`` pairs; ``wrapped`` is True inside a wrapper or a substitution.
 
+    Raises PolicyDenied when wrappers nest deeper than ``_MAX_UNWRAP_DEPTH``.
+
     A bare ``NAME=value`` prefix is unwrapped for vetting but does not count as
     a wrapper: the shell backend still sees and rewrites the git command behind it.
     """
@@ -262,8 +268,11 @@ def _walk_segments(command: str, depth: int = 0, wrapped: bool = False) -> list[
             found.extend(_walk_segments(inner, depth, True))
         tokens = _command_tokens(segment)
         inner = unwrap_shell(tokens)
-        if inner is None or depth >= _MAX_UNWRAP_DEPTH:
+        if inner is None:
             continue
+        if depth >= _MAX_UNWRAP_DEPTH:
+            # The limit bounds the walk; it never lets an unvetted command through.
+            raise PolicyDenied("too many nested wrappers")
         inner_wrapped = wrapped or not _is_assignment_prefix(tokens)
         found.append((inner, inner_wrapped))
         found.extend(_walk_segments(inner, depth + 1, inner_wrapped))

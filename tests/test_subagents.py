@@ -333,6 +333,17 @@ def test_web_report_is_wrapped_as_untrusted(tmp_path):
     ) in system
 
 
+def test_prompts_ask_for_the_projects_checks(tmp_path):
+    from absolutcoder.subagents import CHECKS_SENTENCE
+
+    seen: list = []
+    main = _delegating_main(task_call("explore", "look", "t1"), seen=seen)
+    _invoke(tmp_path, main, {"explore": scripted_model(lambda _m: AIMessage(content="found"))})
+    assert CHECKS_SENTENCE in seen[0][0].text
+    general = next(d for d in builtin_agents() if d.name == "general-purpose")
+    assert CHECKS_SENTENCE in general.prompt
+
+
 def test_main_extra_tools_do_not_reach_workers(tmp_path):
     @tool
     def dummy_lookup(term: str) -> str:

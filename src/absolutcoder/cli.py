@@ -55,6 +55,8 @@ def main(argv: list[str] | None = None) -> None:
             parser.error("--until needs a task")
         if args.max_rounds is not None:
             parser.error("--max-rounds needs a task")
+    if args.until is not None and not args.until.strip():
+        parser.error("--until needs a command")
     import os
 
     from absolutcoder.config import ensure_config

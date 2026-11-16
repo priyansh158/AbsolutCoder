@@ -151,3 +151,15 @@ def test_until_without_task_is_an_error(capsys):
     with pytest.raises(SystemExit) as raised:
         main(["do it", "--max-rounds", "0"])
     assert raised.value.code == 2
+
+
+def test_empty_until_is_an_error(capsys):
+    import pytest
+
+    from absolutcoder.cli import main
+
+    for value in ("", "   "):
+        with pytest.raises(SystemExit) as raised:
+            main(["do it", "--until", value])
+        assert raised.value.code == 2
+        assert "--until needs a command" in capsys.readouterr().err

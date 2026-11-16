@@ -199,6 +199,11 @@ class Repl:
             self._task_stopped = True
             self._say("verify: stopped")
             return VerifyOutcome(False, rounds, "stopped")
+        except GraphBubbleUp:
+            raise
+        except Exception as error:  # noqa: BLE001 - a broken check must not end /loop or --until
+            self._say(f"verify: could not run the check: {error}")
+            return VerifyOutcome(False, rounds, str(error))
         if outcome.passed:
             self._say(f"verify: passed after {outcome.rounds} round(s)")
         else:

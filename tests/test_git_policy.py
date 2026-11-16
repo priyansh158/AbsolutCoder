@@ -209,6 +209,31 @@ def test_wrapped_commit_and_add_are_refused(command):
     vet("git add f.txt", TurnFlags())
 
 
+def _nested_bash(depth: int, inner: str) -> str:
+    command = inner
+    for _ in range(depth):
+        command = "bash -c " + shlex.quote(command)
+    return command
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["env env env env env sh -c 'git push'", _nested_bash(6, "git push")],
+)
+def test_too_many_nested_wrappers_are_refused(command):
+    for flags in (TurnFlags(), _ALL_FLAGS):
+        with pytest.raises(PolicyDenied, match="too many nested wrappers"):
+            vet(command, flags)
+    assert execute_needs_approval(command) is True
+
+
+def test_nested_wrappers_within_the_limit_are_vetted_normally():
+    vet("env env env env echo hi", TurnFlags())
+    vet(_nested_bash(5, "echo hi"), TurnFlags())
+    with pytest.raises(PolicyDenied, match="git push is not allowed"):
+        vet(_nested_bash(5, "git push"), TurnFlags())
+
+
 def test_wrapper_always_needs_approval():
     assert execute_needs_approval('sh -c "git commit -m x"') is True
     assert execute_needs_approval("git commit -m x") is False
@@ -248,6 +273,8 @@ def test_unwrap_shell_returns_the_inner_command():
         ("don't push", False),
         ("commit the fix", False),
         ("fix the bug, then push.", True),
+        ("please push\nthen run the tests", True),
+        ("commit this\npush", True),
     ],
 )
 def test_push_as_ordinary_verb_does_not_unlock(message, expected):

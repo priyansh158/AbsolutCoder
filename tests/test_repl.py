@@ -798,6 +798,88 @@ def test_refused_check_command_fails_the_task(tmp_path, monkeypatch):
     )
 
 
+def _scripted_checks(repl, *exit_codes, error=None):
+    """Replace the check command's execution: each call returns the next exit code, or raises ``error``."""
+
+    from deepagents.backends.protocol import ExecuteResponse
+
+    codes = list(exit_codes)
+    calls: list[str] = []
+
+    def execute(command, *, timeout=None):
+        calls.append(command)
+        if error is not None:
+            raise error
+        code = codes.pop(0) if codes else 0
+        return ExecuteResponse(output=f"check exit {code}", exit_code=code)
+
+    repl.backend.execute = execute
+    return calls
+
+
+def test_check_that_cannot_run_fails_the_task(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    repl, output = _plain_repl(tmp_path)
+    repl.config = replace(repl.config, verify_command="make check")
+    _scripted_checks(repl, error=OSError("shell went away"))
+    outcome = repl.run_task("tidy the readme")
+    assert outcome.passed is False
+    lines = output.getvalue().splitlines()
+    assert "verify: could not run the check: shell went away" in lines
+    assert "Traceback" not in output.getvalue()
+
+
+def test_interrupted_turn_stops_the_check_loop(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    repl, output = _plain_repl(tmp_path)
+    repl.config = replace(repl.config, verify_command="make check")
+    calls = _scripted_checks(repl, 1)
+    thread_id = repl.thread_id
+    stream, state = _interrupt_after_first_part(repl.agent.stream, KeyboardInterrupt())
+    repl.agent.stream = stream
+    outcome = repl.run_task("tidy the readme")
+    assert state["raised"] is True
+    assert outcome.passed is False
+    assert calls == []
+    assert "verify: stopped" in output.getvalue().splitlines()
+    assert repl.thread_id == thread_id
+    assert repl.run_turn("still there?") is not None
+
+
+def test_interrupted_check_stops_the_check_loop(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    repl, output = _plain_repl(tmp_path)
+    repl.config = replace(repl.config, verify_command="make check")
+    calls = _scripted_checks(repl, error=KeyboardInterrupt())
+    thread_id = repl.thread_id
+    outcome = repl.run_task("tidy the readme")
+    assert outcome.passed is False
+    assert calls == ["make check"]
+    assert "verify: stopped" in output.getvalue().splitlines()
+    assert repl.thread_id == thread_id
+    assert repl.run_turn("still there?") is not None
+
+
+def test_loop_continues_after_a_failed_check(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    sleeps: list[float] = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 2:
+            raise KeyboardInterrupt
+
+    repl, output = _plain_repl(tmp_path, sleep_fn=sleep)
+    repl.config = replace(repl.config, verify_command="make check", max_rounds=1)
+    _scripted_checks(repl, 1, 0)
+    repl.handle_line("/loop 1s say hi")
+    lines = output.getvalue().splitlines()
+    assert "verify: still failing after 1 round(s)" in lines
+    assert "loop: iteration 2" in lines
+    assert "verify: passed after 1 round(s)" in lines
+    assert lines[-1] == "loop: stopped after 2 iteration(s)"
+
+
 def test_run_turn_uses_given_flags(tmp_path, monkeypatch):
     _no_web(monkeypatch)
     repl, _output = _plain_repl(tmp_path)
