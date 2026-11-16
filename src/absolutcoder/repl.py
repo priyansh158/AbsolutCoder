@@ -26,7 +26,7 @@ from absolutcoder.sessions import (
     load_session,
     update_session,
 )
-from absolutcoder.shell import GuardedShellBackend
+from absolutcoder.shell import GuardedShellBackend, ShellNotFound
 from absolutcoder.webtools import make_web_tools
 
 _COMMANDS = "Commands: /model, /subagent, /auto, /resume, /attach, /agents, /exit"
@@ -58,7 +58,9 @@ class Repl:
         self.console = console or Console()
         self.pending_attachments: list[Path] = []
         protect_context_file(self.repo)
-        self.backend = GuardedShellBackend(root_dir=self.repo, virtual_mode=True, inherit_env=True)
+        self.backend = GuardedShellBackend(
+            root_dir=self.repo, virtual_mode=True, inherit_env=True, shell=self.config.shell
+        )
         self.checkpointer = checkpoint_saver()
         self.turn_vet_log: list[dict] = []
         self._renderer: StreamRenderer | None = None
@@ -369,6 +371,9 @@ def run_cli(args, config: Config | None = None) -> int:
         repl = Repl(repo, config)
     except ProviderMissing as error:
         print(error, file=sys.stderr)
+        return 1
+    except ShellNotFound as error:
+        print(f"Config error: shell: {error}", file=sys.stderr)
         return 1
     attachments = [Path(item) for item in getattr(args, "attach", [])]
     if getattr(args, "task", None):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 from deepagents import create_deep_agent
@@ -53,12 +54,31 @@ UNTRUSTED_PARAGRAPH = (
 )
 
 
-def _main_system_prompt(agents: list[AgentDef]) -> str:
+def shell_line(kind: str) -> str:
+    """The prompt sentence that names the shell every command runs in."""
+
+    return (
+        f"Shell commands run with {kind}; each command is one {kind} script, "
+        "so cd and variables last until the command ends."
+    )
+
+
+def _main_system_prompt(agents: list[AgentDef], shell_kind: str) -> str:
     """SYSTEM_PROMPT with its delegation sentence replaced by the roster."""
 
     roster = roster_prompt(agents) + "\n" + _REPORT_GUIDANCE
     prompt = SYSTEM_PROMPT.replace(" " + _DELEGATION, "\n\n" + roster)
-    return prompt.rstrip("\n") + "\n\n" + UNTRUSTED_PARAGRAPH + "\n"
+    return prompt.rstrip("\n") + "\n\n" + shell_line(shell_kind) + "\n\n" + UNTRUSTED_PARAGRAPH + "\n"
+
+
+def _with_shell_line(agents: list[AgentDef], shell_kind: str) -> list[AgentDef]:
+    """Roles with the shell group get the shell sentence at the end of their prompt."""
+
+    line = shell_line(shell_kind)
+    return [
+        replace(d, prompt=d.prompt.rstrip("\n") + "\n\n" + line + "\n") if "shell" in d.groups else d
+        for d in agents
+    ]
 
 
 def build_agent(
@@ -84,7 +104,8 @@ def build_agent(
 
     root = Path(repo).resolve()
     protect_context_file(root)
-    routed = workspace_backend(root, backend)
+    routed = workspace_backend(root, backend, shell_preference=config.shell)
+    shell_kind = routed.default.shell_kind
     factory = model_factory or default_model_factory(config)
     roster = builtin_agents() if agents is None else agents
     main_model = (
@@ -94,11 +115,11 @@ def build_agent(
     kwargs = {
         "model": main_model,
         "name": "main",
-        "system_prompt": _main_system_prompt(roster),
+        "system_prompt": _main_system_prompt(roster, shell_kind),
         "tools": list(extra_tools),
         "middleware": [TodoListMiddleware()],
         "subagents": build_specs(
-            roster,
+            _with_shell_line(roster, shell_kind),
             backend=routed,
             config=config,
             model_factory=factory,
@@ -134,10 +155,21 @@ def default_model_factory(config: Config) -> ModelFactory:
     return factory
 
 
-def workspace_backend(root: Path | str, shell: GuardedShellBackend | None = None) -> CompositeBackend:
-    """Route repo files at ``/`` and keep command execution on the guarded shell."""
+def workspace_backend(
+    root: Path | str,
+    shell: GuardedShellBackend | None = None,
+    *,
+    shell_preference: str = "auto",
+) -> CompositeBackend:
+    """Route repo files at ``/`` and keep command execution on the guarded shell.
 
-    guarded = shell or GuardedShellBackend(root_dir=root, virtual_mode=True, inherit_env=True)
+    ``shell_preference`` (the ``shell`` setting) is used only when no shell
+    backend is passed in.
+    """
+
+    guarded = shell or GuardedShellBackend(
+        root_dir=root, virtual_mode=True, inherit_env=True, shell=shell_preference
+    )
     filesystem = RepoFilesystemBackend(root_dir=root, virtual_mode=True)
     return CompositeBackend(default=guarded, routes={"/": filesystem})
 

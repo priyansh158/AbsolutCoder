@@ -7,7 +7,15 @@ from pathlib import Path
 
 import pytest
 
-from absolutcoder.git_policy import PolicyDenied, TurnFlags, protect_context_file, scrub_commit_message, vet
+from absolutcoder.git_policy import (
+    PolicyDenied,
+    TurnFlags,
+    protect_context_file,
+    render_command,
+    scrub_commit_message,
+    sets_commit_identity,
+    vet,
+)
 from absolutcoder.shell import GuardedShellBackend
 
 
@@ -112,6 +120,32 @@ def test_context_file_is_excluded_and_unstaged(tmp_path, git_repo):
         backend.execute("git add AbsolutCoder.md")
     with pytest.raises(PolicyDenied):
         backend.execute("git add -f AbsolutCoder.md")
+
+
+def test_exported_identity_is_denied():
+    for command in (
+        "export GIT_AUTHOR_NAME=x",
+        "GIT_AUTHOR_NAME=x",
+        "set GIT_AUTHOR_NAME=x",
+        "setx GIT_AUTHOR_NAME x",
+        '$env:GIT_AUTHOR_NAME = "x"',
+        "declare -x GIT_COMMITTER_EMAIL=x",
+        "env GIT_AUTHOR_NAME=x git commit -m y",
+        "env GIT_AUTHOR_NAME=x make",
+        "export GIT_COMMITTER_NAME=x; git commit -m y",
+    ):
+        assert sets_commit_identity(command.split(";")[0]), command
+        with pytest.raises(PolicyDenied, match="commit identity variables cannot be set"):
+            vet(command, TurnFlags())
+    assert not sets_commit_identity("GIT_AUTHOR_NAME=x git commit -m y")
+    vet("GIT_AUTHOR_NAME=x git commit -m y", TurnFlags())
+    vet("echo $GIT_AUTHOR_NAME && git log --author=Ada", TurnFlags())
+
+
+def test_render_command_quotes_for_posix_shells():
+    tokens = ["git", "commit", "-m", "two words", "it's", "$HOME and $(id)", 'say "hi"', ""]
+    for kind in ("bash", "sh"):
+        assert shlex.split(render_command(tokens, kind)) == tokens
 
 
 def test_turn_flags_follow_the_user_message():

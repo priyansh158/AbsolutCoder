@@ -21,6 +21,16 @@ _TRAILER = re.compile(r"^\s*(co-authored-by|assisted-by|generated-by)\s*:", re.I
 _ATTRIBUTION = re.compile(r"absolut\s*coder|absolutcoder", re.IGNORECASE)
 _NEGATION = re.compile(r"\b(don't|do not|never|without|no)\s*$")
 _IDENTITY_PREFIXES = ("GIT_AUTHOR_", "GIT_COMMITTER_")
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_ASSIGNING_COMMANDS = frozenset(
+    {"export", "declare", "typeset", "readonly", "local", "set", "setx", "setx.exe", "env"}
+)
+# The lines scrub_commit_message drops, for grep -Eiv at run time.
+_SCRUB_PATTERN = (
+    "^[[:space:]]*(co-authored-by|assisted-by|generated-by)[[:space:]]*:|absolut[[:space:]]*coder"
+)
+# A redirection token such as 2>&1, >/dev/null or <<EOF stays unquoted for a POSIX shell.
+_REDIRECTION = re.compile(r"^(?:\d*|&)(?:>>|>|<<<|<<-|<<|<)&?[\w./:\\~+-]*$")
 
 DEFAULT_MEMORY = """# AbsolutCoder
 
@@ -61,7 +71,36 @@ def vet(command: str, flags: TurnFlags) -> None:
     """
 
     for segment in iter_vet_segments(command):
+        if sets_commit_identity(segment):
+            raise PolicyDenied("commit identity variables cannot be set")
         _vet_segment(segment, flags)
+
+
+def sets_commit_identity(segment: str) -> bool:
+    """True when ``segment`` assigns, exports or sets a GIT_AUTHOR_* / GIT_COMMITTER_* variable.
+
+    A prefix assignment on a ``git commit`` line is allowed: it is stripped
+    before the commit runs. Anywhere else the value could outlive the segment
+    (one process runs the whole command) or reach a git that does not strip it.
+    """
+
+    tokens = _tokens(segment)
+    if any(_names_powershell_identity(token) for token in tokens):
+        return True
+    index = 0
+    while index < len(tokens) and _ASSIGNMENT.match(tokens[index]):
+        index += 1
+    leading, rest = tokens[:index], tokens[index:]
+    if any(_is_identity_assignment(token) for token in leading):
+        if not rest or _command_name(rest[0]) not in {"git", "git.exe"}:
+            return True
+        if _split_git_args(rest[1:])[0] != "commit":
+            return True
+    if rest and _command_name(rest[0]) in _ASSIGNING_COMMANDS:
+        for token in rest[1:]:
+            if token.split("=", 1)[0].upper().startswith(_IDENTITY_PREFIXES):
+                return True
+    return False
 
 
 def scrub_commit_message(message: str) -> str:
@@ -167,25 +206,48 @@ def git_subcommand(segment: str) -> str | None:
     return _subcommand
 
 
-def prepare_commit_segment(segment: str, repo: Path) -> tuple[str, Path | None]:
+def prepare_commit_segment(segment: str, repo: Path, kind: str = "cmd") -> tuple[str, Path | None]:
     """Rewrite a git commit so the stored message has no attribution trailer.
 
     Identity assignments and ``--author`` are removed. The message is passed
-    with ``-F`` so the host shell does not have to quote newlines.
+    with ``-F`` so the host shell does not have to quote newlines. ``kind`` is
+    the shell that runs the result: ``cmd``, ``bash`` or ``sh``.
+
+    For a POSIX shell, a message read with ``-F <file>`` or ``-F -`` (a pipe or
+    here-document) is filtered through ``grep`` at run time, because its text
+    is not known before the script runs.
     """
 
     if git_subcommand(segment) != "commit":
         return segment, None
-    try:
-        tokens = _tokens(segment)
-    except ValueError:
-        return segment, None
-    tokens = [token for token in tokens if not _is_identity_assignment(token)]
+    posix = kind != "cmd"
+    tokens = [token for token in _tokens(segment) if not _is_identity_assignment(token)]
     messages: list[str] = []
     kept: list[str] = []
+    message_source: str | None = None
+    stdin_redirects: list[str] = []
     index = 0
     while index < len(tokens):
         token = tokens[index]
+        if posix and token in {"-F", "--file"} and index + 1 < len(tokens):
+            message_source = tokens[index + 1]
+            index += 2
+            continue
+        if posix and token.startswith("--file="):
+            message_source = token.split("=", 1)[1]
+            index += 1
+            continue
+        if posix and token.startswith("-F") and len(token) > 2:
+            message_source = token[2:]
+            index += 1
+            continue
+        if posix and token.startswith("<") and _REDIRECTION.match(token):
+            stdin_redirects.append(token)
+            if token in {"<", "<<", "<<-", "<<<"} and index + 1 < len(tokens):
+                stdin_redirects.append(tokens[index + 1])
+                index += 1
+            index += 1
+            continue
         if token == "--author":
             index += 2
             continue
@@ -213,11 +275,70 @@ def prepare_commit_segment(segment: str, repo: Path) -> tuple[str, Path | None]:
             continue
         kept.append(token)
         index += 1
-    if not messages:
-        return _join_cmd(kept), None
-    path = _write_message(repo, scrub_commit_message("\n\n".join(messages)))
-    kept.extend(["-F", str(path)])
-    return _join_cmd(kept), path
+    if messages:
+        path = _write_message(repo, scrub_commit_message("\n\n".join(messages)))
+        kept.extend(["-F", str(path)])
+        kept.extend(stdin_redirects)
+        return render_command(kept, kind), path
+    if message_source is None:
+        return render_command(kept + stdin_redirects, kind), None
+    source = stdin_redirects if message_source == "-" else ["<", message_source]
+    scrubber = render_command(["grep", "-Eiv", _SCRUB_PATTERN, *source], kind)
+    return scrubber + " | " + render_command([*kept, "-F", "-"], kind), None
+
+
+def render_command(tokens: list[str], kind: str) -> str:
+    """Join ``tokens`` into one command line for the shell ``kind``.
+
+    ``cmd`` keeps the double-quote rules cmd.exe understands. ``bash`` and
+    ``sh`` quote every word with ``shlex.quote``, keep redirections such as
+    ``2>&1`` or ``<<EOF`` working (a here-document delimiter is quoted, so its
+    body is not expanded), and write existing absolute Windows paths with
+    forward slashes.
+    """
+
+    if kind == "cmd":
+        return _join_cmd(tokens)
+    rendered: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in {"<<", "<<-"} and index + 1 < len(tokens):
+            rendered.append(_heredoc(token, tokens[index + 1]))
+            index += 2
+            continue
+        rendered.append(_posix_word(token))
+        index += 1
+    return " ".join(rendered)
+
+
+def _heredoc(operator: str, delimiter: str) -> str:
+    if "'" in delimiter:
+        return operator + shlex.quote(delimiter)
+    return operator + "'" + delimiter + "'"
+
+
+def _posix_word(token: str) -> str:
+    if _REDIRECTION.match(token):
+        if not token.startswith("<<<"):
+            for operator in ("<<-", "<<"):
+                if token.startswith(operator) and len(token) > len(operator):
+                    return _heredoc(operator, token[len(operator):])
+        return token
+    assignment = _ASSIGNMENT.match(token)
+    if assignment:
+        return assignment.group(0) + shlex.quote(token[assignment.end():])
+    if "\\" in token and _is_existing_absolute(token):
+        token = token.replace("\\", "/")
+    return shlex.quote(token)
+
+
+def _is_existing_absolute(token: str) -> bool:
+    try:
+        path = Path(token)
+        return path.is_absolute() and path.exists()
+    except (OSError, ValueError):
+        return False
 
 
 def _asked(text: str, verb: str) -> bool:
@@ -325,7 +446,19 @@ def _tokens(segment: str) -> list[str]:
 
 
 def _is_identity_assignment(token: str) -> bool:
-    return any(token.startswith(prefix) and "=" in token for prefix in _IDENTITY_PREFIXES)
+    return "=" in token and token.upper().startswith(_IDENTITY_PREFIXES)
+
+
+def _names_powershell_identity(token: str) -> bool:
+    lowered = token.lower()
+    for prefix in ("$env:", "${env:"):
+        if lowered.startswith(prefix):
+            return token[len(prefix) :].upper().startswith(_IDENTITY_PREFIXES)
+    return False
+
+
+def _command_name(token: str) -> str:
+    return token.replace("\\", "/").rsplit("/", 1)[-1].lower()
 
 
 def _reset_is_hard(args: list[str]) -> bool:
