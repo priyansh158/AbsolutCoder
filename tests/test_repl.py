@@ -17,7 +17,14 @@ from absolutcoder.config import Config, config_path, save_config
 from absolutcoder.models import ProviderMissing
 from absolutcoder.repl import Repl, _resume_map
 from absolutcoder.sessions import create_session, list_sessions, load_session
-from tests.support import role_models, scripted_model, tool_call, tool_names_since_last_human
+from tests.support import (
+    role_models,
+    scripted_model,
+    task_call,
+    tool_call,
+    tool_calls,
+    tool_names_since_last_human,
+)
 
 _PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
@@ -493,3 +500,108 @@ def test_startup_reports_custom_roles_and_warnings(tmp_path):
 def test_startup_is_silent_without_custom_roles(tmp_path):
     repl, output = _plain_repl(tmp_path)
     assert not any(line.startswith("agents:") for line in output.getvalue().splitlines())
+
+
+# --- streaming display ----------------------------------------------------------
+
+
+def _no_web(monkeypatch):
+    """Replace the real web tools with test doubles so no HTTP client is created."""
+
+    from langchain_core.tools import tool
+
+    @tool
+    def web_fetch(url: str) -> str:
+        """Fetch a page (test double)."""
+        return "page"
+
+    @tool
+    def web_search(query: str) -> str:
+        """Search (test double)."""
+        return "results"
+
+    monkeypatch.setattr("absolutcoder.repl.make_web_tools", lambda **_kw: [web_fetch, web_search])
+
+
+def test_turn_output_shows_subagent_activity(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def main(messages):
+        if "task" in tool_names_since_last_human(messages):
+            return AIMessage(content="main final answer")
+        return tool_calls(task_call("explore", "find the config", "t1"))
+
+    def explorer(messages):
+        if "grep" not in tool_names_since_last_human(messages):
+            return tool_call("grep", {"pattern": "config"}, "g1")
+        return AIMessage(content="explorer report")
+
+    output = io.StringIO()
+    repl = Repl(
+        repo,
+        Config(main_model="openai:main-test", subagent_model="openai:worker-test", auto_run=True),
+        chat_model=scripted_model(main),
+        model_factory=role_models({"explore": scripted_model(explorer)}, default=scripted_model(lambda _m: AIMessage(content="ok"))),
+        console=Console(file=output, force_terminal=False, no_color=True, width=200),
+    )
+    assert repl.run_turn("where is the config?") is not None
+    text = output.getvalue()
+    lines = text.splitlines()
+    assert "  task [explore]: find the config" in lines
+    assert any(line.startswith("  [explore] tool: grep(") for line in lines)
+    assert "  task [explore] finished" in lines
+    assert text.count("main final answer") == 1
+    assert "explorer report" not in text
+
+
+def test_keyboard_interrupt_mid_stream_keeps_session(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    repl, output = _plain_repl(tmp_path)
+    thread_id = repl.thread_id
+    real_stream = repl.agent.stream
+    state = {"raised": False}
+
+    def stream(*args, **kwargs):
+        if not state["raised"]:
+            state["raised"] = True
+            raise KeyboardInterrupt
+        return real_stream(*args, **kwargs)
+
+    repl.agent.stream = stream
+    assert repl.run_turn("first") is None
+    text = output.getvalue()
+    assert "interrupted" in text.splitlines()
+    assert "Traceback" not in text
+    assert repl.thread_id == thread_id
+    assert repl.run_turn("second") is not None
+    assert "ok" in output.getvalue().splitlines()
+    assert repl.thread_id == thread_id
+
+
+def test_approval_prompt_follows_tool_line(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    repo = _git_repo(tmp_path / "repo")
+
+    def responder(messages):
+        if "execute" not in tool_names_since_last_human(messages):
+            return tool_call("execute", {"command": "git status"}, "call-status")
+        return AIMessage(content="status done")
+
+    output = io.StringIO()
+    repl = Repl(
+        repo,
+        Config(main_model="openai:main-test", subagent_model="openai:worker-test", auto_run=False),
+        chat_model=scripted_model(responder),
+        model_factory=_worker(),
+        input_fn=lambda _prompt="": "y",
+        console=Console(file=output, force_terminal=False, no_color=True, width=200),
+    )
+    repl.run_turn("show git status")
+    text = output.getvalue()
+    tool_at = text.index("  tool: execute(git status)")
+    prompt_at = text.index("Run command?")
+    assert tool_at < prompt_at
+    assert text.count("tool: execute(") == 1
+    assert text.count("status done") == 1

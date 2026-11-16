@@ -17,6 +17,7 @@ from absolutcoder.attachments import build_user_content
 from absolutcoder.config import Config, config_path, resolve_model, save_config
 from absolutcoder.git_policy import TurnFlags, protect_context_file
 from absolutcoder.models import ModelFactory, ProviderMissing, missing_keys
+from absolutcoder.render import StreamRenderer
 from absolutcoder.sessions import (
     Session,
     checkpoint_saver,
@@ -60,6 +61,7 @@ class Repl:
         self.backend = GuardedShellBackend(root_dir=self.repo, virtual_mode=True, inherit_env=True)
         self.checkpointer = checkpoint_saver()
         self.turn_vet_log: list[dict] = []
+        self._renderer: StreamRenderer | None = None
         self.agents, warnings = load_roster(self.repo)
         # Built once and reused by every rebuild, so no rebuild leaves a client behind.
         self.web_tools = make_web_tools(max_chars=self.config.web_max_chars)
@@ -124,11 +126,18 @@ class Repl:
         self.backend.flags = TurnFlags.from_message(text)
         start = len(self.backend.vet_log)
         config = {"configurable": {"thread_id": self.thread_id}}
+        self._renderer = None
         try:
             content = build_user_content(text, attachments)
             return self._drive({"messages": [{"role": "user", "content": content}]}, config)
         except GraphBubbleUp:
             raise
+        except KeyboardInterrupt:
+            if self._renderer is None:
+                self.console.print("interrupted", markup=False, highlight=False)
+            else:
+                self._renderer.interrupted()
+            return None
         except Exception as exc:
             self.console.print(f"Error: {exc}", markup=False, highlight=False)
             return None
@@ -284,17 +293,26 @@ class Repl:
         )
 
     def _drive(self, payload, config):
+        renderer = self._renderer = StreamRenderer(self.console)
         while True:
-            for chunk in self.agent.stream(payload, config, stream_mode="updates"):
-                self._render_update(chunk)
+            parts = self.agent.stream(
+                payload,
+                config,
+                stream_mode=["messages", "updates"],
+                subgraphs=True,
+                version="v2",
+            )
+            for part in parts:
+                renderer.feed(part)
             snapshot = self.agent.get_state(config)
             interrupts = _pending_interrupts(snapshot)
             if not interrupts:
-                self._render_final(snapshot)
+                renderer.finish(snapshot)
                 return snapshot
             if not all(getattr(item, "id", None) for item in interrupts):
                 # Command(resume={id: ...}) cannot address it; re-streaming would loop forever.
                 raise RuntimeError("Cannot resume: an approval request has no id.")
+            renderer.end_line()
             payload = Command(resume=_resume_map(interrupts, self._decisions(interrupts)))
 
     def _decisions(self, interrupts) -> dict[str, dict]:
@@ -318,34 +336,6 @@ class Repl:
                     decisions.append({"type": "reject", "message": "User rejected the command."})
             answered[interrupt_id] = {"decisions": decisions}
         return answered
-
-    def _render_update(self, chunk) -> None:
-        if not isinstance(chunk, dict):
-            return
-        for update in chunk.values():
-            if not isinstance(update, dict):
-                continue
-            messages = update.get("messages") or []
-            if not isinstance(messages, list):
-                messages = [messages]
-            for message in messages:
-                for call in getattr(message, "tool_calls", None) or []:
-                    if call.get("name") != "task":
-                        continue
-                    description = str(call.get("args", {}).get("description", "")).strip()
-                    self.console.print("task: " + " ".join(description.split()))
-
-    def _render_final(self, snapshot) -> None:
-        messages = snapshot.values.get("messages", []) if snapshot.values else []
-        for message in reversed(messages):
-            if getattr(message, "type", None) != "ai":
-                continue
-            if getattr(message, "tool_calls", None):
-                continue
-            text = _message_text(getattr(message, "content", ""))
-            if text:
-                self.console.print(text)
-            return
 
     def _auto_value(self, argument: str) -> bool | None:
         lowered = argument.lower()
@@ -400,17 +390,3 @@ def _resume_map(interrupts, answered: dict[str, dict]):
     if len(interrupts) == 1 and len(answered) == 1:
         return next(iter(answered.values()))
     return answered
-
-
-def _message_text(content) -> str:
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, str):
-                parts.append(block)
-            elif isinstance(block, dict) and block.get("type") == "text":
-                parts.append(str(block.get("text", "")))
-        return "\n".join(part for part in parts if part).strip()
-    return str(content).strip()
