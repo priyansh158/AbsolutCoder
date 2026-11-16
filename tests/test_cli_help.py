@@ -153,6 +153,24 @@ def test_until_without_task_is_an_error(capsys):
     assert raised.value.code == 2
 
 
+def test_first_launch_without_a_terminal_explains_the_config(tmp_path):
+    scripts, executable = _executable()
+    env = os.environ.copy()
+    env["PATH"] = str(scripts) + os.pathsep + env.get("PATH", "")
+    env["ABSOLUTCODER_HOME"] = str(tmp_path)
+    completed = subprocess.run(
+        [str(executable), "hello"], check=False, capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL
+    )
+    assert completed.returncode == 1
+    path = tmp_path / "config.json"
+    assert (
+        f"No config found at {path}. Run absolut once in a terminal to choose models, "
+        'or create that file with "main_model" and "subagent_model".'
+    ) in completed.stderr
+    assert "Traceback" not in completed.stderr
+    assert not path.exists()
+
+
 def test_empty_until_is_an_error(capsys):
     import pytest
 

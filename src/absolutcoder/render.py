@@ -295,5 +295,7 @@ class StreamRenderer:
 
     def _print(self, text: str) -> None:
         with self._output:
-            self.console.print(text, markup=False, highlight=False)
+            # Off a terminal (a pipe or a file) a whole line is never hard-wrapped.
+            soft_wrap = not self.console.is_terminal
+            self.console.print(text, markup=False, highlight=False, soft_wrap=soft_wrap)
 

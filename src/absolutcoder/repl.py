@@ -35,12 +35,13 @@ from absolutcoder.shell import GuardedShellBackend, ShellNotFound
 from absolutcoder.tasks import TaskManager, TaskRecord, make_task_tools
 from absolutcoder.webtools import make_web_tools
 
-_COMMANDS = "Commands: /model, /subagent, /auto, /resume, /attach, /agents, /tasks, /verify, /loop, /exit"
+_COMMANDS = "Commands: /model, /subagent, /auto, /resume, /attach, /agents, /tasks, /verify, /loop, /exit, /quit"
 _LOOP_USAGE = "Usage: /loop <N>(s|m|h) <prompt>"
 _TASKS_USAGE = "Usage: /tasks [show <id> | cancel <id>]"
 _TASKS_OFF = "Background tasks are off in this mode."
 _UPDATES_HEADER = "[Background task updates — reported by the program, not typed by the user]"
 _REJECTED = {"type": "reject", "message": "User rejected the command."}
+_NO_TERMINAL = "No terminal to ask on: the command was rejected. Use --auto to allow commands without asking."
 _FAILURE_TAIL_LINES = 15
 _WAIT_STEP = 0.2  # seconds per join while leaving, so Ctrl+C is seen promptly
 
@@ -71,9 +72,15 @@ class Repl:
         self.model_factory = model_factory
         self.input_fn = input_fn or input
         self.console = console or Console()
+        # Where "Error:" lines go; a one-shot run points it at stderr.
+        self.error_console = self.console
         self.sleep_fn = sleep_fn
         self.pending_attachments: list[Path] = []
         self.last_turn_interrupted = False
+        self.last_turn_failed = False
+        # While --auto is in force: the auto_run value config.json keeps.
+        self.saved_auto_run: bool | None = None
+        self._no_terminal_noted = False
         self._task_stopped = False
         protect_context_file(self.repo)
         self.backend = GuardedShellBackend(
@@ -186,6 +193,8 @@ class Repl:
         """
 
         self.last_turn_interrupted = False
+        self.last_turn_failed = False
+        self._no_terminal_noted = False
         attachments = list(self.pending_attachments if paths is None else paths)
         self.pending_attachments.clear()
         self.backend.flags = TurnFlags.from_message(text) if flags is None else flags
@@ -212,9 +221,10 @@ class Repl:
             return None
         except Exception as exc:
             self._requeue_undelivered(notices, updates, config)
+            self.last_turn_failed = True
             if self._renderer is not None:
                 self._renderer.end_line()
-            self.console.print(f"Error: {exc}", markup=False, highlight=False)
+            self.error_console.print(f"Error: {exc}", markup=False, highlight=False)
             return None
         finally:
             self.turn_vet_log = self.backend.vet_log[start:]
@@ -316,8 +326,10 @@ class Repl:
                     interrupts,
                     question=lambda command, r=record: f"task {r.id} [{r.agent}] wants to run: {command}",
                 )
-            except (KeyboardInterrupt, EOFError):
+            except (KeyboardInterrupt, EOFError) as error:
                 self.console.print()
+                if isinstance(error, EOFError):
+                    self._note_no_terminal()
                 decisions = _rejections(interrupts)
                 stop = True
             try:
@@ -412,7 +424,7 @@ class Repl:
             return
         command = None if argument.lower() == "off" else argument
         self.config = replace(self.config, verify_command=command)
-        save_config(config_path(), self.config)
+        self._save()
         self._say(f"verify: {command or 'off'}")
 
     def _loop(self, argument: str) -> None:
@@ -542,7 +554,9 @@ class Repl:
             return False
         self.config = updated
         self.agent = agent
-        save_config(config_path(), self.config)
+        if auto_run is not None:
+            self.saved_auto_run = None  # /auto chose a value to keep
+        self._save()
         self.session = update_session(
             self.session.id,
             main_model=self.config.main_model,
@@ -636,13 +650,32 @@ class Repl:
                     self.console.print(f"Run command? {command}")
                 else:
                     self._say(question(command))
-                answer = self._ask("[y/n] ").strip().lower()
+                try:
+                    answer = self._ask("[y/n] ").strip().lower()
+                except EOFError:
+                    if question is not None:
+                        raise  # a task approval: service_tasks rejects and stops asking
+                    self._note_no_terminal()
+                    answer = ""
                 if answer in {"y", "yes"}:
                     decisions.append({"type": "approve"})
                 else:
                     decisions.append(dict(_REJECTED))
             answered[interrupt_id] = {"decisions": decisions}
         return answered
+
+    def _note_no_terminal(self) -> None:
+        """Say once per turn that a request was rejected because nobody can answer."""
+
+        if not self._no_terminal_noted:
+            self._no_terminal_noted = True
+            self.error_console.print(_NO_TERMINAL, markup=False, highlight=False)
+
+    def _save(self) -> None:
+        """Write the settings; a run-only --auto is not written."""
+
+        saved = self.config if self.saved_auto_run is None else replace(self.config, auto_run=self.saved_auto_run)
+        save_config(config_path(), saved)
 
     def _auto_value(self, argument: str) -> bool | None:
         lowered = argument.lower()
@@ -665,8 +698,10 @@ class Repl:
 def run_cli(args, config: Config | None = None, *, repl_factory=Repl) -> int:
     """Run one task, or open the terminal loop, from the current repo.
 
-    A one-shot task returns 2 when its check command still fails, else 0.
-    ``--until`` and ``--max-rounds`` apply to that run only and are not saved.
+    A one-shot task returns 2 when its check command still fails, 1 when its
+    turn failed, 130 when it was stopped with Ctrl+C, else 0; its error lines
+    go to stderr. ``--until``, ``--max-rounds`` and ``--auto`` apply to that
+    run only and are not saved.
     """
 
     from absolutcoder.config import ensure_config
@@ -674,6 +709,10 @@ def run_cli(args, config: Config | None = None, *, repl_factory=Repl) -> int:
     repo = Path.cwd()
     if config is None:
         config = ensure_config()
+    auto = bool(getattr(args, "auto", False))
+    saved_auto_run = config.auto_run
+    if auto:
+        config = replace(config, auto_run=True)
     task = getattr(args, "task", None)
     if task:
         until = getattr(args, "until", None)
@@ -691,12 +730,20 @@ def run_cli(args, config: Config | None = None, *, repl_factory=Repl) -> int:
     except ShellNotFound as error:
         print(f"Config error: shell: {error}", file=sys.stderr)
         return 1
+    if auto and hasattr(repl, "saved_auto_run"):
+        repl.saved_auto_run = saved_auto_run
+    if task and hasattr(repl, "error_console"):
+        repl.error_console = Console(stderr=True)
     attachments = [Path(item) for item in getattr(args, "attach", [])]
     clean = True
     try:
         if task:
-            outcome = repl.run_task(task, paths=attachments)
-            code = 2 if outcome is not None and not outcome.passed else 0
+            try:
+                outcome = repl.run_task(task, paths=attachments)
+            except KeyboardInterrupt:
+                outcome, code = None, 130
+            else:
+                code = _one_shot_code(repl, outcome)
         else:
             repl.pending_attachments.extend(attachments)
             _interactive_loop(repl)
@@ -715,9 +762,20 @@ def run_cli(args, config: Config | None = None, *, repl_factory=Repl) -> int:
     return code
 
 
+def _one_shot_code(repl, outcome: VerifyOutcome | None) -> int:
+    """130 after Ctrl+C; with a check, 0 or 2 by its result; else 1 when the turn failed."""
+
+    if getattr(repl, "last_turn_interrupted", False) or getattr(repl, "_task_stopped", False):
+        return 130
+    if outcome is not None:
+        return 0 if outcome.passed else 2
+    return 1 if getattr(repl, "last_turn_failed", False) else 0
+
+
 def _make_repl(repl_factory, repo: Path, config: Config, *, background: bool):
     """Call the factory, passing ``background`` when it takes that keyword."""
 
+    # The signature is inspected only so test fakes without that keyword still work.
     try:
         parameters = inspect.signature(repl_factory).parameters.values()
     except (TypeError, ValueError):

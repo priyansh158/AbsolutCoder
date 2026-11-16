@@ -1487,3 +1487,59 @@ def test_run_cli_closes_and_passes_background(tmp_path, monkeypatch):
     assert run_cli(SimpleNamespace(task="hi", attach=[]), config, repl_factory=Recorder) == 0
     assert run_cli(SimpleNamespace(task=None, attach=[]), config, repl_factory=Recorder) == 0
     assert made == [False, True]
+
+
+_NO_TERMINAL = "No terminal to ask on: the command was rejected. Use --auto to allow commands without asking."
+
+
+def test_eof_at_main_approval_rejects_and_the_turn_continues(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    repo = _git_repo(tmp_path / "repo")
+
+    def ask(_prompt=""):
+        raise EOFError
+
+    def responder(messages):
+        names = tool_names_since_last_human(messages)
+        if names.count("execute") < 2:
+            return tool_call("execute", {"command": "echo hi"}, f"call-{len(names)}")
+        tools = [m for m in messages if getattr(m, "type", None) == "tool"]
+        return AIMessage(content="saw: " + str(tools[-1].content))
+
+    output = io.StringIO()
+    repl = Repl(
+        repo,
+        Config(main_model="openai:main-test", subagent_model="openai:worker-test", auto_run=False),
+        chat_model=scripted_model(responder),
+        model_factory=_worker(),
+        input_fn=ask,
+        console=Console(file=output, force_terminal=False, no_color=True, width=200),
+    )
+    snapshot = repl.run_turn("say hi")
+    assert snapshot is not None
+    lines = output.getvalue().splitlines()
+    assert lines.count(_NO_TERMINAL) == 1
+    assert not any(line.startswith("Error") for line in lines)
+    assert any("User rejected the command." in line for line in lines if line.startswith("saw: "))
+    assert repl.backend.vet_log == []
+
+
+def test_eof_at_task_approval_says_why(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+
+    def ask(_prompt=""):
+        raise EOFError
+
+    repl, output = _task_repl(
+        tmp_path, lambda _m: AIMessage(content="ok"), {"general-purpose": _runs("echo hi")}, auto_run=False, input_fn=ask
+    )
+    try:
+        repl.tasks.start("general-purpose", "one", flags=TurnFlags())
+        assert repl.tasks.wait("t1", timeout=TIMEOUT).status == "needs_approval"
+        repl.service_tasks()
+        finished = repl.tasks.wait("t1", timeout=TIMEOUT)
+        assert finished.status == "done"
+        assert "User rejected the command." in finished.result
+        assert output.getvalue().splitlines().count(_NO_TERMINAL) == 1
+    finally:
+        repl.close()
