@@ -267,7 +267,10 @@ class Repl:
     def _decisions(self, interrupts) -> dict[str, dict]:
         answered: dict[str, dict] = {}
         for item in interrupts:
-            value = item.value if not isinstance(item.value, dict) else item.value
+            interrupt_id = getattr(item, "id", None)
+            if not interrupt_id:
+                continue  # Command(resume={id: ...}) cannot address it
+            value = item.value
             actions = value.get("action_requests", []) if isinstance(value, dict) else []
             decisions = []
             for action in actions:
@@ -280,7 +283,7 @@ class Repl:
                     decisions.append({"type": "approve"})
                 else:
                     decisions.append({"type": "reject", "message": "User rejected the command."})
-            answered[getattr(item, "id", "") or ""] = {"decisions": decisions}
+            answered[interrupt_id] = {"decisions": decisions}
         return answered
 
     def _render_update(self, chunk) -> None:
@@ -359,9 +362,10 @@ def _pending_interrupts(snapshot) -> list:
 
 
 def _resume_map(interrupts, answered: dict[str, dict]):
-    if len(interrupts) == 1:
-        only = getattr(interrupts[0], "id", "") or ""
-        return answered.get(only, next(iter(answered.values())))
+    """One pending interrupt takes its answer directly; several take ``{id: answer}``."""
+
+    if len(interrupts) == 1 and len(answered) == 1:
+        return next(iter(answered.values()))
     return answered
 
 

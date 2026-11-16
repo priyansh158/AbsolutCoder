@@ -7,8 +7,12 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from absolutcoder.models import ModelFactory
 
 
-def scripted_model(responder):
-    """Return a chat model whose replies come from ``responder(messages)``."""
+def scripted_model(responder, *, bound: list | None = None):
+    """Return a chat model whose replies come from ``responder(messages)``.
+
+    When ``bound`` is given, every ``bind_tools`` call appends the list of tool
+    names it was given.
+    """
 
     class FakeChatModel(BaseChatModel):
         @property
@@ -19,9 +23,17 @@ def scripted_model(responder):
             return ChatResult(generations=[ChatGeneration(message=responder(messages))])
 
         def bind_tools(self, tools, **kwargs):
+            if bound is not None:
+                bound.append([_tool_name(tool) for tool in tools])
             return self
 
     return FakeChatModel()
+
+
+def _tool_name(tool) -> str:
+    if isinstance(tool, dict):
+        return str(tool.get("name") or tool.get("function", {}).get("name", ""))
+    return str(getattr(tool, "name", ""))
 
 
 def tool_call(name: str, args: dict, call_id: str) -> AIMessage:
@@ -29,6 +41,23 @@ def tool_call(name: str, args: dict, call_id: str) -> AIMessage:
         content="",
         tool_calls=[{"name": name, "args": args, "id": call_id, "type": "tool_call"}],
     )
+
+
+def task_call(agent: str, description: str, call_id: str) -> dict:
+    """One tool-call dict for the ``task`` tool."""
+
+    return {
+        "name": "task",
+        "args": {"description": description, "subagent_type": agent},
+        "id": call_id,
+        "type": "tool_call",
+    }
+
+
+def tool_calls(*calls: dict) -> AIMessage:
+    """One AIMessage carrying several tool calls."""
+
+    return AIMessage(content="", tool_calls=list(calls))
 
 
 def last_human_text(messages) -> str:
@@ -59,12 +88,22 @@ def tool_names_since_last_human(messages) -> list[str]:
     return names
 
 
-def role_models(mapping: dict[str, BaseChatModel], *, seen: list | None = None) -> ModelFactory:
-    """Return a model factory that hands out ``mapping[role]`` and records requests."""
+_NO_DEFAULT = object()
+
+
+def role_models(
+    mapping: dict[str, BaseChatModel], *, seen: list | None = None, default=_NO_DEFAULT
+) -> ModelFactory:
+    """Return a model factory that hands out ``mapping[role]`` and records requests.
+
+    A role missing from ``mapping`` gets ``default`` when one is given, else KeyError.
+    """
 
     def factory(role: str, model_id: str):
         if seen is not None:
             seen.append((role, model_id))
+        if role not in mapping and default is not _NO_DEFAULT:
+            return default
         return mapping[role]
 
     return factory
