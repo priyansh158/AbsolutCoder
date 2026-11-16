@@ -334,3 +334,23 @@ def test_summarization_tokens_inside_the_model_node_are_not_printed():
     renderer.feed(part)
     assert "summary text" not in output.getvalue()
     _clean(renderer)
+
+
+def test_tools_used_collects_main_and_worker_tools():
+    renderer, _output = _renderer(False)
+    assert renderer.tools_used == set()
+    renderer.feed(_upd("model", [_call("read_file", {"file_path": "/a.py"}, "c1")]))
+    renderer.feed(_upd("tools", [ToolMessage(content="x", tool_call_id="c1", name="read_file", id="r1")]))
+    renderer.feed(_upd("model", [_call("write_file", {"file_path": "/b.py"}, "c2")], ns=WORKER_NS))
+    renderer.feed(_upd("model", [_call("task", {"subagent_type": "explore", "description": "d"}, "c3")]))
+    several = AIMessage(
+        content="",
+        id="ai-several",
+        tool_calls=[
+            {"name": "grep", "args": {"pattern": "x"}, "id": "c4", "type": "tool_call"},
+            {"name": "execute", "args": {"command": "ls"}, "id": "c5", "type": "tool_call"},
+        ],
+    )
+    renderer.feed(_upd("model", [several], ns=WORKER_NS))
+    assert renderer.tools_used == {"read_file", "write_file", "task", "grep", "execute"}
+    _clean(renderer)

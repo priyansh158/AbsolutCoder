@@ -108,6 +108,7 @@ class StreamRenderer:
         self._output = output_lock(console)
         self.live = console.is_terminal if live is None else live
         self.errors: list[Exception] = []
+        self.tools_used: set[str] = set()  # names of the tools called this turn, main loop and workers
         self._labels: dict[tuple, str] = {}
         self._calls: dict[str, dict] = {}  # tool_call_id -> most recent call with that id
         self._shown_ids: set[str] = set()  # main message ids already on screen
@@ -238,6 +239,8 @@ class StreamRenderer:
         if call_id:
             self._calls[call_id] = call
         name = str(call.get("name", ""))
+        if name:
+            self.tools_used.add(name)
         args = call.get("args") if isinstance(call.get("args"), dict) else {}
         if ns:
             self._line(f"  [{self._label(ns)}] tool: {name}({summarize_call(name, args)})")

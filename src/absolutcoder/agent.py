@@ -13,7 +13,7 @@ from langchain.agents.middleware import AgentMiddleware, TodoListMiddleware
 from langchain_core.tools import BaseTool
 from langgraph.graph.state import CompiledStateGraph
 
-from absolutcoder.codemap import CodeMap, make_map_tools
+from absolutcoder.codemap import CODE_MAP_RULE, CodeMap, make_map_tools
 from absolutcoder.config import Config
 from absolutcoder.git_policy import execute_needs_approval, protect_context_file
 from absolutcoder.models import ModelFactory, build_model, construct_model, provider_error
@@ -35,6 +35,7 @@ from absolutcoder.subagents import (  # noqa: F401 - SECRET_PATHS is re-exported
     secret_permissions,
     skill_text,
     web_runnable,
+    with_map_rule,
     with_skill_text,
 )
 
@@ -95,10 +96,12 @@ def _main_system_prompt(
     background: bool = False,
     skills: str = "",
     interactive: bool = True,
+    code_map: bool = False,
 ) -> str:
     """SYSTEM_PROMPT with its delegation sentence replaced by the roster.
 
     ``background`` adds the paragraph on background tasks (the task tools are given).
+    ``code_map`` adds the rule to ask the code map first (its tools are given).
     ``skills`` (the skill-folders note and always-on rules) is appended last.
     """
 
@@ -109,6 +112,8 @@ def _main_system_prompt(
         prompt += "\n" + BACKGROUND_PARAGRAPH + "\n"
     if not interactive:
         prompt += "\n" + NON_INTERACTIVE_LINE + "\n"
+    if code_map:
+        prompt += "\n" + CODE_MAP_RULE + "\n"
     if skills:
         prompt += "\n" + skills + "\n"
     return prompt
@@ -146,8 +151,8 @@ def build_agent(
     the default backend so ``execute`` still runs on this machine. The route
     backend strips Windows ``\\\\?\\`` prefixes before the root check.
 
-    A usable ``code_map`` gives its tools to the main model and to every
-    worker role that reads the repository.
+    A usable ``code_map`` gives its tools, and the rule to ask it first, to
+    the main model and to every worker role that reads the repository.
     """
 
     root = Path(repo).resolve()
@@ -170,6 +175,7 @@ def build_agent(
             background=any(t.name == _TASK_TOOL_NAME for t in extra_tools),
             skills=skill_text(root),
             interactive=interactive,
+            code_map=bool(map_tools),
         ),
         "tools": [*extra_tools, *map_tools],
         "middleware": [TodoListMiddleware()],
@@ -231,13 +237,16 @@ def build_role_graph(
     if "web" in role.groups:
         return web_runnable(role, model, model_id, config, web_tools, checkpointer=checkpointer)
     routed = workspace_backend(root, backend, shell_preference=config.shell)
-    definition = with_skill_text(_with_shell_line([role], routed.default.shell_kind)[0], root)
+    map_tools = _map_tools(code_map)
+    definition = with_map_rule(
+        with_skill_text(_with_shell_line([role], routed.default.shell_kind)[0], root), map_tools
+    )
     permissions = role_permissions(role)
     kwargs = {
         "model": model,
         "name": role.name,
         "system_prompt": definition.prompt,
-        "tools": role_map_tools(role, _map_tools(code_map)),
+        "tools": role_map_tools(role, map_tools),
         "middleware": [*role_middleware(role, routed), _NoSubWorkers()],
         "permissions": (
             secret_permissions() + global_skills_permissions() if permissions is None else permissions

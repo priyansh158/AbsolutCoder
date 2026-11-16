@@ -17,6 +17,7 @@ from rich.console import Console
 from absolutcoder.agent import build_agent, build_role_graph
 from absolutcoder.agent_files import load_roster
 from absolutcoder.attachments import build_user_content
+from absolutcoder.codemap import CodeMap
 from absolutcoder.config import Config, config_path, resolve_model, save_config
 from absolutcoder.git_policy import PolicyDenied, TurnFlags, protect_context_file
 from absolutcoder.loops import VerifyOutcome, parse_interval, run_interval_loop, run_until_verified
@@ -36,14 +37,18 @@ from absolutcoder.skills import global_skills_dir, install_skill, list_skills, r
 from absolutcoder.tasks import TaskManager, TaskRecord, make_task_tools
 from absolutcoder.webtools import make_web_tools
 
-_COMMANDS = "Commands: /model, /subagent, /auto, /resume, /attach, /agents, /tasks, /skills, /verify, /loop, /exit, /quit"
+_COMMANDS = "Commands: /model, /subagent, /auto, /resume, /attach, /agents, /tasks, /skills, /map, /verify, /loop, /exit, /quit"
 _SKILLS_ADD_USAGE = "Usage: /skills add <folder>"
 _SKILLS_REMOVE_USAGE = "Usage: /skills remove <name>"
 _SKILLS_USAGE = "Usage: /skills [add <folder> | remove <name>]"
 _BUILTIN_COMMANDS = frozenset(
     {"/model", "/subagent", "/auto", "/resume", "/attach", "/agents", "/tasks", "/skills",
-     "/verify", "/loop", "/exit", "/quit"}
+     "/map", "/verify", "/loop", "/exit", "/quit"}
 )
+_MAP_USAGE = "Usage: /map [build|update|on|off]"
+_MAP_OFF_HINT = "map: off (use /map on)"
+# A turn that called one of these may have changed files, so the code map is refreshed.
+_CHANGING_TOOLS = frozenset({"write_file", "edit_file", "delete", "execute"})
 _LOOP_USAGE = "Usage: /loop <N>(s|m|h) <prompt>"
 _TASKS_USAGE = "Usage: /tasks [show <id> | cancel <id>]"
 _TASKS_OFF = "Background tasks are off in this mode."
@@ -69,6 +74,7 @@ class Repl:
         sleep_fn=time.sleep,
         background: bool = True,
         overrides: Mapping[str, object] | None = None,
+        code_map_factory: Callable[..., CodeMap] | None = None,
     ) -> None:
         self.repo = Path(repo).resolve()
         # Settings for this run only (--auto, --until, --max-rounds, --until-timeout).
@@ -103,6 +109,15 @@ class Repl:
         self.web_tools = make_web_tools(max_chars=self.config.web_max_chars)
         self._output = output_lock(self.console)  # shared with every turn's renderer
         self._closed: bool | None = None  # close() result once it has run
+        # One code map per session, made before the first build so its tools and
+        # rule are in it; a build already under way counts as usable.
+        self._code_map_factory = code_map_factory or CodeMap
+        self.code_map: CodeMap | None = None
+        earlier_map = False
+        if self.config.code_map == "auto":
+            self.code_map = self._new_code_map()
+            earlier_map = self.code_map.status() == "ready"
+            self.code_map.ensure()
         # The manager and its tools exist before the first build so every build,
         # and every rebuild, gets the same tool objects; it learns the session id
         # once the session row exists, before any task can start.
@@ -126,6 +141,8 @@ class Repl:
         if agent is None:
             if self.tasks is not None:
                 self.tasks.shutdown()
+            if self.code_map is not None:
+                self.code_map.close()
             raise ProviderMissing("\n".join(self._failures))
         self.session = create_session(
             self.repo,
@@ -138,6 +155,8 @@ class Repl:
         self.thread_id = self.session.id
         self.agent = agent
         self._report_roster(warnings)
+        if earlier_map:
+            self._map_status("ready")
 
     # --- settings: saved vs effective ------------------------------------------
     #
@@ -166,6 +185,7 @@ class Repl:
             model_factory=self.model_factory,
             backend=backend,
             web_tools=self.web_tools,
+            code_map=self.code_map,
         )
 
     def _report_roster(self, warnings: list[str]) -> None:
@@ -269,6 +289,7 @@ class Repl:
             return None
         finally:
             self.turn_vet_log = self.backend.vet_log[start:]
+            self._refresh_map_after_turn()
 
     def _requeue_undelivered(self, notices: list[str], updates: dict | None, config) -> None:
         """Put the notices back unless the failed turn's user message was already saved."""
@@ -399,11 +420,89 @@ class Repl:
         if record.status == "queued":
             return  # the start_task call line already shows it
         status = "needs approval (press Enter to answer)" if record.status == "needs_approval" else record.status
+        self._print_status_line(f"task {record.id} [{record.agent}] {status}")
+        code_map = self.code_map
+        if code_map is not None and record.status in {"done", "failed"}:
+            code_map.refresh()  # the task's tools are not observed: it may have changed files
+
+    def _print_status_line(self, text: str) -> None:
+        """One whole line from any thread: end an open streamed line first, under the output lock."""
+
         with self._output:
             renderer = self._renderer
             if renderer is not None:
                 renderer.end_line()
-            self.console.print(f"task {record.id} [{record.agent}] {status}", markup=False, highlight=False)
+            self.console.print(text, markup=False, highlight=False)
+
+    # --- the code map -----------------------------------------------------------
+
+    def _new_code_map(self) -> CodeMap:
+        return self._code_map_factory(
+            self.repo, min_files=self.config.code_map_min_files, on_status=self._map_status
+        )
+
+    def _map_status(self, status: str) -> None:
+        """Print a code map status change; runs on the map's build thread, never reads input."""
+
+        if status == "building":
+            self._print_status_line("map: building…")
+        elif status == "ready" or status.startswith("failed: "):
+            self._print_status_line(f"map: {status}")
+
+    def _refresh_map_after_turn(self) -> None:
+        renderer = self._renderer
+        if self.code_map is not None and renderer is not None and renderer.tools_used & _CHANGING_TOOLS:
+            self.code_map.refresh()
+
+    def _map_command(self, argument: str) -> None:
+        action = argument.lower()
+        if action not in {"", "build", "update", "on", "off"}:
+            self._say(_MAP_USAGE)
+            return
+        if action == "off":
+            self.config = replace(self.config, code_map="off")
+            self._save()
+            if self.code_map is not None:
+                self.code_map.close()
+                self.code_map = None
+            self._swap_graph()
+            self._say("map: off")
+            return
+        if action == "on":
+            self.config = replace(self.config, code_map="auto")
+            self._save()
+            if self.code_map is None:
+                self.code_map = self._new_code_map()
+            self.code_map.ensure()
+            self._swap_graph()
+            self._say(f"map: {self.code_map.status()}")
+            return
+        code_map = self.code_map
+        if code_map is None:
+            self._say(_MAP_OFF_HINT if action else "map: off")
+            return
+        if not action:
+            self._say(f"map: {code_map.status()}")
+        elif action == "update":
+            status = code_map.status()
+            code_map.refresh()
+            self._say("map: updating" if status == "ready" else f"map: {status}")
+        else:  # build
+            before = code_map.status()
+            code_map.ensure(force=True)
+            if before in {"ready", "building", "unavailable"}:
+                self._say(f"map: {before}")  # nothing new starts; a started build reports itself
+            if before not in {"ready", "building"} and code_map.usable():
+                self._swap_graph()
+
+    def _swap_graph(self) -> None:
+        """Build a new graph for the current settings and switch to it; keep the old one if that fails."""
+
+        agent = self._try_build(self.config)
+        if agent is None:
+            self._say("The change is saved but not live in this session yet.")
+            return
+        self.agent = agent
 
     def close(self) -> bool:
         """Stop the background tasks; False when the user left while some were still running.
@@ -414,6 +513,8 @@ class Repl:
         if self._closed is not None:
             return self._closed
         self._closed = True
+        if self.code_map is not None:
+            self.code_map.close()
         if self.tasks is None:
             return True
         cancelled = self.tasks.shutdown()
@@ -562,6 +663,9 @@ class Repl:
         if command == "/skills":
             self._skills_command(argument)
             return
+        if command == "/map":
+            self._map_command(argument)
+            return
         name = command[1:]
         skill = next((s for s in list_skills(self.repo) if s.name == name), None)
         if command not in _BUILTIN_COMMANDS and skill is not None:
@@ -627,11 +731,7 @@ class Repl:
     def _rebuild_after_skill_change(self) -> None:
         """Rebuild so the new skill folders are routed; keep the old graph if that fails."""
 
-        agent = self._try_build(self.config)
-        if agent is None:
-            self._say("The change is saved but not live in this session yet.")
-            return
-        self.agent = agent
+        self._swap_graph()
 
     def _resolve_or_report(self, argument: str) -> str | None:
         try:
@@ -740,6 +840,7 @@ class Repl:
             agents=self.agents,
             web_tools=self.web_tools,
             interactive=self.tasks is not None,
+            code_map=self.code_map,
         )
 
     def _drive(self, payload, config):

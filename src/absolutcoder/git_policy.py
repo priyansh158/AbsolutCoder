@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 CONTEXT_FILENAME = "AbsolutCoder.md"
+CODE_MAP_DIR = "graphify-out/"  # the code map's output folder, never committed
 _NO_PROMPT_GIT = frozenset({"commit", "branch", "switch", "merge"})
 _TRAILER = re.compile(r"^\s*(co-authored-by|assisted-by|generated-by)\s*:", re.IGNORECASE)
 _ATTRIBUTION = re.compile(r"absolut\s*coder|absolutcoder", re.IGNORECASE)
@@ -164,7 +165,7 @@ def scrub_commit_message(message: str) -> str:
 
 
 def protect_context_file(repo: Path | str) -> None:
-    """Create AbsolutCoder.md when missing and keep it out of git."""
+    """Create AbsolutCoder.md when missing and keep it, and the code map folder, out of git."""
 
     root = Path(repo).resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -177,11 +178,12 @@ def protect_context_file(repo: Path | str) -> None:
     info = git_dir / "info"
     info.mkdir(parents=True, exist_ok=True)
     exclude = info / "exclude"
-    existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
-    lines = [line.strip() for line in existing.splitlines()]
-    if CONTEXT_FILENAME not in lines:
-        suffix = "" if existing.endswith("\n") or not existing else "\n"
-        exclude.write_text(existing + suffix + CONTEXT_FILENAME + "\n", encoding="utf-8")
+    for entry in (CONTEXT_FILENAME, CODE_MAP_DIR):
+        existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+        lines = [line.strip() for line in existing.splitlines()]
+        if entry not in lines:
+            suffix = "" if existing.endswith("\n") or not existing else "\n"
+            exclude.write_text(existing + suffix + entry + "\n", encoding="utf-8")
     unstage_context_file(root)
 
 

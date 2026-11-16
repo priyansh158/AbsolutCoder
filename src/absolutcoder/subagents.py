@@ -13,6 +13,7 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage
 from langchain_core.tools import BaseTool
 
+from absolutcoder.codemap import CODE_MAP_RULE
 from absolutcoder.config import Config
 from absolutcoder.models import ModelFactory, construct_model, provider_error
 from absolutcoder.skills import always_text, skill_paths_note, skill_sources
@@ -208,7 +209,8 @@ def build_specs(
     ``interrupt_on`` is not set on declarative specs: they inherit the
     parent's, which is how ``execute`` approvals reach general-purpose.
     With ``repo``, roles that edit files get its skills and skill text.
-    Roles with the ``read`` group get ``map_tools`` (the code map tools).
+    Roles with the ``read`` group get ``map_tools`` (the code map tools) and,
+    with them, ``CODE_MAP_RULE`` in their prompt.
     """
 
     specs: list[dict] = []
@@ -220,7 +222,10 @@ def build_specs(
             specs.append({"name": d.name, "description": d.description, "runnable": runnable})
         else:
             spec = _declarative_spec(
-                with_skill_text(d, repo), model, backend, tools=role_map_tools(d, map_tools)
+                with_map_rule(with_skill_text(d, repo), map_tools),
+                model,
+                backend,
+                tools=role_map_tools(d, map_tools),
             )
             sources = role_skill_sources(d, repo)
             if sources:
@@ -266,6 +271,14 @@ def role_map_tools(d: AgentDef, map_tools: Sequence[BaseTool] | None) -> list[Ba
     if not map_tools or "read" not in d.groups:
         return []
     return list(map_tools)
+
+
+def with_map_rule(d: AgentDef, map_tools: Sequence[BaseTool] | None) -> AgentDef:
+    """A role that gets the code map tools also gets the rule to ask the map first."""
+
+    if not role_map_tools(d, map_tools):
+        return d
+    return replace(d, prompt=d.prompt.rstrip("\n") + "\n\n" + CODE_MAP_RULE + "\n")
 
 
 def _declarative_spec(d: AgentDef, model, backend, *, tools: Sequence[BaseTool] = ()) -> dict:

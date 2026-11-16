@@ -13,6 +13,7 @@ In the terminal loop:
   /agents           list the worker roles        /tasks          list background tasks
   /skills           list, add or remove global skills
   /<skill-name> <request>     run a request with that skill's instructions loaded
+  /map [build|update|on|off]  code map of this repository
   /verify <cmd|off> check command run after every request
   /loop <N>(s|m|h) <prompt>   repeat a prompt    /exit, /quit    leave
 

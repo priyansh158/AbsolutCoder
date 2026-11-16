@@ -106,6 +106,21 @@ def test_scrub_commit_message_removes_attribution():
     assert scrubbed == "feat: work"
 
 
+def test_graphify_out_is_git_excluded(tmp_path, git_repo):
+    repo = git_repo(tmp_path / "repo")
+    protect_context_file(repo)
+    protect_context_file(repo)
+    lines = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8").splitlines()
+    assert lines.count("graphify-out/") == 1
+    assert lines.count("AbsolutCoder.md") == 1
+    (repo / "graphify-out").mkdir()
+    (repo / "graphify-out" / "graph.json").write_text("{}", encoding="utf-8")
+    checked = subprocess.run(
+        ["git", "check-ignore", "graphify-out/graph.json"], cwd=repo, capture_output=True, text=True
+    )
+    assert checked.returncode == 0, checked.stderr
+
+
 def test_context_file_is_excluded_and_unstaged(tmp_path, git_repo):
     repo = git_repo(tmp_path / "repo")
     protect_context_file(repo)
