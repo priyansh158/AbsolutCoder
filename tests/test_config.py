@@ -59,6 +59,29 @@ def test_numeric_settings_must_be_positive_integers(tmp_path, key, value):
         load_config(_write(tmp_path, **{key: value}))
 
 
+def test_code_map_settings_default_and_round_trip(tmp_path):
+    loaded = load_config(_write(tmp_path))
+    assert loaded.code_map == "auto"
+    assert loaded.code_map_min_files == 20
+    path = tmp_path / "saved.json"
+    original = Config(
+        main_model="openai:a", subagent_model="openai:b", code_map="off", code_map_min_files=7
+    )
+    save_config(path, original)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["code_map"] == "off"
+    assert payload["code_map_min_files"] == 7
+    again = load_config(path)
+    assert (again.code_map, again.code_map_min_files) == ("off", 7)
+
+
+def test_bad_code_map_settings_are_config_errors(tmp_path):
+    with pytest.raises(ValueError, match="code_map must be 'auto' or 'off'"):
+        load_config(_write(tmp_path, code_map="sometimes"))
+    with pytest.raises(ValueError, match="code_map_min_files must be a positive integer"):
+        load_config(_write(tmp_path, code_map_min_files=0))
+
+
 @pytest.mark.parametrize("key", ["main_model", "subagent_model"])
 def test_model_ids_must_be_strings(tmp_path, key):
     with pytest.raises(ValueError, match=key):

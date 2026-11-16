@@ -13,6 +13,7 @@ from langchain.agents.middleware import AgentMiddleware, TodoListMiddleware
 from langchain_core.tools import BaseTool
 from langgraph.graph.state import CompiledStateGraph
 
+from absolutcoder.codemap import CodeMap, make_map_tools
 from absolutcoder.config import Config
 from absolutcoder.git_policy import execute_needs_approval, protect_context_file
 from absolutcoder.models import ModelFactory, build_model, construct_model, provider_error
@@ -27,6 +28,7 @@ from absolutcoder.subagents import (  # noqa: F401 - SECRET_PATHS is re-exported
     global_skills_permissions,
     role_middleware,
     role_model_id,
+    role_map_tools,
     role_permissions,
     role_skill_sources,
     roster_prompt,
@@ -134,6 +136,7 @@ def build_agent(
     agents: list[AgentDef] | None = None,
     web_tools: Sequence[BaseTool] | None = None,
     interactive: bool = True,
+    code_map: CodeMap | None = None,
 ) -> CompiledStateGraph:
     """Compile one deep agent. The main model supervises the worker roster.
 
@@ -142,9 +145,13 @@ def build_agent(
     routed at ``/`` so the secret-path denies apply, and the guarded shell stays
     the default backend so ``execute`` still runs on this machine. The route
     backend strips Windows ``\\\\?\\`` prefixes before the root check.
+
+    A usable ``code_map`` gives its tools to the main model and to every
+    worker role that reads the repository.
     """
 
     root = Path(repo).resolve()
+    map_tools = _map_tools(code_map)
     protect_context_file(root)
     routed = workspace_backend(root, backend, shell_preference=config.shell)
     shell_kind = routed.default.shell_kind
@@ -164,7 +171,7 @@ def build_agent(
             skills=skill_text(root),
             interactive=interactive,
         ),
-        "tools": list(extra_tools),
+        "tools": [*extra_tools, *map_tools],
         "middleware": [TodoListMiddleware()],
         "subagents": build_specs(
             _with_shell_line(roster, shell_kind),
@@ -174,6 +181,7 @@ def build_agent(
             interrupt_on=interrupt_on,
             web_tools=web_tools,
             repo=root,
+            map_tools=map_tools,
         ),
         "memory": [MEMORY_PATH],
         "permissions": secret_permissions() + global_skills_permissions(),
@@ -205,12 +213,14 @@ def build_role_graph(
     model_factory: ModelFactory | None = None,
     backend: GuardedShellBackend | None = None,
     web_tools: Sequence[BaseTool] | None = None,
+    code_map: CodeMap | None = None,
 ) -> CompiledStateGraph:
     """Compile one worker role as a standalone graph, for a background task.
 
     The role is the top-level model, with the same tools and restrictions
-    ``build_specs`` gives it as a delegated worker. It has no sub-workers and
-    no ``task`` tool, and never the main loop's task-manager tools.
+    ``build_specs`` gives it as a delegated worker (the code map tools when it
+    reads the repository). It has no sub-workers and no ``task`` tool, and
+    never the main loop's task-manager tools.
     """
 
     root = Path(repo).resolve()
@@ -227,7 +237,7 @@ def build_role_graph(
         "model": model,
         "name": role.name,
         "system_prompt": definition.prompt,
-        "tools": [],
+        "tools": role_map_tools(role, _map_tools(code_map)),
         "middleware": [*role_middleware(role, routed), _NoSubWorkers()],
         "permissions": (
             secret_permissions() + global_skills_permissions() if permissions is None else permissions
@@ -247,6 +257,14 @@ def build_role_graph(
         if converted is None:
             raise
         raise converted from error
+
+
+def _map_tools(code_map: CodeMap | None) -> list[BaseTool]:
+    """The code map tools when a usable map is given; otherwise none."""
+
+    if code_map is None or not code_map.usable():
+        return []
+    return make_map_tools(code_map)
 
 
 class _NoSubWorkers(AgentMiddleware):

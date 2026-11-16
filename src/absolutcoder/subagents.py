@@ -201,12 +201,14 @@ def build_specs(
     interrupt_on: dict | None,
     web_tools: Sequence[BaseTool] | None = None,
     repo: Path | None = None,
+    map_tools: Sequence[BaseTool] | None = None,
 ) -> list[dict]:
     """Turn role definitions into deepagents subagent specs.
 
     ``interrupt_on`` is not set on declarative specs: they inherit the
     parent's, which is how ``execute`` approvals reach general-purpose.
     With ``repo``, roles that edit files get its skills and skill text.
+    Roles with the ``read`` group get ``map_tools`` (the code map tools).
     """
 
     specs: list[dict] = []
@@ -217,7 +219,9 @@ def build_specs(
             runnable = web_runnable(d, model, model_id, config, web_tools)
             specs.append({"name": d.name, "description": d.description, "runnable": runnable})
         else:
-            spec = _declarative_spec(with_skill_text(d, repo), model, backend)
+            spec = _declarative_spec(
+                with_skill_text(d, repo), model, backend, tools=role_map_tools(d, map_tools)
+            )
             sources = role_skill_sources(d, repo)
             if sources:
                 spec["skills"] = sources
@@ -256,13 +260,21 @@ def role_permissions(d: AgentDef) -> list[FilesystemPermission] | None:
     )
 
 
-def _declarative_spec(d: AgentDef, model, backend) -> dict:
+def role_map_tools(d: AgentDef, map_tools: Sequence[BaseTool] | None) -> list[BaseTool]:
+    """The code map tools for a role that reads the repository; none for other roles."""
+
+    if not map_tools or "read" not in d.groups:
+        return []
+    return list(map_tools)
+
+
+def _declarative_spec(d: AgentDef, model, backend, *, tools: Sequence[BaseTool] = ()) -> dict:
     spec: dict = {
         "name": d.name,
         "description": d.description,
         "system_prompt": d.prompt,
         "model": model,
-        "tools": [],
+        "tools": list(tools),
     }
     middleware = role_middleware(d, backend)
     if middleware:

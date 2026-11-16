@@ -214,7 +214,7 @@ def _flat(bound: list) -> set[str]:
     return {name for names in bound for name in names}
 
 
-def _invoke(tmp_path, main, workers: dict, *, extra_tools=()):
+def _invoke(tmp_path, main, workers: dict, *, extra_tools=(), code_map=None):
     agent = build_agent(
         tmp_path,
         Config(main_model="openai:main-test", subagent_model="openai:worker-test", auto_run=True),
@@ -223,6 +223,7 @@ def _invoke(tmp_path, main, workers: dict, *, extra_tools=()):
         model_factory=role_models(workers, default=_ok_model()),
         extra_tools=extra_tools,
         web_tools=_fake_web_tools(),
+        code_map=code_map,
     )
     return agent.invoke({"messages": [{"role": "user", "content": "go"}]})["messages"]
 
@@ -367,6 +368,91 @@ def test_main_extra_tools_do_not_reach_workers(tmp_path):
     for role in roles:
         assert bound[role], role
         assert "dummy_lookup" not in _flat(bound[role]), role
+
+
+_ROLES = ["explore", "plan", "general-purpose", "web-researcher"]
+
+
+def _fake_code_map(repo, *, ready: bool):
+    """A CodeMap on a fake runner; ``ready`` writes graph.json, else the repo is too small."""
+
+    import subprocess
+
+    from absolutcoder.codemap import CodeMap
+
+    if ready:
+        (repo / "graphify-out").mkdir(parents=True)
+        (repo / "graphify-out" / "graph.json").write_text("{}", encoding="utf-8")
+    runner = lambda args, **_kw: subprocess.CompletedProcess(args, 0, "", "")  # noqa: E731
+    return CodeMap(repo, runner=runner)
+
+
+def _bound_per_role(tmp_path, code_map):
+    main_names: list = []
+    bound = {role: [] for role in _ROLES}
+    main = _delegating_main(
+        *(task_call(role, "check", f"t{i}") for i, role in enumerate(_ROLES)), bound=main_names
+    )
+    _invoke(tmp_path, main, {role: _ok_model(bound=bound[role]) for role in _ROLES}, code_map=code_map)
+    assert main_names and all(bound.values())
+    return {"main": _flat(main_names), **{role: _flat(names) for role, names in bound.items()}}
+
+
+def test_map_tools_on_reading_roles_not_on_web_role(tmp_path):
+    from absolutcoder.codemap import MAP_TOOL_NAMES
+
+    code_map = _fake_code_map(tmp_path, ready=True)
+    assert code_map.status() == "ready"
+    names = _bound_per_role(tmp_path, code_map)
+    for role in ("main", "explore", "plan", "general-purpose"):
+        assert set(MAP_TOOL_NAMES) <= names[role], role
+    assert not set(MAP_TOOL_NAMES) & names["web-researcher"]
+    assert names["web-researcher"] == {"web_fetch", "web_search"}
+
+
+def test_no_code_map_means_no_map_tools(tmp_path):
+    from absolutcoder.codemap import MAP_TOOL_NAMES
+
+    small = _fake_code_map(tmp_path, ready=False)
+    assert small.status() == "too small"
+    for code_map in (None, small):
+        names = _bound_per_role(tmp_path, code_map)
+        for role, bound in names.items():
+            assert not set(MAP_TOOL_NAMES) & bound, (code_map, role)
+
+
+def test_role_graph_gets_map_tools_only_for_reading_roles(tmp_path, monkeypatch):
+    import absolutcoder.agent as agent_module
+    from absolutcoder.agent import build_role_graph
+    from absolutcoder.codemap import MAP_TOOL_NAMES
+
+    captured: dict[str, dict] = {}
+
+    def recorder(**kwargs):
+        captured[kwargs["name"]] = kwargs
+        return object()
+
+    monkeypatch.setattr(agent_module, "create_deep_agent", recorder)
+    config = Config(main_model="openai:main-test", subagent_model="openai:worker-test")
+    roles = {d.name: d for d in builtin_agents()}
+    factory = role_models({}, default=_ok_model())
+    ready = _fake_code_map(tmp_path, ready=True)
+    build_role_graph(tmp_path, config, None, roles["plan"], model_factory=factory, code_map=ready)
+    assert tuple(t.name for t in captured["plan"]["tools"]) == MAP_TOOL_NAMES
+    build_role_graph(tmp_path, config, None, roles["plan"], model_factory=factory)
+    assert captured["plan"]["tools"] == []
+    web_names: list = []
+    web = build_role_graph(
+        tmp_path,
+        config,
+        None,
+        roles["web-researcher"],
+        model_factory=role_models({}, default=_ok_model(bound=web_names)),
+        web_tools=_fake_web_tools(),
+        code_map=ready,
+    )
+    web.invoke({"messages": [{"role": "user", "content": "go"}]})
+    assert _flat(web_names) == {"web_fetch", "web_search"}
 
 
 def _custom_repo(tmp_path, text, name="reviewer.md"):

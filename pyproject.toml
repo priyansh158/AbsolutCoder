@@ -15,6 +15,7 @@ dependencies = [
     "pyyaml",
     "ddgs",
     "prompt_toolkit",
+    "graphifyy>=0.9,<0.10",
 ]
 
 [project.optional-dependencies]
