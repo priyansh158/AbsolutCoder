@@ -11,6 +11,8 @@ In the terminal loop:
   /auto [on|off]    run commands without asking  /resume [N]     resume an earlier session
   /attach <path>    attach a file to the next message
   /agents           list the worker roles        /tasks          list background tasks
+  /skills           list, add or remove global skills
+  /<skill-name> <request>     run a request with that skill's instructions loaded
   /verify <cmd|off> check command run after every request
   /loop <N>(s|m|h) <prompt>   repeat a prompt    /exit, /quit    leave
 

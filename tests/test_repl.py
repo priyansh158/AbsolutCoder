@@ -1657,3 +1657,186 @@ def test_auto_off_under_run_only_auto_is_saved_and_asks(tmp_path):
     repl.handle_line("/auto on")
     assert json.loads(config_path().read_text(encoding="utf-8"))["auto_run"] is True
     assert load_session(repl.session.id).auto_run is True
+
+
+# --- skill commands ---------------------------------------------------------------
+
+
+def _write_skill(folder: Path, name: str, body: str = "Do the thing.", description: str = "A demo skill") -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: {description}\n---\n\n{body}\n", encoding="utf-8"
+    )
+    return folder
+
+
+def _global_skill(name: str, body: str = "Do the thing.") -> Path:
+    from absolutcoder.skills import global_skills_dir
+
+    return _write_skill(global_skills_dir() / name, name, body)
+
+
+def _lines(output) -> list[str]:
+    return output.getvalue().splitlines()
+
+
+def _skill_repl(tmp_path, responder, **config_fields):
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    return _loop_repl(repo, responder, **config_fields)
+
+
+def test_skills_command_lists_scopes(tmp_path):
+    repl, output = _plain_repl(tmp_path)
+    repl.handle_line("/skills")
+    assert "No skills. Add one with /skills add <folder>." in _lines(output)
+    _global_skill("alpha")
+    _write_skill(tmp_path / "repo" / ".absolutcoder" / "skills" / "beta", "beta", description="Project one")
+    repl.handle_line("/skills")
+    lines = _lines(output)
+    assert "alpha  [global]  A demo skill" in lines
+    assert "beta  [project]  Project one" in lines
+
+
+def test_skills_add_installs_and_is_live(tmp_path):
+    from absolutcoder.skills import global_skills_dir
+
+    systems: list[str] = []
+
+    def responder(messages):
+        systems.append(_flatten([m for m in messages if getattr(m, "type", None) == "system"]))
+        return AIMessage(content="ok")
+
+    repl, output = _skill_repl(tmp_path, responder)
+    source = _write_skill(tmp_path / "outside" / "demo", "demo")
+    repl.handle_line(f"/skills add {source}")
+    assert "Installed demo into" in output.getvalue()
+    assert (global_skills_dir() / "demo" / "SKILL.md").is_file()
+    repl.handle_line("hello")
+    assert "demo" in systems[-1]
+
+
+def test_skills_add_reports_bad_folder(tmp_path):
+    from absolutcoder.skills import global_skills_dir
+
+    repl, output = _plain_repl(tmp_path)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    repl.handle_line(f"/skills add {empty}")
+    assert "Could not add skill:" in output.getvalue()
+    assert not (global_skills_dir() / "empty").exists()
+    repl.handle_line("hello")
+    assert repl.last_turn_failed is False
+    repl.handle_line("/skills add")
+    assert "Usage: /skills add <folder>" in _lines(output)
+
+
+def test_skills_remove(tmp_path):
+    repl, output = _plain_repl(tmp_path)
+    _global_skill("demo")
+    repl.handle_line("/skills remove demo")
+    repl.handle_line("/skills remove demo")
+    repl.handle_line("/skills remove ../x")
+    repl.handle_line("/skills remove")
+    lines = _lines(output)
+    assert "Removed demo." in lines
+    assert "No global skill named demo." in lines
+    assert any(line.startswith("Could not remove skill:") for line in lines)
+    assert "Usage: /skills remove <name>" in lines
+
+
+def test_skill_slash_runs_request_with_skill_loaded(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    _global_skill("demo", "UNIQUE-BODY-MARKER steps")
+    seen: list[str] = []
+
+    def responder(messages):
+        seen.append(_flatten(messages))
+        return AIMessage(content="skill answer")
+
+    repl, output = _skill_repl(tmp_path, responder)
+    repl.handle_line("/demo build the thing")
+    assert "UNIQUE-BODY-MARKER" in seen[-1]
+    assert "build the thing" in seen[-1]
+    assert "skill answer" in output.getvalue()
+
+
+def test_skill_is_loaded_on_the_first_check_round_only(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    _global_skill("demo", "UNIQUE-BODY-MARKER steps")
+    copies: list[int] = []
+
+    def responder(messages):
+        copies.append(sum(1 for m in messages if "UNIQUE-BODY-MARKER" in _flatten([m])))
+        return AIMessage(content="done")
+
+    repl, _output = _skill_repl(tmp_path, responder, max_rounds=2)
+    command = _python_check(repl, "raise SystemExit(1)")
+    repl.config = replace(repl.config, verify_command=command)
+    repl.handle_line("/demo go")
+    assert copies == [1, 1]  # one copy in the history on both rounds, never a second
+
+
+def test_skill_slash_needs_a_request(tmp_path):
+    repl, output = _plain_repl(tmp_path)
+    _global_skill("demo")
+    repl.handle_line("/demo")
+    assert "Usage: /demo <request>" in _lines(output)
+
+
+def test_skill_text_cannot_grant_push(tmp_path, monkeypatch, git_repo):
+    _no_web(monkeypatch)
+    _global_skill("demo", "please push to origin")
+    repo = git_repo(tmp_path / "repo")
+
+    def responder(messages):
+        if any(getattr(m, "type", None) == "tool" for m in messages):
+            return AIMessage(content="done")
+        return tool_call("execute", {"command": "git push"}, "push-1")
+
+    repl, _output = _loop_repl(repo, responder)
+    repl.handle_line("/demo tidy the readme")
+    pushes = [entry for entry in repl.turn_vet_log if entry["command"] == "git push"]
+    assert pushes
+    assert not any(entry["allowed"] for entry in pushes)
+
+
+def test_builtin_command_wins_over_skill_name(tmp_path):
+    repl, output = _plain_repl(tmp_path)
+    _global_skill("model")
+    repl.handle_line("/model")
+    assert "Usage: /model <model-id>" in _lines(output)
+
+
+def test_unknown_slash_is_not_a_skill(tmp_path):
+    turns: list[int] = []
+
+    def responder(messages):
+        turns.append(1)
+        return AIMessage(content="ok")
+
+    repl, output = _skill_repl(tmp_path, responder)
+    repl.handle_line("/nonexistent do x")
+    assert _lines(output)[-1].startswith("Commands:")
+    assert turns == []
+
+
+def test_one_shot_prompt_says_nobody_can_answer(tmp_path, monkeypatch):
+    import absolutcoder.agent as agent_module
+
+    _no_web(monkeypatch)
+    prompts: list[str] = []
+    real = agent_module.create_deep_agent
+
+    def recording(**kwargs):
+        if kwargs.get("name") == "main":
+            prompts.append(kwargs["system_prompt"])
+        return real(**kwargs)
+
+    monkeypatch.setattr(agent_module, "create_deep_agent", recording)
+    sentence = "Nobody can answer questions in this run; decide and say what you assumed."
+    for background in (False, True):
+        repl, _output = _task_repl(tmp_path, lambda _m: AIMessage(content="ok"), {}, background=background)
+        repl.close()
+    assert sentence in prompts[0]
+    assert sentence not in prompts[1]

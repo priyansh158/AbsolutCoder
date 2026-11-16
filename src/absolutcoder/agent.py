@@ -73,6 +73,7 @@ BACKGROUND_PARAGRAPH = (
     "let you look earlier; cancel_task stops one."
 )
 _TASK_TOOL_NAME = "start_task"
+NON_INTERACTIVE_LINE = "Nobody can answer questions in this run; decide and say what you assumed."
 COMMIT_MESSAGE_LINE = "Write commit messages with one or more -m options; each is taken as you wrote it."
 
 
@@ -86,7 +87,12 @@ def shell_line(kind: str) -> str:
 
 
 def _main_system_prompt(
-    agents: list[AgentDef], shell_kind: str, *, background: bool = False, skills: str = ""
+    agents: list[AgentDef],
+    shell_kind: str,
+    *,
+    background: bool = False,
+    skills: str = "",
+    interactive: bool = True,
 ) -> str:
     """SYSTEM_PROMPT with its delegation sentence replaced by the roster.
 
@@ -99,6 +105,8 @@ def _main_system_prompt(
     prompt = prompt.rstrip("\n") + "\n\n" + shell_line(shell_kind) + " " + COMMIT_MESSAGE_LINE + "\n\n" + UNTRUSTED_PARAGRAPH + "\n"
     if background:
         prompt += "\n" + BACKGROUND_PARAGRAPH + "\n"
+    if not interactive:
+        prompt += "\n" + NON_INTERACTIVE_LINE + "\n"
     if skills:
         prompt += "\n" + skills + "\n"
     return prompt
@@ -125,6 +133,7 @@ def build_agent(
     extra_tools: Sequence[BaseTool] = (),
     agents: list[AgentDef] | None = None,
     web_tools: Sequence[BaseTool] | None = None,
+    interactive: bool = True,
 ) -> CompiledStateGraph:
     """Compile one deep agent. The main model supervises the worker roster.
 
@@ -153,6 +162,7 @@ def build_agent(
             shell_kind,
             background=any(t.name == _TASK_TOOL_NAME for t in extra_tools),
             skills=skill_text(root),
+            interactive=interactive,
         ),
         "tools": list(extra_tools),
         "middleware": [TodoListMiddleware()],
