@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -108,10 +108,21 @@ def _is_set(environ: Mapping[str, str], name: str) -> bool:
     return bool(environ.get(name, "").strip())
 
 
-def missing_keys(config: Config, environ: Mapping[str, str]) -> list[str]:
-    """Names of API key variables the configured providers need but lack."""
+def missing_keys(
+    config: Config, environ: Mapping[str, str], extra_model_ids: Iterable[str] = ()
+) -> list[str]:
+    """Names of API key variables the configured providers need but lack.
 
-    ids = [config.main_model, config.subagent_model, *config.agent_models.values()]
+    ``extra_model_ids`` (for example ids pinned by worker roles) are checked
+    like the configured ones.
+    """
+
+    ids = [
+        config.main_model,
+        config.subagent_model,
+        *config.agent_models.values(),
+        *extra_model_ids,
+    ]
     seen: list[str] = []
     for model_id in ids:
         provider = provider_of(model_id)
@@ -157,3 +168,37 @@ def install_hint(error: ImportError) -> str | None:
     if extra is not None:
         return f'pip install "absolutcoder[{extra}]"'
     return f"pip install {package}"
+
+
+def provider_error(error: Exception, model_id: str) -> ProviderMissing | None:
+    """Map a model-construction failure to ProviderMissing, or None if unrecognised."""
+
+    if isinstance(error, ImportError):
+        hint = install_hint(error)
+        if hint is None:
+            return None
+        package = missing_package(error)
+        return ProviderMissing(
+            f"The {package} package for this model is not installed. Install it with: {hint}"
+        )
+    if isinstance(error, ValueError) and str(error).startswith("Unable to infer model provider"):
+        return ProviderMissing(
+            f"Unknown model provider in {model_id!r}. Use provider:model, for example "
+            "openai:gpt-x or anthropic:claude-x, or define the provider under "
+            '"providers" in config.json.'
+        )
+    return None
+
+
+def construct_model(factory: ModelFactory, role: str, model_id: str) -> BaseChatModel | str:
+    """Call the model factory; every failure becomes ProviderMissing."""
+
+    try:
+        return factory(role, model_id)
+    except ProviderMissing:
+        raise
+    except Exception as error:
+        converted = provider_error(error, model_id)
+        if converted is None:
+            converted = ProviderMissing(f"Could not set up {model_id}: {error}")
+        raise converted from error

@@ -25,6 +25,9 @@ from absolutcoder.sessions import (
     update_session,
 )
 from absolutcoder.shell import GuardedShellBackend
+from absolutcoder.subagents import builtin_agents
+
+_COMMANDS = "Commands: /model, /subagent, /auto, /resume, /attach, /agents, /exit"
 
 
 class Repl:
@@ -56,6 +59,7 @@ class Repl:
         self.backend = GuardedShellBackend(root_dir=self.repo, virtual_mode=True, inherit_env=True)
         self.checkpointer = checkpoint_saver()
         self.turn_vet_log: list[dict] = []
+        self.agents = builtin_agents()
         self._failures: list[str] = []
         self._quiet = True  # the caller prints a failed start itself
         agent = self._try_build(self.config)
@@ -72,7 +76,7 @@ class Repl:
         self.agent = agent
 
     def loop(self) -> None:
-        self.console.print("AbsolutCoder. Commands: /model, /subagent, /auto, /resume, /attach, /exit")
+        self.console.print(f"AbsolutCoder. {_COMMANDS}")
         while True:
             try:
                 line = self._ask("absolut> ")
@@ -151,7 +155,14 @@ class Repl:
             self.pending_attachments.append(Path(argument).expanduser())
             self.console.print(f"attached {argument}")
             return
-        self.console.print("Commands: /model, /subagent, /auto, /resume, /attach, /exit")
+        if command == "/agents":
+            for definition in self.agents:
+                self.console.print(
+                    f"{definition.name}  [{definition.source}]  {definition.description}",
+                    markup=False,
+                )
+            return
+        self.console.print(_COMMANDS)
 
     def _resolve_or_report(self, argument: str) -> str | None:
         try:
@@ -172,7 +183,8 @@ class Repl:
         self._failures = []
         if self.model_factory is None:
             try:
-                missing = missing_keys(config, os.environ)
+                pinned = [d.model for d in self.agents if d.model]
+                missing = missing_keys(config, os.environ, extra_model_ids=pinned)
             except ValueError as error:
                 self._report(f"Invalid model id: {error}")
                 return None
@@ -251,6 +263,7 @@ class Repl:
             chat_model=self.chat_model,
             model_factory=self.model_factory,
             backend=self.backend,
+            agents=self.agents,
         )
 
     def _drive(self, payload, config):

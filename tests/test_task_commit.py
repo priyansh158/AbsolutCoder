@@ -61,7 +61,8 @@ def test_scripted_turn_commits_locally_and_pushes_only_when_asked(tmp_path, monk
         Config(main_model="openai:main-test", subagent_model="openai:worker-test", auto_run=True),
         chat_model=scripted_model(_responder),
         model_factory=role_models(
-            {"general-purpose": scripted_model(lambda _m: AIMessage(content="worker"))}
+            {"general-purpose": scripted_model(lambda _m: AIMessage(content="worker"))},
+            default=scripted_model(lambda _m: AIMessage(content="worker")),
         ),
     )
     repl.run_turn("Add hello.txt containing hello and commit it")

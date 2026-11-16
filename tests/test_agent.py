@@ -29,7 +29,7 @@ def test_build_agent_uses_memory_and_image_blocks(tmp_path):
         config,
         None,
         chat_model=_ok_model(),
-        model_factory=role_models({"general-purpose": _ok_model()}),
+        model_factory=role_models({"general-purpose": _ok_model()}, default=_ok_model()),
     )
 
     assert _memory_sources(agent) == [MEMORY_PATH]
@@ -65,9 +65,11 @@ def test_subagent_model_comes_from_factory(tmp_path):
         config,
         None,
         chat_model=_ok_model(),
-        model_factory=role_models({"general-purpose": _ok_model()}, seen=seen),
+        model_factory=role_models({"general-purpose": _ok_model()}, seen=seen, default=_ok_model()),
     )
-    assert seen == [("general-purpose", "openai:worker-test")]
+    assert [entry for entry in seen if entry[0] == "general-purpose"] == [
+        ("general-purpose", "openai:worker-test")
+    ]
 
 
 def test_agent_models_override_worker_model(tmp_path):
@@ -82,9 +84,11 @@ def test_agent_models_override_worker_model(tmp_path):
         config,
         None,
         chat_model=_ok_model(),
-        model_factory=role_models({"general-purpose": _ok_model()}, seen=seen),
+        model_factory=role_models({"general-purpose": _ok_model()}, seen=seen, default=_ok_model()),
     )
-    assert seen == [("general-purpose", "anthropic:w")]
+    assert [entry for entry in seen if entry[0] == "general-purpose"] == [
+        ("general-purpose", "anthropic:w")
+    ]
 
 
 def test_main_delegates_to_worker_offline(tmp_path):
@@ -104,7 +108,8 @@ def test_main_delegates_to_worker_offline(tmp_path):
         None,
         chat_model=scripted_model(main),
         model_factory=role_models(
-            {"general-purpose": scripted_model(lambda _m: AIMessage(content="worker says hi"))}
+            {"general-purpose": scripted_model(lambda _m: AIMessage(content="worker says hi"))},
+            default=_ok_model(),
         ),
     )
     result = agent.invoke({"messages": [{"role": "user", "content": "delegate"}]})

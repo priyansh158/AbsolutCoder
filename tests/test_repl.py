@@ -24,7 +24,8 @@ _PNG = base64.b64decode(
 
 
 def _worker():
-    return role_models({"general-purpose": scripted_model(lambda _m: AIMessage(content="worker"))})
+    worker = scripted_model(lambda _m: AIMessage(content="worker"))
+    return role_models({"general-purpose": worker}, default=worker)
 
 
 def _console() -> Console:
@@ -209,7 +210,8 @@ def _factory_repl(tmp_path, fail, *, auto_run=True):
         {
             "main": scripted_model(lambda _m: AIMessage(content="ok")),
             "general-purpose": scripted_model(lambda _m: AIMessage(content="worker")),
-        }
+        },
+        default=scripted_model(lambda _m: AIMessage(content="worker")),
     )
 
     def factory(role, model_id):
@@ -337,6 +339,23 @@ def test_agent_model_ids_are_normalised(tmp_path):
         console=_console(),
     )
     assert repl.config.agent_models == {"general-purpose": "openai:c"}
+
+
+def test_agents_command_lists_roster(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    output = io.StringIO()
+    repl = Repl(
+        repo,
+        Config(main_model="openai:main-test", subagent_model="openai:worker-test"),
+        chat_model=scripted_model(lambda _m: AIMessage(content="ok")),
+        model_factory=_worker(),
+        console=Console(file=output, force_terminal=False, no_color=True, width=200),
+    )
+    repl.handle_line("/agents")
+    lines = output.getvalue().splitlines()
+    for name in ("explore", "plan", "general-purpose", "web-researcher"):
+        assert any(line.startswith(f"{name}  [builtin]  ") for line in lines), name
 
 
 def _flatten(messages) -> str:

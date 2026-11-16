@@ -61,6 +61,13 @@ def test_missing_keys_follow_configured_providers():
     assert missing_keys(config, {}) == ["MY_KEY"]
 
 
+def test_roster_model_ids_are_key_checked():
+    config = Config(main_model="openai:a", subagent_model="openai:b")
+    assert missing_keys(config, {"OPENAI_API_KEY": "k"}, extra_model_ids=["anthropic:x"]) == [
+        "ANTHROPIC_API_KEY"
+    ]
+
+
 def test_google_accepts_either_key():
     config = Config(main_model="google_genai:g", subagent_model="google_genai:g")
     assert missing_keys(config, {}) == ["GOOGLE_API_KEY or GEMINI_API_KEY"]
