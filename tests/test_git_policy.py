@@ -159,6 +159,69 @@ def test_exclude_works_in_a_subfolder_of_a_repository(tmp_path, git_repo):
     assert exclude.read_text(encoding="utf-8").splitlines() == ["*.log", "AbsolutCoder.md", "graphify-out/"]
 
 
+def test_exclude_works_under_a_non_ascii_folder(tmp_path, git_repo):
+    before = set(os.listdir(tmp_path))
+    parent = tmp_path / "prøjekt-日本"
+    repo = git_repo(parent / "repo")
+    (repo / "readme.txt").write_text("x\n", encoding="utf-8")
+    _git(repo, "add", "readme.txt")
+    _git(repo, "commit", "-m", "first")
+    worktree = parent / "linked"
+    _git(repo, "worktree", "add", "--detach", str(worktree))
+    for folder in (repo, worktree):
+        protect_context_file(folder)
+        assert _ignored(folder, "AbsolutCoder.md"), folder
+        assert _ignored(folder, "graphify-out/graph.json"), folder
+    assert set(os.listdir(tmp_path)) == before | {"prøjekt-日本"}
+    assert set(os.listdir(parent)) == {"repo", "linked"}
+    lines = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8").splitlines()
+    assert lines.count("AbsolutCoder.md") == 1
+    assert lines.count("graphify-out/") == 1
+
+
+def test_bare_repository_exclude_is_untouched(tmp_path):
+    bare = tmp_path / "bare.git"
+    subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
+    exclude = bare / "info" / "exclude"
+    before = exclude.read_bytes() if exclude.exists() else None
+    protect_context_file(bare)
+    assert (exclude.read_bytes() if exclude.exists() else None) == before
+
+
+def test_read_only_exclude_file_does_not_raise(tmp_path, git_repo):
+    import stat
+
+    repo = git_repo(tmp_path / "repo")
+    exclude = repo / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    exclude.write_text("*.log\n", encoding="utf-8")
+    os.chmod(exclude, stat.S_IREAD)
+    try:
+        protect_context_file(repo)
+        assert exclude.read_text(encoding="utf-8") == "*.log\n"
+    finally:
+        os.chmod(exclude, stat.S_IREAD | stat.S_IWRITE)
+
+
+def test_missing_reported_git_directory_creates_nothing(tmp_path, monkeypatch):
+    import absolutcoder.git_policy as git_policy
+
+    folder = tmp_path / "plain"
+    missing = tmp_path / "missing-git-dir"
+    real_run = subprocess.run
+
+    def fake_run(args, *rest, **kwargs):
+        if list(args[:2]) == ["git", "rev-parse"]:
+            stdout = f"true\n{missing.as_posix()}/info/exclude\n".encode()
+            return subprocess.CompletedProcess(args, 0, stdout, b"")
+        return real_run(args, *rest, **kwargs)
+
+    monkeypatch.setattr(git_policy.subprocess, "run", fake_run)
+    protect_context_file(folder)
+    assert not missing.exists()
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name != "absolutcoder-home") == ["plain"]
+
+
 def test_non_repository_gets_no_git_files(tmp_path, monkeypatch):
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
     folder = tmp_path / "plain"

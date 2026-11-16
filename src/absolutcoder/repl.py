@@ -474,16 +474,20 @@ class Repl:
         if renderer is not None and renderer.tools_used & _CHANGING_TOOLS:
             self._refresh_map()
 
-    def _refresh_map(self) -> None:
-        """Refresh the current map; nothing it raises reaches a turn or a task event."""
+    def _refresh_map(self) -> bool:
+        """Refresh the current map; False when there is none or the request raised.
+
+        Nothing it raises reaches a turn or a task event.
+        """
 
         code_map = self.code_map
         if code_map is None:
-            return
+            return False
         try:
             code_map.refresh()
-        except Exception:  # noqa: BLE001, S110 - a map refresh must never break a turn or a task
-            pass
+        except Exception:  # noqa: BLE001 - a map refresh must never break a turn or a task
+            return False
+        return True
 
     def _map_line(self, code_map: CodeMap) -> str:
         status = code_map.status()
@@ -520,8 +524,11 @@ class Repl:
             self._say(self._map_line(code_map))
         elif action == "update":
             status = code_map.status()
-            self._refresh_map()
-            self._say("map: updating" if status == "ready" else f"map: {status}")
+            started = self._refresh_map()
+            if status != "ready":
+                self._say(f"map: {status}")
+            else:
+                self._say("map: updating" if started else "map: could not update")
         else:  # build
             before = code_map.status()
             code_map.ensure(force=True)

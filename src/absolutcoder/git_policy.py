@@ -175,37 +175,58 @@ def protect_context_file(repo: Path | str) -> None:
         memory.write_text(DEFAULT_MEMORY, encoding="utf-8")
     exclude = _git_exclude_file(root)
     if exclude is None:
-        return  # not inside a repository, or git is missing
-    exclude.parent.mkdir(parents=True, exist_ok=True)
-    for entry in (CONTEXT_FILENAME, CODE_MAP_DIR):
+        return  # not inside a work tree, or git is missing
+    try:
+        _add_exclude_lines(exclude, (CONTEXT_FILENAME, CODE_MAP_DIR))
+    except OSError:
+        pass  # an unwritable exclude file must not stop the session
+    try:
+        unstage_context_file(root)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _add_exclude_lines(exclude: Path, entries: tuple[str, ...]) -> None:
+    """Append each missing entry once; only the ``info`` folder itself is ever created."""
+
+    exclude.parent.mkdir(exist_ok=True)
+    for entry in entries:
         existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
         lines = [line.strip() for line in existing.splitlines()]
         if entry not in lines:
             suffix = "" if existing.endswith("\n") or not existing else "\n"
             exclude.write_text(existing + suffix + entry + "\n", encoding="utf-8")
-    unstage_context_file(root)
 
 
 def _git_exclude_file(root: Path) -> Path | None:
-    """The repository's info/exclude as git resolves it (worktrees and subfolders too), or None."""
+    """The work tree's info/exclude as git resolves it (worktrees and subfolders too), or None.
+
+    None outside a work tree (a bare repository included), when git fails or
+    is missing, when its output is not UTF-8, or when the git directory it
+    names does not exist.
+    """
 
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "--git-path", "info/exclude"],
+            ["git", "rev-parse", "--is-inside-work-tree", "--git-path", "info/exclude"],
             cwd=root,
             capture_output=True,
-            text=True,
             timeout=_EXCLUDE_LOOKUP_TIMEOUT,
             stdin=subprocess.DEVNULL,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+        if result.returncode != 0:
+            return None
+        lines = (result.stdout or b"").decode("utf-8", errors="strict").splitlines()
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
         return None
-    text = (result.stdout or "").strip()
-    if result.returncode != 0 or not text:
+    if len(lines) != 2 or lines[0].strip() != "true" or not lines[1].strip():
         return None
-    path = Path(text)
-    return path if path.is_absolute() else root / path
+    path = Path(lines[1].strip())
+    exclude = path if path.is_absolute() else root / path
+    if not exclude.parent.parent.is_dir():
+        return None  # the git directory git named is not there: create nothing
+    return exclude
 
 
 def execute_needs_approval(command: str) -> bool:

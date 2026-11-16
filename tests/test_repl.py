@@ -2440,6 +2440,57 @@ def test_cancelled_background_task_refreshes_the_map(tmp_path, monkeypatch):
         repl.close()
 
 
+def test_map_update_reports_a_refresh_that_could_not_start(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    repl, output, _runner, _made = _map_repl(tmp_path, map_class=_BrokenRefresh)
+    try:
+        assert repl.code_map.wait(10) == "ready"
+        repl.handle_line("/map update")
+        assert _lines(output)[-1] == "map: could not update"
+        assert "map: updating" not in _lines(output)
+    finally:
+        repl.close()
+
+
+class _CountedRefresh(CodeMap):
+    """A code map that counts refresh requests and signals the first one."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.refreshes = 0
+        self.refreshed = threading.Event()
+
+    def refresh(self):
+        self.refreshes += 1
+        super().refresh()
+        self.refreshed.set()
+
+
+def test_cancelled_real_task_refreshes_the_map_once(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    release = threading.Event()
+    started = threading.Event()
+    repl, output, runner, _made = _map_repl(
+        tmp_path, map_class=_CountedRefresh, workers={"explore": _blocked(release, started)}
+    )
+    code_map = repl.code_map
+    try:
+        assert code_map.wait(10) == "ready"
+        repl.tasks.start("explore", "look around", flags=TurnFlags())
+        assert started.wait(TIMEOUT)
+        repl.handle_line("/tasks cancel t1")
+        release.set()
+        assert repl.tasks.wait("t1", timeout=TIMEOUT).status == "cancelled"
+        assert code_map.refreshed.wait(TIMEOUT)
+        assert code_map.wait(10) == "ready"
+    finally:
+        release.set()
+        repl.close()
+    assert code_map.refreshes == 1
+    assert runner.commands("update") == [UPDATE]
+    assert "task t1 [explore] cancelled" in _lines(output)
+
+
 def test_any_failed_start_closes_the_map(tmp_path, monkeypatch):
     _no_web(monkeypatch)
 
