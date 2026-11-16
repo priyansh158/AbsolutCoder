@@ -1,0 +1,311 @@
+"""Terminal loop for AbsolutCoder."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from langgraph.errors import GraphBubbleUp
+from langgraph.types import Command
+from rich.console import Console
+
+from absolutcoder.agent import build_agent
+from absolutcoder.attachments import build_user_content
+from absolutcoder.config import Config, config_path, resolve_model, save_config
+from absolutcoder.git_policy import TurnFlags, protect_context_file
+from absolutcoder.sessions import (
+    Session,
+    checkpoint_saver,
+    create_session,
+    list_sessions,
+    load_session,
+    update_session,
+)
+from absolutcoder.shell import GuardedShellBackend
+
+
+class Repl:
+    """Stream the main agent, print each delegated task, and gate the shell."""
+
+    def __init__(
+        self,
+        repo: Path | str,
+        config: Config,
+        *,
+        chat_model=None,
+        input_fn=None,
+        console: Console | None = None,
+    ) -> None:
+        self.repo = Path(repo).resolve()
+        self.config = Config(
+            main_model=resolve_model(config.main_model),
+            subagent_model=resolve_model(config.subagent_model),
+            auto_run=config.auto_run,
+        )
+        self.chat_model = chat_model
+        self.input_fn = input_fn or input
+        self.console = console or Console()
+        self.pending_attachments: list[Path] = []
+        protect_context_file(self.repo)
+        self.backend = GuardedShellBackend(root_dir=self.repo, virtual_mode=True, inherit_env=True)
+        self.checkpointer = checkpoint_saver()
+        self.session = create_session(
+            self.repo,
+            self.config.main_model,
+            self.config.subagent_model,
+            auto_run=self.config.auto_run,
+        )
+        self.thread_id = self.session.id
+        self.turn_vet_log: list[dict] = []
+        self.agent = self._build()
+
+    def loop(self) -> None:
+        self.console.print("AbsolutCoder. Commands: /model, /subagent, /auto, /resume, /attach, /exit")
+        while True:
+            try:
+                line = self._ask("absolut> ")
+            except (EOFError, KeyboardInterrupt):
+                self.console.print()
+                return
+            if line.strip() in {"/exit", "/quit"}:
+                return
+            self.handle_line(line)
+
+    def handle_line(self, line: str) -> None:
+        stripped = line.strip()
+        if not stripped:
+            return
+        if stripped.startswith("/"):
+            self._slash(stripped)
+            return
+        self.run_turn(stripped)
+
+    def run_turn(self, text: str, paths: list[Path] | None = None):
+        """Run one user turn on the current thread and return the graph state.
+
+        A tool or stream failure is printed and swallowed. The thread, agent,
+        and checkpointer stay in place so the caller can prompt again.
+        """
+
+        attachments = list(self.pending_attachments if paths is None else paths)
+        self.pending_attachments.clear()
+        self.backend.flags = TurnFlags.from_message(text)
+        start = len(self.backend.vet_log)
+        config = {"configurable": {"thread_id": self.thread_id}}
+        try:
+            content = build_user_content(text, attachments)
+            return self._drive({"messages": [{"role": "user", "content": content}]}, config)
+        except GraphBubbleUp:
+            raise
+        except Exception as exc:
+            self.console.print(f"Error: {exc}")
+            return None
+        finally:
+            self.turn_vet_log = self.backend.vet_log[start:]
+
+    def _slash(self, line: str) -> None:
+        command, _, argument = line.partition(" ")
+        argument = argument.strip()
+        if command == "/model":
+            if not argument:
+                self.console.print("Usage: /model <model-id>")
+                return
+            self._retarget(main_model=resolve_model(argument))
+            return
+        if command == "/subagent":
+            if not argument:
+                self.console.print("Usage: /subagent <model-id>")
+                return
+            self._retarget(subagent_model=resolve_model(argument))
+            return
+        if command == "/auto":
+            enabled = self._auto_value(argument)
+            if enabled is None:
+                return
+            self._retarget(auto_run=enabled)
+            self.console.print(f"auto_run {'on' if enabled else 'off'}")
+            return
+        if command == "/resume":
+            self._resume(argument)
+            return
+        if command == "/attach":
+            if not argument:
+                self.console.print("Usage: /attach <path>")
+                return
+            self.pending_attachments.append(Path(argument).expanduser())
+            self.console.print(f"attached {argument}")
+            return
+        self.console.print("Commands: /model, /subagent, /auto, /resume, /attach, /exit")
+
+    def _retarget(self, *, main_model: str | None = None, subagent_model: str | None = None, auto_run: bool | None = None) -> None:
+        self.config = Config(
+            main_model=self.config.main_model if main_model is None else main_model,
+            subagent_model=self.config.subagent_model if subagent_model is None else subagent_model,
+            auto_run=self.config.auto_run if auto_run is None else auto_run,
+        )
+        save_config(config_path(), self.config)
+        self.session = update_session(
+            self.session.id,
+            main_model=self.config.main_model,
+            subagent_model=self.config.subagent_model,
+            auto_run=self.config.auto_run,
+        )
+        self.thread_id = self.session.id
+        self.agent = self._build()
+
+    def _resume(self, argument: str) -> None:
+        sessions = list_sessions(self.repo)
+        if not sessions:
+            self.console.print("No sessions for this repo.")
+            return
+        for index, session in enumerate(sessions, start=1):
+            self.console.print(
+                f"{index}. {session.id}  {session.main_model}  {session.subagent_model}"
+            )
+        choice = argument or self._ask("Resume session number: ")
+        try:
+            selected = sessions[int(choice) - 1]
+        except (ValueError, IndexError):
+            self.console.print("Unknown session.")
+            return
+        self._adopt(selected)
+
+    def _adopt(self, session: Session) -> None:
+        loaded = load_session(session.id)
+        self.session = loaded
+        self.thread_id = loaded.id
+        self.config = Config(
+            main_model=loaded.main_model,
+            subagent_model=loaded.subagent_model,
+            auto_run=loaded.auto_run,
+        )
+        self.agent = self._build()
+        self.console.print(f"Resumed {loaded.id}")
+
+    def _build(self):
+        return build_agent(
+            self.repo,
+            self.config,
+            self.checkpointer,
+            chat_model=self.chat_model,
+            backend=self.backend,
+        )
+
+    def _drive(self, payload, config):
+        while True:
+            for chunk in self.agent.stream(payload, config, stream_mode="updates"):
+                self._render_update(chunk)
+            snapshot = self.agent.get_state(config)
+            interrupts = _pending_interrupts(snapshot)
+            if not interrupts:
+                self._render_final(snapshot)
+                return snapshot
+            payload = Command(resume=_resume_map(interrupts, self._decisions(interrupts)))
+
+    def _decisions(self, interrupts) -> dict[str, dict]:
+        answered: dict[str, dict] = {}
+        for item in interrupts:
+            value = item.value if not isinstance(item.value, dict) else item.value
+            actions = value.get("action_requests", []) if isinstance(value, dict) else []
+            decisions = []
+            for action in actions:
+                command = ""
+                if isinstance(action, dict):
+                    command = str(action.get("args", {}).get("command", action.get("name", "")))
+                self.console.print(f"Run command? {command}")
+                answer = self._ask("[y/n] ").strip().lower()
+                if answer in {"y", "yes"}:
+                    decisions.append({"type": "approve"})
+                else:
+                    decisions.append({"type": "reject", "message": "User rejected the command."})
+            answered[getattr(item, "id", "") or ""] = {"decisions": decisions}
+        return answered
+
+    def _render_update(self, chunk) -> None:
+        if not isinstance(chunk, dict):
+            return
+        for update in chunk.values():
+            if not isinstance(update, dict):
+                continue
+            messages = update.get("messages") or []
+            if not isinstance(messages, list):
+                messages = [messages]
+            for message in messages:
+                for call in getattr(message, "tool_calls", None) or []:
+                    if call.get("name") != "task":
+                        continue
+                    description = str(call.get("args", {}).get("description", "")).strip()
+                    self.console.print("task: " + " ".join(description.split()))
+
+    def _render_final(self, snapshot) -> None:
+        messages = snapshot.values.get("messages", []) if snapshot.values else []
+        for message in reversed(messages):
+            if getattr(message, "type", None) != "ai":
+                continue
+            if getattr(message, "tool_calls", None):
+                continue
+            text = _message_text(getattr(message, "content", ""))
+            if text:
+                self.console.print(text)
+            return
+
+    def _auto_value(self, argument: str) -> bool | None:
+        lowered = argument.lower()
+        if lowered in {"", "toggle"}:
+            return not self.config.auto_run
+        if lowered in {"on", "true", "1"}:
+            return True
+        if lowered in {"off", "false", "0"}:
+            return False
+        self.console.print("Usage: /auto [on|off]")
+        return None
+
+    def _ask(self, prompt: str) -> str:
+        try:
+            return self.input_fn(prompt)
+        except TypeError:
+            return self.input_fn()
+
+
+def run_cli(args) -> int:
+    """Run one task, or open the terminal loop, from the current repo."""
+
+    from absolutcoder.config import ensure_config
+
+    repo = Path.cwd()
+    config = ensure_config()
+    repl = Repl(repo, config)
+    attachments = [Path(item) for item in getattr(args, "attach", [])]
+    if getattr(args, "task", None):
+        repl.run_turn(args.task, paths=attachments)
+        return 0
+    repl.pending_attachments.extend(attachments)
+    repl.loop()
+    return 0
+
+
+def _pending_interrupts(snapshot) -> list:
+    found = []
+    for task in getattr(snapshot, "tasks", ()) or ():
+        found.extend(getattr(task, "interrupts", ()) or ())
+    return found
+
+
+def _resume_map(interrupts, answered: dict[str, dict]):
+    if len(interrupts) == 1:
+        only = getattr(interrupts[0], "id", "") or ""
+        return answered.get(only, next(iter(answered.values())))
+    return answered
+
+
+def _message_text(content) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+        return "\n".join(part for part in parts if part).strip()
+    return str(content).strip()
