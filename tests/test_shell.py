@@ -161,6 +161,108 @@ def test_concurrent_commits_both_land(tmp_path, git_repo):
     assert subjects == {"add one", "add two", "add three", "add four"}
 
 
+def _identity(repo: Path) -> str:
+    return _git(repo, "log", "-1", "--format=%an <%ae> / %cn <%ce>").strip()
+
+
+_REPO_IDENTITY = "Ada Fixture <ada@example.com> / Ada Fixture <ada@example.com>"
+
+
+@posix_only
+def test_identity_set_by_unlisted_form_does_not_reach_commit(tmp_path, git_repo):
+    repo = git_repo(tmp_path / "repo")
+    backend = GuardedShellBackend(root_dir=repo)
+    (repo / "f.txt").write_text("f\n", encoding="utf-8")
+    result = backend.execute(
+        "set -a; printf -v GIT_AUTHOR_NAME evil; printf -v GIT_AUTHOR_EMAIL e@vil; "
+        'git add f.txt && git commit -m "x"'
+    )
+    assert result.exit_code == 0, result.output
+    assert _identity(repo) == _REPO_IDENTITY
+
+    (tmp_path / "ident.sh").write_text(
+        "export GIT_COMMITTER_NAME=evil\nexport GIT_COMMITTER_EMAIL=e@vil\n", encoding="utf-8"
+    )
+    (repo / "g.txt").write_text("g\n", encoding="utf-8")
+    result = backend.execute('. ../ident.sh; git add g.txt && git commit -m "y"')
+    assert result.exit_code == 0, result.output
+    assert _git(repo, "rev-list", "--count", "HEAD").strip() == "2"
+    assert _identity(repo) == _REPO_IDENTITY
+
+
+@posix_only
+def test_shell_function_named_git_cannot_replace_commit(tmp_path, git_repo):
+    repo = git_repo(tmp_path / "repo")
+    backend = GuardedShellBackend(root_dir=repo)
+    (repo / "f.txt").write_text("f\n", encoding="utf-8")
+    subprocess.run(["git", "add", "f.txt"], cwd=repo, check=True, capture_output=True)
+    result = backend.execute(
+        'git() { echo fake; }; git commit -m "feat: x" -m "Co-authored-by: A <a@b.c>"'
+    )
+    assert result.exit_code == 0, result.output
+    assert _git(repo, "rev-list", "--count", "HEAD").strip() == "1"
+    assert _git(repo, "log", "-1", "--format=%B").strip() == "feat: x"
+
+
+def _finishes_while_locked(repo: Path, backend: GuardedShellBackend, command: str, wait: float) -> bool:
+    """Run ``command`` in another thread while this thread holds the repo lock."""
+
+    done = threading.Event()
+    with shell_module.repo_lock(repo):
+        worker = threading.Thread(target=lambda: (backend.execute(command), done.set()))
+        worker.start()
+        finished = done.wait(timeout=wait)
+    worker.join(timeout=30)
+    assert done.is_set()  # it always finishes once the lock is free
+    return finished
+
+
+def test_non_git_command_does_not_take_the_repo_lock(tmp_path, git_repo):
+    repo = git_repo(tmp_path / "repo")
+    backend = GuardedShellBackend(root_dir=repo)
+    assert _finishes_while_locked(repo, backend, "echo git is mentioned", wait=10)
+
+
+def test_git_command_waits_for_the_repo_lock(tmp_path, git_repo):
+    repo = git_repo(tmp_path / "repo")
+    backend = GuardedShellBackend(root_dir=repo)
+    assert not _finishes_while_locked(repo, backend, "git status", wait=2)
+
+
+def test_backends_in_one_repo_share_a_lock(tmp_path, git_repo):
+    repo = git_repo(tmp_path / "repo")
+    (repo / "sub").mkdir()
+    root = GuardedShellBackend(root_dir=repo)
+    sub = GuardedShellBackend(root_dir=repo / "sub")
+    assert root.git_lock is sub.git_lock
+    assert root.git_lock is shell_module.repo_lock(repo)
+    plain = GuardedShellBackend(root_dir=tmp_path / "not-a-repo")
+    assert plain.git_lock is shell_module.repo_lock(tmp_path / "not-a-repo")
+
+
+@posix_only
+def test_trailing_comment_keeps_the_group_valid(tmp_path, git_repo):
+    repo = git_repo(tmp_path / "repo")
+    backend = GuardedShellBackend(root_dir=repo)
+    (repo / "f.txt").write_text("f\n", encoding="utf-8")
+    result = backend.execute('git add f.txt && git commit -m "x" # note')
+    assert result.exit_code == 0, result.output
+    assert _git(repo, "rev-list", "--count", "HEAD").strip() == "1"
+    assert _git(repo, "log", "-1", "--format=%B").strip() == "x"
+
+
+@posix_only
+def test_backgrounded_commit_runs_in_the_foreground(tmp_path, git_repo):
+    repo = git_repo(tmp_path / "repo")
+    backend = GuardedShellBackend(root_dir=repo)
+    (repo / "f.txt").write_text("f\n", encoding="utf-8")
+    subprocess.run(["git", "add", "f.txt"], cwd=repo, check=True, capture_output=True)
+    result = backend.execute('git commit -m "x" &')
+    assert result.exit_code == 0, result.output
+    assert _git(repo, "rev-list", "--count", "HEAD").strip() == "1"
+    assert _git(repo, "log", "-1", "--format=%B").strip() == "x"
+
+
 def test_nonzero_exit_and_stderr_are_reported(tmp_path):
     backend = GuardedShellBackend(root_dir=tmp_path)
     if backend.shell_kind == "cmd":

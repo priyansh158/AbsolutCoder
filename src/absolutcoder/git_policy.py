@@ -25,6 +25,23 @@ _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _ASSIGNING_COMMANDS = frozenset(
     {"export", "declare", "typeset", "readonly", "local", "set", "setx", "setx.exe", "env"}
 )
+_ENV_WITHOUT_IDENTITY = (
+    "env",
+    *(
+        part
+        for name in (
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_AUTHOR_DATE",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+            "GIT_COMMITTER_DATE",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+        )
+        for part in ("-u", name)
+    ),
+)
 # The lines scrub_commit_message drops, for grep -Eiv at run time.
 _SCRUB_PATTERN = (
     "^[[:space:]]*(co-authored-by|assisted-by|generated-by)[[:space:]]*:|absolut[[:space:]]*coder"
@@ -206,6 +223,30 @@ def git_subcommand(segment: str) -> str | None:
     return _subcommand
 
 
+_COMMAND_PREFIXES = frozenset(
+    {"do", "then", "else", "elif", "if", "while", "until", "!", "{", "(", "time", "command",
+     "exec", "nohup", "env", "sudo", "xargs", "timeout"}
+)
+
+
+def runs_git(segment: str) -> bool:
+    """True when git is the command this segment runs, not just a word in it.
+
+    Leading assignments, shell keywords and simple wrappers such as ``env``
+    or ``command`` (with their options) may come first: ``echo git`` is false,
+    ``FOO=1 env git status`` is true.
+    """
+
+    for token in _tokens(segment):
+        name = _command_name(token)
+        if name in {"git", "git.exe"}:
+            return True
+        if _ASSIGNMENT.match(token) or name in _COMMAND_PREFIXES or token.startswith("-") or token.isdigit():
+            continue
+        return False
+    return False
+
+
 def prepare_commit_segment(segment: str, repo: Path, kind: str = "cmd") -> tuple[str, Path | None]:
     """Rewrite a git commit so the stored message has no attribution trailer.
 
@@ -275,6 +316,8 @@ def prepare_commit_segment(segment: str, repo: Path, kind: str = "cmd") -> tuple
             continue
         kept.append(token)
         index += 1
+    if posix:
+        kept = _without_identity_env(kept)
     if messages:
         path = _write_message(repo, scrub_commit_message("\n\n".join(messages)))
         kept.extend(["-F", str(path)])
@@ -285,6 +328,21 @@ def prepare_commit_segment(segment: str, repo: Path, kind: str = "cmd") -> tuple
     source = stdin_redirects if message_source == "-" else ["<", message_source]
     scrubber = render_command(["grep", "-Eiv", _SCRUB_PATTERN, *source], kind)
     return scrubber + " | " + render_command([*kept, "-F", "-"], kind), None
+
+
+def _without_identity_env(tokens: list[str]) -> list[str]:
+    """Put ``env -u ...`` directly before the git executable.
+
+    One process runs the whole script, so an earlier part of it may have set
+    identity or config variables by any means; ``env`` drops them for the
+    commit alone, and because it execs the real program a shell function or
+    alias named ``git`` cannot stand in for the commit.
+    """
+
+    for index, token in enumerate(tokens):
+        if _command_name(token) in {"git", "git.exe"}:
+            return [*tokens[:index], *_ENV_WITHOUT_IDENTITY, *tokens[index:]]
+    return tokens
 
 
 def render_command(tokens: list[str], kind: str) -> str:

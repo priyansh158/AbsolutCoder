@@ -27,6 +27,7 @@ from absolutcoder.git_policy import (
     prepare_commit_segment,
     protect_context_file,
     render_command,
+    runs_git,
     split_command_chain,
     unstage_context_file,
     vet,
@@ -38,6 +39,7 @@ _EXTENDED_UNC_PREFIX = "\\\\?\\UNC\\"
 _GIT_MARKERS = ("cmd/git.exe", "bin/git.exe", "mingw64/bin/git.exe")
 _MENTIONS_GIT = re.compile(r"(?<![\w.-])git(?:\.exe)?(?![\w-])", re.IGNORECASE)
 _LEADING_KEYWORDS = re.compile(r"^((?:(?:do|then|else|elif|if|while|until|!|\{)\s+)*)(.*)$", re.DOTALL)
+_HEREDOC = re.compile(r"<<(?!<)")
 _JOINERS = {"&&": " && ", "||": " || ", ";": "; ", "|": " | ", "\n": "\n"}
 
 _REPO_LOCKS: dict[str, threading.RLock] = {}
@@ -244,6 +246,25 @@ class GuardedShellBackend(_ExtendedPathMixin, LocalShellBackend):
         self._log_lock = threading.Lock()
         self._env.setdefault("GIT_TERMINAL_PROMPT", "0")
         protect_context_file(self.cwd)
+        self.git_lock = repo_lock(self._repository_top())
+
+    def _repository_top(self) -> Path:
+        """The work tree that holds ``self.cwd``, or ``self.cwd`` when it is not a repository."""
+
+        try:
+            found = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=self.cwd,
+                env=self._env,
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                check=False,
+            )
+        except OSError:
+            return self.cwd
+        top = found.stdout.strip()
+        return Path(top) if found.returncode == 0 and top else self.cwd
 
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
         if not command or not isinstance(command, str):
@@ -259,13 +280,14 @@ class GuardedShellBackend(_ExtendedPathMixin, LocalShellBackend):
         if effective <= 0:
             raise ValueError(f"timeout must be positive, got {effective}")
         env = dict(self._env)
-        uses_git = bool(_MENTIONS_GIT.search(command))
-        if uses_git:
+        if _MENTIONS_GIT.search(command):
             for key in [key for key in env if key.upper().startswith(_IDENTITY_PREFIXES)]:
                 del env[key]
         chain = split_command_chain(command)
-        writes_index = any(git_subcommand(segment) in {"commit", "add"} for _op, segment in chain)
-        with repo_lock(self.cwd) if uses_git else nullcontext():
+        subcommands = [git_subcommand(segment) for _op, segment in chain]
+        writes_index = any(subcommand in {"commit", "add"} for subcommand in subcommands)
+        uses_repo = any(runs_git(segment) for _op, segment in chain)
+        with self.git_lock if uses_repo else nullcontext():
             if not writes_index:
                 return self._run(command, env, timeout)
             if self.shell_kind == "cmd":
@@ -298,21 +320,27 @@ class GuardedShellBackend(_ExtendedPathMixin, LocalShellBackend):
                 pieces.append(segment)
                 continue
             lead, body = _LEADING_KEYWORDS.match(segment).groups()
+            body = _foreground(body)
             if subcommand == "commit":
                 rewritten, path = prepare_commit_segment(body, self.cwd, self.shell_kind)
                 if path is not None:
                     message_files.append(path)
-                pieces.append(f"{lead}{{ {unstage}; {rewritten}; }}")
+                # A here-document body starts on the next line, so the brace stays on this one.
+                close = "; }" if _HEREDOC.search(rewritten) else "\n}"
+                pieces.append(f"{lead}{{ {unstage}; {rewritten}{close}")
             else:
-                pieces.append(f"{lead}{{ {body}; __ac_rc=$?; {unstage}; (exit $__ac_rc); }}")
+                pieces.append(f"{lead}{{ {body}\n__ac_rc=$?; {unstage}; (exit $__ac_rc)\n}}")
         return "".join(pieces), message_files
 
     def _unstage_script(self) -> str:
-        """The shell form of ``unstage_context_file``: silent, never fails."""
+        """The shell form of ``unstage_context_file``: silent, never fails.
+
+        ``env`` runs the real git even if the script defined a ``git`` function.
+        """
 
         repo = str(self.cwd)
-        restore = ["git", "-C", repo, "restore", "--staged", "--", CONTEXT_FILENAME]
-        remove = ["git", "-C", repo, "rm", "--cached", "--ignore-unmatch", "-q", "--", CONTEXT_FILENAME]
+        restore = ["env", "git", "-C", repo, "restore", "--staged", "--", CONTEXT_FILENAME]
+        remove = ["env", "git", "-C", repo, "rm", "--cached", "--ignore-unmatch", "-q", "--", CONTEXT_FILENAME]
         restore_text = render_command(restore, self.shell_kind)
         remove_text = render_command(remove, self.shell_kind)
         return f"{{ {restore_text} || {remove_text}; }} >/dev/null 2>&1 || :"
@@ -411,6 +439,39 @@ class GuardedShellBackend(_ExtendedPathMixin, LocalShellBackend):
                 truncated=False,
             )
         return _response(result, self._max_output_bytes)
+
+
+def _foreground(segment: str) -> str:
+    """Drop a trailing shell comment and a trailing ``&`` from an add or commit segment.
+
+    The rebuilt group must stay valid shell, and a backgrounded commit would
+    race with the deletion of its message file.
+    """
+
+    quote = ""
+    cut = len(segment)
+    index = 0
+    while index < len(segment):
+        char = segment[index]
+        if quote:
+            if char == "\\" and quote == '"':
+                index += 2
+                continue
+            if char == quote:
+                quote = ""
+        elif char == "\\":
+            index += 2
+            continue
+        elif char in {"'", '"'}:
+            quote = char
+        elif char == "#" and (index == 0 or segment[index - 1].isspace()):
+            cut = index
+            break
+        index += 1
+    text = segment[:cut].rstrip()
+    if text.endswith("&") and not text.endswith(("&&", ">&", "<&")):
+        text = text[:-1].rstrip()
+    return text
 
 
 def _response(result: subprocess.CompletedProcess, max_output_bytes: int) -> ExecuteResponse:
