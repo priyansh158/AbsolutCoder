@@ -228,3 +228,52 @@ def test_non_object_sections_are_config_errors(tmp_path):
     path.write_text("[]")
     with pytest.raises(ValueError, match="top level"):
         load_config(path)
+
+
+def test_openai_key_env_without_base_url_is_used_for_requests(monkeypatch):
+    from langchain_openai import ChatOpenAI
+
+    monkeypatch.setenv("OPENAI_API_KEY", "default-key")
+    monkeypatch.setenv("WORK_OPENAI_KEY", "work-key")
+    providers = {"openai": ProviderSettings(api_key_env="WORK_OPENAI_KEY")}
+    model = build_model("openai:gpt-x", providers)
+    assert isinstance(model, ChatOpenAI)
+    assert model.openai_api_key.get_secret_value() == "work-key"
+    assert model.use_responses_api is True
+    # Without api_key_env the id string still goes to deepagents, which reads OPENAI_API_KEY.
+    assert build_model("openai:gpt-x", {"openai": ProviderSettings()}) == "openai:gpt-x"
+
+
+def test_provider_entry_without_kind_explains_itself():
+    from absolutcoder.models import ProviderMissing
+
+    providers = {"mybox": ProviderSettings(base_url="http://h/v1")}
+    with pytest.raises(ProviderMissing) as raised:
+        build_model("mybox:model-a", providers)
+    assert str(raised.value) == (
+        'providers.mybox needs "kind": "openai" to be used as an OpenAI-compatible endpoint.'
+    )
+    # A provider langchain knows keeps its own handling.
+    assert build_model("anthropic:claude-x", {"anthropic": ProviderSettings()}) == "anthropic:claude-x"
+
+
+def test_dependencies_pin_the_libraries_used_directly():
+    import tomllib
+    from pathlib import Path
+
+    project = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    dependencies = project["dependencies"]
+    for expected in (
+        "deepagents==0.7.35",
+        "langchain>=1.5,<1.6",
+        "langchain-core>=1.8,<1.9",
+        "langgraph>=1.2,<1.3",
+        "langchain-openai",
+        "langgraph-checkpoint-sqlite",
+        "rich",
+        "httpx",
+        "pyyaml",
+        "ddgs",
+        "prompt_toolkit",
+    ):
+        assert expected in dependencies, expected

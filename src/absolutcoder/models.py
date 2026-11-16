@@ -83,8 +83,14 @@ def build_model(
     if settings is None:
         return normalized
     api = effective_api(provider, settings)
-    builds_instance = settings.kind == "openai" or (provider == "openai" and api == "chat")
+    builds_instance = settings.kind == "openai" or (
+        provider == "openai" and (api == "chat" or settings.api_key_env is not None)
+    )
     if not builds_instance:
+        if settings.kind is None and provider not in _known_providers():
+            raise ProviderMissing(
+                f'providers.{provider} needs "kind": "openai" to be used as an OpenAI-compatible endpoint.'
+            )
         return normalized
 
     from langchain.chat_models import init_chat_model
@@ -92,8 +98,9 @@ def build_model(
     extra: dict[str, str] = {}
     if settings.base_url:
         extra["base_url"] = settings.base_url
-    if provider != "openai" or settings.base_url:
-        # Never let ChatOpenAI fall back to OPENAI_API_KEY for a custom endpoint.
+    if provider != "openai" or settings.base_url or settings.api_key_env:
+        # The key comes from api_key_env when one is named; a custom endpoint
+        # never falls back to OPENAI_API_KEY.
         value = os.environ.get(settings.api_key_env, "").strip() if settings.api_key_env else ""
         extra["api_key"] = value or ("not-set" if settings.api_key_env else "not-needed")
     return init_chat_model(
@@ -102,6 +109,16 @@ def build_model(
         use_responses_api=(api == "responses"),
         **extra,
     )
+
+
+def _known_providers() -> frozenset[str]:
+    """Provider prefixes langchain's init_chat_model understands (a langchain internal)."""
+
+    try:
+        from langchain.chat_models import base
+    except ImportError:
+        return frozenset()
+    return frozenset(getattr(base, "_BUILTIN_PROVIDERS", {}) or ())
 
 
 def _is_set(environ: Mapping[str, str], name: str) -> bool:
