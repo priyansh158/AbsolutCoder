@@ -145,10 +145,10 @@ def test_collapsed_mode_prints_summary_and_answer_once():
     renderer.feed(_upd("model", [done]))
     renderer.finish(_snapshot(done))
     lines = _printed(output)
-    assert "⏺ Cooked for 1m 12s · 3 calls · /calls to see them" in lines
+    assert "● Cooked for 1m 12s · 3 calls · /calls to see them" in lines
     assert _text(output).count("All done here.") == 1
     assert any(line.startswith("tokens: 10 in") for line in lines)
-    assert lines.index("⏺ Cooked for 1m 12s · 3 calls · /calls to see them") < next(
+    assert lines.index("● Cooked for 1m 12s · 3 calls · /calls to see them") < next(
         i for i, line in enumerate(lines) if line.startswith("tokens:")
     )
     assert keys.events == ["start", "stop"]
@@ -158,14 +158,24 @@ def test_collapsed_mode_prints_summary_and_answer_once():
 def test_final_answer_only_in_the_snapshot_is_printed_after_the_summary():
     renderer, output, _keys = _collapsed()
     renderer.finish(_snapshot(AIMessage(content="late answer", id="late")))
-    assert _printed(output) == ["⏺ Cooked for 0s", "late answer"]  # no calls: no count and no hint
+    assert _printed(output) == ["● Cooked for 0s", "late answer"]  # no calls: no count and no hint
+
+
+def test_summary_dot_is_a_plain_text_dot_in_the_normal_colour():
+    renderer, output, _keys = _collapsed()
+    renderer.finish(_snapshot())
+    raw = output.getvalue()
+    assert "⏺" not in raw  # drawn as a blue emoji button on Windows
+    dot = raw.index("●")
+    assert "\x1b[2m" not in raw[max(0, dot - 12) : dot]  # the dot itself is not dimmed
+    assert "\x1b[2m" in raw[dot : dot + 12]  # the words after it are
 
 
 def test_summary_counts_one_call_in_the_singular():
     renderer, output, _keys = _collapsed()
     renderer.feed(_upd("model", [_call("ls", {"path": "/"}, "c1")]))
     renderer.finish(_snapshot())
-    assert "⏺ Cooked for 0s · 1 call · /calls to see them" in _text(output)
+    assert "● Cooked for 0s · 1 call · /calls to see them" in _text(output)
 
 
 def test_arrow_keys_expand_and_collapse_the_live_region():
@@ -316,7 +326,7 @@ def test_pause_and_resume_stop_and_restart_the_view():
     assert keys.events == ["start", "stop", "start", "stop"]  # Ctrl+C at a prompt: stays down
     renderer.interrupted()
     lines = _printed(output)
-    assert lines[-2:] == ["⏺ Cooked for 0s · 1 call · /calls to see them", "interrupted"]
+    assert lines[-2:] == ["● Cooked for 0s · 1 call · /calls to see them", "interrupted"]
 
 
 def test_format_elapsed():
@@ -429,7 +439,7 @@ def test_pause_and_resume_around_approval(tmp_path, monkeypatch):
     assert "Run command? git status" in printed
     assert not any("tool: execute(" in line for line in printed)
     assert printed.count("status done") == 1
-    assert printed[-1].startswith("⏺ Cooked for") and printed[-1].endswith("1 call · /calls to see them")
+    assert printed[-1].startswith("● Cooked for") and printed[-1].endswith("1 call · /calls to see them")
 
 
 def test_calls_command_prints_last_turn_log(tmp_path, monkeypatch):
@@ -517,7 +527,7 @@ def test_stream_error_in_collapsed_mode_stops_the_view_and_summarises(tmp_path, 
     lines = _printed(output)
     assert keys.events == ["start", "stop"]
     assert lines[-1] == "Error: stream broke"
-    assert lines[-2].startswith("⏺ Cooked for ") and lines[-2].endswith("1 call · /calls to see them")
+    assert lines[-2].startswith("● Cooked for ") and lines[-2].endswith("1 call · /calls to see them")
 
 
 def test_ctrl_c_in_collapsed_mode_prints_summary_then_interrupted(tmp_path, monkeypatch):
@@ -538,7 +548,7 @@ def test_ctrl_c_in_collapsed_mode_prints_summary_then_interrupted(tmp_path, monk
     lines = _printed(output)
     assert keys.events == ["start", "stop"]
     assert lines[-1] == "interrupted"
-    assert lines[-2].startswith("⏺ Cooked for ")
+    assert lines[-2].startswith("● Cooked for ")
 
 
 # --- fix round 1 -------------------------------------------------------------------
@@ -577,7 +587,7 @@ def test_ctrl_c_while_the_listener_stops_still_stops_the_live_region():
     assert not region.is_started  # stopped in spite of the interrupt
     assert region._refresh_thread is None
     renderer.interrupted()  # today's interrupt path afterwards: summary, then "interrupted"
-    assert _printed(output)[-2:] == ["⏺ Cooked for 0s", "interrupted"]
+    assert _printed(output)[-2:] == ["● Cooked for 0s", "interrupted"]
 
 
 def test_live_region_is_kept_for_a_retry_when_its_own_stop_is_interrupted():
@@ -633,14 +643,14 @@ def test_collapsed_partial_text_is_printed_once_on_interrupt():
         renderer.feed(_chunk(piece))
     assert "Half an answer" not in _printed(output)  # nothing streamed while collapsed
     renderer.interrupted()
-    assert _printed(output) == ["⏺ Cooked for 0s", "Half an answer", "interrupted"]
+    assert _printed(output) == ["● Cooked for 0s", "Half an answer", "interrupted"]
 
 
 def test_collapsed_partial_text_is_printed_on_a_stream_error():
     renderer, output, _keys = _collapsed()
     renderer.feed(_chunk("cut off"))
     renderer.abort()
-    assert _printed(output) == ["⏺ Cooked for 0s", "cut off"]
+    assert _printed(output) == ["● Cooked for 0s", "cut off"]
 
 
 def test_collapsed_completed_message_prints_its_text_once():
@@ -670,7 +680,7 @@ def test_a_start_time_of_zero_counts():
     renderer, output, _keys = _collapsed(clock=clock)
     clock.now = 75.0
     renderer.finish(_snapshot())
-    assert "⏺ Cooked for 1m 15s" in _printed(output)
+    assert "● Cooked for 1m 15s" in _printed(output)
 
 
 def _key(vk, down, char="\0"):

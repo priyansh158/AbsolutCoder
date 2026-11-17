@@ -27,7 +27,7 @@ _TRIMMED_IMAGES_NODE = "SeenImagesMiddleware."  # history.SeenImagesMiddleware's
 COOK_LABEL = "Lemme cook…"
 SHOW_HINT = "↓ show calls"
 HIDE_HINT = "↑ hide calls"
-SUMMARY_MARK = "⏺"
+SUMMARY_MARK = "●"  # a text dot; "⏺" is drawn as a blue emoji button on Windows
 CALLS_HINT = "/calls to see them"
 REFRESHES_PER_SECOND = 10
 _EXPAND_KEYS = frozenset({"down", "right"})
@@ -459,10 +459,12 @@ class StreamRenderer:
         self._summary_shown = True
         now = self._clock()
         elapsed = now - (now if self._started_at is None else self._started_at)
-        text = f"{SUMMARY_MARK} Cooked for {format_elapsed(elapsed)}"
+        text = f" Cooked for {format_elapsed(elapsed)}"
         if self._call_count:
             text += f" · {_count(self._call_count, 'call')} · {CALLS_HINT}"
-        self._print(text, style="dim")
+        line = Text(SUMMARY_MARK)  # the dot in the normal text colour, the rest dim
+        line.append(text, style="dim")
+        self._print(line)
 
     def _record_later(self, error: Exception) -> None:
         """Record an error raised while drawing; its line is printed from the main thread."""
@@ -758,7 +760,7 @@ class StreamRenderer:
             self._last_text = None
             self._print(text)
 
-    def _print(self, text: str, *, style: str | None = None) -> None:
+    def _print(self, text: str | Text, *, style: str | None = None) -> None:
         with self._output:
             # Off a terminal (a pipe or a file) a whole line is never hard-wrapped.
             soft_wrap = not self.console.is_terminal

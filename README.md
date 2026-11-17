@@ -311,7 +311,7 @@ On a terminal a turn shows one line at the bottom instead of a line per call:
 Press ↓ or → to list the latest calls under it, and ↑ or ← to fold them away
 again; the arrow keys work the same on Windows, macOS and Linux. What the model
 writes still appears above the line. When the turn ends the line becomes a
-summary such as `⏺ Cooked for 1m 12s · 14 calls · /calls to see them`, and
+summary such as `● Cooked for 1m 12s · 14 calls · /calls to see them`, and
 `/calls` prints every call of that turn. Set `"activity": "full"` to print each
 call as it happens; piped output always does.
 
