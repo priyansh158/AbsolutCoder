@@ -315,6 +315,10 @@ summary such as `⏺ Cooked for 1m 12s · 14 calls · /calls to see them`, and
 `/calls` prints every call of that turn. Set `"activity": "full"` to print each
 call as it happens; piped output always does.
 
+On Windows, anything else you type during a turn is kept for the next prompt
+(arrow keys pressed after it then wait there too). On macOS and Linux, keys
+other than the arrows are dropped while the line is shown.
+
 Screenshots and other images the model reads with `read_file` (or that another
 tool returns) stay in the conversation only until the model has seen them.
 After that each one is replaced by a short note (the model can read the file

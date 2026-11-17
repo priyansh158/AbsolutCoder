@@ -157,6 +157,31 @@ def _clip(text: str, cells: int, style: str = "") -> Text:
     return line
 
 
+def _finish_interrupted_stop(region) -> None:  # noqa: ANN001 - a rich Live
+    """Undo what a ``Live.stop()`` cut short by Ctrl+C can leave behind.
+
+    ``stop()`` marks the region stopped first, so calling it again does
+    nothing. This stops the refresh thread, takes the region off the console's
+    live stack and render hooks, erases it and shows the cursor again. It uses
+    rich's private fields, each only when present.
+    """
+
+    console = region.console
+    with region._lock:  # the refresh thread checks its stop flag under this lock
+        thread = getattr(region, "_refresh_thread", None)
+        if thread is not None:
+            thread.stop()
+            region._refresh_thread = None
+        for name in ("_live_stack", "_render_hooks"):
+            stack = getattr(console, name, None)
+            if isinstance(stack, list) and region in stack:
+                stack.remove(region)
+        live_render = getattr(region, "_live_render", None)
+        if region.transient and live_render is not None and live_render.last_render_height:
+            console.control(live_render.restore_cursor())
+        console.show_cursor(True)
+
+
 class _StatusView:
     """The live region's renderable: rebuilt on every refresh so the spinner and clock move."""
 
@@ -415,7 +440,10 @@ class StreamRenderer:
                 region = self._live_region
                 if region is not None:
                     try:
-                        region.stop()
+                        if region.is_started:
+                            region.stop()
+                        else:
+                            _finish_interrupted_stop(region)  # an earlier stop() was cut short
                     except Exception as error:  # noqa: BLE001
                         self._record_later(error)
                     self._live_region = None

@@ -9,7 +9,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from rich.console import Console
 
 from absolutcoder.config import Config
-from absolutcoder.keys import NoKeys, PosixDecoder, decode_posix, decode_windows, default_key_listener
+from absolutcoder.keys import NoKeys, PosixDecoder, decode_posix, default_key_listener
 from absolutcoder.render import COOK_LABEL, StreamRenderer, format_elapsed
 from tests.support import role_models, scripted_model, tool_call, tool_names_since_last_human
 
@@ -329,14 +329,6 @@ def test_format_elapsed():
 # --- key decoding -----------------------------------------------------------------
 
 
-def test_windows_arrow_sequences_decode():
-    assert decode_windows("\xe0H\xe0P\xe0K\xe0M") == ["up", "down", "left", "right"]
-    assert decode_windows("\x00H\x00P") == ["up", "down"]
-    assert decode_windows("abc\r\x1b") == []  # other keys are dropped
-    assert decode_windows("\xe0G\x00;") == []  # Home, F1: not arrows
-    assert decode_windows("\xe0") == []
-
-
 def test_posix_arrow_sequences_decode():
     assert decode_posix(b"\x1b[A\x1b[B\x1b[C\x1b[D") == ["up", "down", "right", "left"]
     assert decode_posix(b"\x1bOA\x1bOB") == ["up", "down"]
@@ -608,6 +600,33 @@ def test_live_region_is_kept_for_a_retry_when_its_own_stop_is_interrupted():
     assert renderer._live_region is None and not region.is_started
 
 
+def test_ctrl_c_inside_rich_stop_is_cleaned_up_on_the_next_stop():
+    renderer, output, _keys = _collapsed()
+    region = renderer._live_region
+    console = renderer.console
+    thread = region._refresh_thread
+    real_clear = console.clear_live
+    calls = {"n": 0}
+
+    def interrupted_clear():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise KeyboardInterrupt  # after Live.stop() has already marked itself stopped
+        real_clear()
+
+    console.clear_live = interrupted_clear
+    with pytest.raises(KeyboardInterrupt):
+        renderer.stop_view()
+    assert not region.is_started and renderer._live_region is region
+    assert region in console._render_hooks  # what the cut-short stop left behind
+    renderer.stop_view()
+    thread.join(1)
+    assert not thread.is_alive() and region._refresh_thread is None
+    assert region not in console._render_hooks and region not in console._live_stack
+    assert renderer._live_region is None
+    assert output.getvalue().endswith("\x1b[?25h")  # the cursor is shown again
+
+
 def test_collapsed_partial_text_is_printed_once_on_interrupt():
     renderer, output, _keys = _collapsed()
     for piece in ("Half an ", "answer"):
@@ -654,68 +673,170 @@ def test_a_start_time_of_zero_counts():
     assert "⏺ Cooked for 1m 15s" in _printed(output)
 
 
-class FakeMsvcrt:
-    """Characters waiting in the console; getwch on an empty queue would block for ever."""
+def _key(vk, down, char="\0"):
+    from absolutcoder.keys import KEY_EVENT, ConsoleEvent
 
-    def __init__(self, chars):
-        self.chars = list(chars)
-
-    def kbhit(self):
-        return bool(self.chars)
-
-    def getwch(self):
-        if not self.chars:
-            raise AssertionError("getwch would block: no key is waiting")
-        return self.chars.pop(0)
+    return ConsoleEvent(KEY_EVENT, down, vk, char)
 
 
-def test_windows_reader_handles_a_lone_prefix_character():
-    from absolutcoder.keys import read_windows_keys
+def test_console_records_plan_arrows_and_stop_at_typed_keys():
+    from absolutcoder.keys import (
+        FOCUS_EVENT,
+        MENU_EVENT,
+        MOUSE_EVENT,
+        WINDOW_BUFFER_SIZE_EVENT,
+        ConsoleEvent,
+        plan_console_events,
+    )
 
-    assert read_windows_keys(FakeMsvcrt("à")) == []  # a typed à: no wait for a second character
-    assert read_windows_keys(FakeMsvcrt("\xe0P")) == ["down"]
-    assert read_windows_keys(FakeMsvcrt("\x00H")) == ["up"]
-    assert read_windows_keys(FakeMsvcrt("q")) == []
-    queue = FakeMsvcrt("\xe0Ka")
-    assert read_windows_keys(queue) == ["left"]
-    assert queue.chars == ["a"]
+    down, up, left, right = 0x28, 0x26, 0x25, 0x27
+    assert plan_console_events([_key(down, True), _key(down, False)]) == (["down"], 2)
+    assert plan_console_events([_key(up, True), _key(left, True), _key(right, True)]) == (["up", "left", "right"], 3)
+    assert plan_console_events([_key(up, False)]) == ([], 1)  # a key-up is taken silently
+    focus = ConsoleEvent(FOCUS_EVENT)
+    assert plan_console_events([focus, ConsoleEvent(MENU_EVENT), _key(down, True)]) == (["down"], 3)
+    # A typed character stops the plan: it and everything after it stay for the prompt.
+    assert plan_console_events([_key(down, True), _key(0x58, True, "x"), _key(up, True)]) == (["down"], 1)
+    assert plan_console_events([_key(0x30, True, "à"), _key(down, True)]) == ([], 0)  # à is a character, not an arrow
+    assert plan_console_events([_key(0x0D, True, "\r")]) == ([], 0)  # Enter
+    assert plan_console_events([ConsoleEvent(MOUSE_EVENT), _key(down, True)]) == ([], 0)
+    assert plan_console_events([ConsoleEvent(WINDOW_BUFFER_SIZE_EVENT)]) == ([], 0)
+    # The Enter key-up left by the prompt, and a modifier pressed alone, do not block arrows.
+    assert plan_console_events([_key(0x0D, False, "\r"), _key(0x10, True), _key(down, True)]) == (["down"], 3)
+    assert plan_console_events([_key(0x10, True, "A")]) == ([], 0)
+    assert plan_console_events([]) == ([], 0)
 
 
-def test_windows_listener_thread_reads_through_an_injected_console():
-    import threading
+def test_windows_listener_without_a_console_falls_back(monkeypatch):
+    import absolutcoder.keys as keys_module
 
-    from absolutcoder.keys import WindowsKeys
+    class TTY:
+        def isatty(self):
+            return True
 
-    class OneByOne(FakeMsvcrt):
-        """à arrives alone; the arrow's two halves arrive together a moment later."""
+        def fileno(self):
+            return 0
 
-        def __init__(self):
-            super().__init__("")
-            self.batches = [["à"], ["\xe0", "M"]]
-            self.gap = False  # one empty poll between batches: the next key comes later
+    def no_console():
+        raise OSError("no console")
 
-        def kbhit(self):
-            if not self.chars and self.batches:
-                if self.gap:
-                    self.gap = False
-                    return False
-                self.chars = self.batches.pop(0)
-                self.gap = True
-            return bool(self.chars)
+    monkeypatch.setattr(keys_module.sys, "stdin", TTY())
+    monkeypatch.setattr(keys_module.sys, "platform", "win32")
+    monkeypatch.setattr(keys_module, "WindowsConsoleKeys", no_console)
+    assert isinstance(keys_module.default_key_listener(), NoKeys)
 
-    got: list[str] = []
+
+_CONSOLE_CHILD = r'''
+import ctypes, json, sys, threading, time
+from ctypes import wintypes
+
+sys.path.insert(0, sys.argv[1])
+from absolutcoder.keys import WindowsConsoleKeys, _console_types
+
+_, _, KEY_EVENT_RECORD, INPUT_RECORD = _console_types()
+k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+k32.CreateFileW.restype = wintypes.HANDLE
+handle = k32.CreateFileW("CONIN$", 0x80000000 | 0x40000000, 3, None, 3, 0, None)
+
+
+def key(vk, scan, char, down, state=0):
+    record = INPUT_RECORD()
+    record.EventType = 1
+    event = record.Event.KeyEvent
+    event.bKeyDown, event.wRepeatCount, event.wVirtualKeyCode, event.wVirtualScanCode = down, 1, vk, scan
+    event.uChar, event.dwControlKeyState = char, state
+    return record
+
+
+def inject(*records):
+    array = (INPUT_RECORD * len(records))(*records)
+    written = wintypes.DWORD()
+    assert k32.WriteConsoleInputW(wintypes.HANDLE(handle), array, len(records), ctypes.byref(written))
+    assert written.value == len(records)
+
+
+def leftover():
+    count = wintypes.DWORD()
+    k32.GetNumberOfConsoleInputEvents(wintypes.HANDLE(handle), ctypes.byref(count))
+    if not count.value:
+        return []
+    array = (INPUT_RECORD * count.value)()
+    read = wintypes.DWORD()
+    k32.ReadConsoleInputW(wintypes.HANDLE(handle), array, count.value, ctypes.byref(read))
+    return [[r.Event.KeyEvent.uChar, bool(r.Event.KeyEvent.bKeyDown)] for r in array[: read.value] if r.EventType == 1]
+
+
+def run(records, wait_for_key):
+    leftover()  # start from an empty queue
+    got = []
     seen = threading.Event()
-    listener = WindowsKeys(msvcrt=OneByOne())
+    listener = WindowsConsoleKeys(handle=handle)
 
-    def on_key(key):
-        got.append(key)
+    def on_key(name):
+        got.append(name)
         seen.set()
 
     listener.start(on_key)
-    assert seen.wait(2)
+    inject(*records)
+    if wait_for_key:
+        seen.wait(3)
+    time.sleep(0.3)  # several polls: nothing more may be taken
+    thread = listener._thread
+    started = time.monotonic()
     listener.stop()
-    assert got == ["right"]
-    assert listener._thread is None
+    stop_seconds = time.monotonic() - started
+    return {"keys": got, "left": leftover(), "stop_seconds": stop_seconds, "thread_alive": thread.is_alive()}
+
+
+DOWN = (0x28, 0x50, "\0")
+results = {
+    "down_then_x": run(
+        [key(*DOWN, True, 0x100), key(*DOWN, False, 0x100), key(0x58, 0x2D, "x", True), key(0x58, 0x2D, "x", False)],
+        True,
+    ),
+    "a_grave_then_down": run(
+        [key(0x30, 0x0B, "à", True), key(0x30, 0x0B, "à", False), key(*DOWN, True, 0x100), key(*DOWN, False, 0x100)],
+        False,
+    ),
+}
+with open(sys.argv[2], "w", encoding="utf-8") as out:
+    json.dump(results, out)
+'''
+
+
+@pytest.mark.skipif(__import__("sys").platform != "win32", reason="needs a real Windows console")
+def test_windows_reader_on_a_real_console(tmp_path):
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    import absolutcoder
+
+    child = tmp_path / "console_child.py"
+    child.write_text(_CONSOLE_CHILD, encoding="utf-8")
+    result = tmp_path / "result.json"
+    src = str(Path(absolutcoder.__file__).resolve().parents[1])
+    completed = subprocess.run(
+        [sys.executable, "-I", str(child), src, str(result)],
+        creationflags=subprocess.CREATE_NO_WINDOW,  # its own hidden console
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=30,  # run() kills the child on timeout
+    )
+    assert completed.returncode == 0, completed.stderr[-2000:]
+    results = json.loads(result.read_text(encoding="utf-8"))
+    print(json.dumps(results, ensure_ascii=False))
+    first = results["down_then_x"]
+    assert first["keys"] == ["down"]
+    assert first["left"] == [["x", True], ["x", False]]  # the typed x stays for the next prompt
+    second = results["a_grave_then_down"]
+    assert second["keys"] == []
+    assert second["left"] == [["à", True], ["à", False], ["\0", True], ["\0", False]]
+    for case in results.values():
+        assert case["stop_seconds"] < 0.2
+        assert case["thread_alive"] is False
 
 
 def test_posix_listener_only_in_the_foreground(monkeypatch):
