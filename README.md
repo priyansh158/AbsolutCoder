@@ -18,6 +18,25 @@ pip install -e ".[google]"      # optional: Google models
 pip install -e ".[ollama]"      # optional: Ollama models
 ```
 
+### macOS and Linux
+
+Use `python3 -m pip install -e .` if `pip` is not on your PATH, and set the
+key with `export OPENAI_API_KEY=...` (add it to `~/.zshrc` to keep it).
+
+- Shell commands run through `bash` from your PATH, or `/bin/sh` when there is
+  none. To use another shell, set `"shell"` in `config.json` to its path. The
+  `cmd` setting is Windows-only.
+- Settings, sessions and global skills live in `~/.absolutcoder`.
+- The Hallmark rules need Node 18 or newer (`brew install node`).
+- Each shell command runs in its own session. If a command times out, a
+  server or other child process it started can keep running; stop it yourself.
+- The header and the prompt box need a terminal with Unicode block characters
+  (Terminal.app and iTerm2 have them). Set `AC_ASCII=1` if they look wrong.
+
+AbsolutCoder is developed and tested on Windows 11. The macOS and Linux paths
+are in the code but have not been run there yet; run `python3 -m pytest -q`
+after installing with `".[dev]"` to check your machine.
+
 ## Run
 
 ```
