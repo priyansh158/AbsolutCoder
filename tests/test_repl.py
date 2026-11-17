@@ -2770,7 +2770,7 @@ def test_loop_shows_header_on_a_terminal_and_not_the_old_line(tmp_path, monkeypa
     repl, output = _terminal_repl(tmp_path, input_fn=lambda _p="": "/exit")
     repl.loop()
     text = _ANSI.sub("", output.getvalue())
-    assert banner.frame_lines(math.inf)[-1] in text.splitlines()
+    assert banner.mid_frame_lines(math.inf)[-1] in text.splitlines()
     assert "model openai:main-test" in text
     assert _HINT in text
     assert "AbsolutCoder. Commands:" not in text

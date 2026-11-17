@@ -259,8 +259,9 @@ A one-shot run takes a skill too: `absolut "/hallmark make a landing page"`.
 ## The header
 
 On a terminal the interactive loop opens with the AbsolutCoder wordmark, drawn
-in block letters that slide in one at a time. Windows between 65 and 92 columns
-get a smaller block wordmark, and narrower ones a one-line form. The prompt
+in block letters that slide in one at a time. It is three rows tall and needs 55
+columns; narrower windows get a one-line form, and `AC_BIG=1` shows the full
+six-row wordmark in windows of 93 columns or more. The prompt
 sits between two horizontal rules; when you press Enter the rules are cleared
 and your line is kept as `> …`, so everything AbsolutCoder prints stays above
 the prompt. Three environment variables change it: `NO_COLOR` (no

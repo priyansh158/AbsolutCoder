@@ -145,7 +145,7 @@ def test_facts_line():
 
 def test_static_show_prints_header_facts_and_hint():
     console, output = _console(terminal=False)
-    banner.show(console, version="0.1.0", model="openai:m", cwd="~/r", animate=False, environ={})
+    banner.show(console, version="0.1.0", model="openai:m", cwd="~/r", animate=False, environ={"AC_BIG": "1"})
     text = output.getvalue()
     lines = text.split("\n")
     for row in _RESTING:
@@ -157,7 +157,7 @@ def test_static_show_prints_header_facts_and_hint():
 
 
 def test_narrow_console_gets_the_one_line_form():
-    console, output = _console(terminal=False, width=60)
+    console, output = _console(terminal=False, width=50)
     banner.show(console, version="0.1.0", animate=False, environ={})
     lines = output.getvalue().split("\n")
     assert "  ▰ AbsolutCoder" in lines
@@ -169,7 +169,7 @@ def test_narrow_console_gets_the_one_line_form():
 def test_animated_show_ends_on_the_resting_frame():
     console, output = _console(terminal=True, color_system="truecolor")
     fake = FakeTime()
-    banner.show(console, version="0.1.0", model="m", environ={}, sleep=fake.sleep, clock=fake.clock)
+    banner.show(console, version="0.1.0", model="m", environ={"AC_BIG": "1"}, sleep=fake.sleep, clock=fake.clock)
     assert fake.calls and set(fake.calls) == {banner.FRAME / 1000}
     raw = output.getvalue()
     assert raw.index("\x1b[?25l") < raw.rindex("\x1b[?25h")
@@ -182,7 +182,7 @@ def test_animated_show_ends_on_the_resting_frame():
 def test_no_anim_switch_is_static():
     console, output = _console(terminal=True)
     fake = FakeTime()
-    banner.show(console, version="0.1.0", environ={"AC_NO_ANIM": "1"}, sleep=fake.sleep, clock=fake.clock)
+    banner.show(console, version="0.1.0", environ={"AC_BIG": "1", "AC_NO_ANIM": "1"}, sleep=fake.sleep, clock=fake.clock)
     assert fake.calls == []
     assert "\x1b[?25l" not in output.getvalue()
     assert _rows_before_footer(_plain_lines(output)) == _RESTING
@@ -190,7 +190,7 @@ def test_no_anim_switch_is_static():
 
 def test_no_color_switch_emits_no_colour_codes():
     console, output = _console(terminal=True, color_system="truecolor")
-    banner.show(console, version="0.1.0", animate=False, environ={"NO_COLOR": "1"})
+    banner.show(console, version="0.1.0", animate=False, environ={"AC_BIG": "1", "NO_COLOR": "1"})
     text = output.getvalue()
     assert "\x1b[" not in text
     assert _RESTING[-1] in text.split("\n")
@@ -199,7 +199,7 @@ def test_no_color_switch_emits_no_colour_codes():
 def test_ctrl_c_during_animation_restores_cursor_and_returns():
     console, output = _console(terminal=True)
     fake = FakeTime(interrupt_on=3)
-    banner.show(console, version="0.1.0", environ={}, sleep=fake.sleep, clock=fake.clock)
+    banner.show(console, version="0.1.0", environ={"AC_BIG": "1"}, sleep=fake.sleep, clock=fake.clock)
     assert len(fake.calls) == 3
     raw = output.getvalue()
     assert raw.rindex("\x1b[?25h") > raw.index("\x1b[?25l")
@@ -244,39 +244,42 @@ def test_show_holds_the_output_lock():
     assert seen and all(seen)
 
 
-_MID_BOTTOM = "  ██  █  █ █▄▄▀ ▄▄▄▀ ▀▄▄▀ █ ▀▄▄█  █▄ ▀▄▄▄ ▀▄▄▀ ▀▄▄█ ▀▄▄▄ █"
+_MID_BOTTOM = "  ██  █ █ █▄▀ ▄█▀ ▀▄▀ █ ▀▄█  █▄ ▀▄▄ ▀▄▀ ▀▄█ ▀█▄ █"
 
 
-def test_mid_size_wordmark_rests_on_four_rows_within_its_width():
+def test_small_wordmark_rests_on_three_rows_within_its_width():
     lines = banner.mid_frame_lines(math.inf)
-    assert len(lines) == banner.MID_ROWS == 4
-    assert banner.MID_WIDTH == 64
+    assert len(lines) == banner.MID_ROWS == 3
+    assert banner.MID_WIDTH == 54
     assert max(len(line) for line in lines) <= banner.MID_WIDTH
     assert lines[-1] == _MID_BOTTOM
 
 
-def test_mid_size_letters_arrive_one_at_a_time():
+def test_small_wordmark_letters_arrive_one_at_a_time():
     early = banner.mid_frame_lines(LETTER_START + 1)
     late = banner.mid_frame_lines(math.inf)
     assert max(len(line) for line in early) < max(len(line) for line in late)
     assert banner.mid_frame_lines(TOTAL) == late
 
 
-def test_width_picks_the_one_line_mid_size_or_full_wordmark():
+def test_small_wordmark_is_the_default_and_the_full_one_is_opt_in():
     def shown(width, **env):
         console, output = _console(terminal=False, width=width)
         banner.show(console, version="0.1.0", model="m", cwd="~/x", animate=False, environ=env)
         return output.getvalue()
 
+    full_bottom = banner.frame_lines(math.inf)[-1]
     assert "▰ AbsolutCoder" in shown(banner.MID_WIDTH)
-    mid = shown(banner.MID_WIDTH + 1)
-    assert _MID_BOTTOM in mid and "▰" not in mid
-    assert _MID_BOTTOM in shown(WIDTH)
-    assert banner.frame_lines(math.inf)[-1] in shown(WIDTH + 1)
+    small = shown(banner.MID_WIDTH + 1)
+    assert _MID_BOTTOM in small and "▰" not in small
+    wide = shown(200)
+    assert _MID_BOTTOM in wide and full_bottom not in wide
+    assert full_bottom in shown(WIDTH + 1, AC_BIG="1")
+    assert _MID_BOTTOM in shown(WIDTH, AC_BIG="1")
     assert "// AbsolutCoder" in shown(banner.MID_WIDTH + 1, AC_ASCII="1")
 
 
-def test_animated_mid_size_show_ends_on_the_resting_frame():
+def test_animated_small_wordmark_ends_on_the_resting_frame():
     console = Console(file=io.StringIO(), force_terminal=True, no_color=True, width=70, legacy_windows=False)
     now = [0.0]
     banner.show(

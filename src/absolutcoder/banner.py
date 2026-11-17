@@ -119,20 +119,20 @@ def frame_lines(t: float, *, block: str = "█") -> list[str]:
 
 # The mid-size wordmark, for windows too narrow for the full one. Each glyph is
 # drawn on a grid of square pixels, two pixel rows to a text row (half blocks).
-MID_PIXEL_ROWS = 8
+MID_PIXEL_ROWS = 6
 MID_ROWS = MID_PIXEL_ROWS // 2
 MID_RAW = {
-    "A": [".##.", "#..#", "#..#", "#..#", "####", "#..#", "#..#", "#..#"],
-    "b": ["#...", "#...", "#...", "###.", "#..#", "#..#", "#..#", "###."],
-    "s": ["....", "....", "....", ".###", "#...", ".##.", "...#", "###."],
-    "o": ["....", "....", "....", ".##.", "#..#", "#..#", "#..#", ".##."],
-    "l": ["#", "#", "#", "#", "#", "#", "#", "#"],
-    "u": ["....", "....", "....", "#..#", "#..#", "#..#", "#..#", ".###"],
-    "t": ["...", ".#.", ".#.", "###", ".#.", ".#.", ".#.", ".##"],
-    "C": [".###", "#...", "#...", "#...", "#...", "#...", "#...", ".###"],
-    "d": ["...#", "...#", "...#", ".###", "#..#", "#..#", "#..#", ".###"],
-    "e": ["....", "....", "....", ".##.", "#..#", "####", "#...", ".###"],
-    "r": ["...", "...", "...", "#.#", "##.", "#..", "#..", "#.."],
+    "A": [".#.", "#.#", "#.#", "###", "#.#", "#.#"],
+    "b": ["#..", "#..", "##.", "#.#", "#.#", "##."],
+    "s": ["...", "...", ".##", "##.", ".##", "##."],
+    "o": ["...", "...", ".#.", "#.#", "#.#", ".#."],
+    "l": ["#", "#", "#", "#", "#", "#"],
+    "u": ["...", "...", "#.#", "#.#", "#.#", ".##"],
+    "t": ["...", ".#.", "###", ".#.", ".#.", ".##"],
+    "C": [".##", "#..", "#..", "#..", "#..", ".##"],
+    "d": ["..#", "..#", ".##", "#.#", "#.#", ".##"],
+    "e": ["...", "...", ".##", "#.#", "##.", ".##"],
+    "r": ["...", "...", "#.#", "##.", "#..", "#.."],
 }
 MID_MARK = ["##"] * MID_PIXEL_ROWS
 MID_MARK_GAP = 2
@@ -298,9 +298,11 @@ def show(
         facts = facts_line(version, model, cwd)
         try:
             # Half blocks need a font with block characters, so ASCII mode skips the mid size.
-            mid = compact is None and not ascii_only and MID_WIDTH + 1 <= console.width < WIDTH + 1
+            # The small wordmark is the default; AC_BIG asks for the full six-row one.
+            big = (ascii_only or _is_set(env, "AC_BIG")) and console.width >= WIDTH + 1
+            mid = compact is None and not ascii_only and not big and console.width >= MID_WIDTH + 1
             if compact is None:
-                compact = console.width < WIDTH + 1 and not mid
+                compact = not big and not mid
             if animate is None:
                 animate = (
                     console.is_terminal
