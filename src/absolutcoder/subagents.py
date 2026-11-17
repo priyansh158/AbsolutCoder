@@ -17,6 +17,7 @@ from absolutcoder.codemap import CODE_MAP_RULE_WORKER
 from absolutcoder.config import Config
 from absolutcoder.models import ModelFactory, construct_model, provider_error
 from absolutcoder.design_rules import DESIGN_RULES
+from absolutcoder.history import SeenImagesMiddleware
 from absolutcoder.skills import always_text, skill_paths_note, skill_sources
 from absolutcoder.webtools import make_web_tools, wrap_untrusted
 
@@ -254,16 +255,19 @@ def role_model_id(d: AgentDef, config: Config) -> str:
 
 
 def role_middleware(d: AgentDef, backend) -> list[AgentMiddleware]:
-    """An allowlisted FilesystemMiddleware for roles without every filesystem tool.
+    """The middleware every file-reading role gets on top of deepagents' defaults.
 
+    Roles without every filesystem tool get an allowlisted FilesystemMiddleware.
     It is named FilesystemMiddleware, so it replaces deepagents' default one.
     It has no rules of its own; deepagents copies the permissions onto it.
+    Every role gets ``SeenImagesMiddleware``, so screenshots it reads do not
+    stay in its history after it has seen them.
     """
 
     allowed = [name for group in d.groups for name in TOOL_GROUPS[group]]
     if set(allowed) == _FS_TOOLS:
-        return []
-    return [FilesystemMiddleware(backend=backend, tools=allowed)]
+        return [SeenImagesMiddleware()]
+    return [FilesystemMiddleware(backend=backend, tools=allowed), SeenImagesMiddleware()]
 
 
 def role_permissions(d: AgentDef) -> list[FilesystemPermission] | None:
@@ -328,7 +332,7 @@ def web_runnable(
             model,
             tools=tools,
             system_prompt=d.prompt,
-            middleware=[UntrustedReportMiddleware(d.name)],
+            middleware=[UntrustedReportMiddleware(d.name), SeenImagesMiddleware()],
             name=d.name,
             checkpointer=checkpointer,
         )

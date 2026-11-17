@@ -123,6 +123,7 @@ called with the Chat Completions API unless you add `"api": "responses"`.
 | `max_background_tasks` | `4` | Background tasks running at once |
 | `code_map` | `"auto"` | `auto` builds a code map of the repository; `off` disables it (`/map`) |
 | `code_map_min_files` | `20` | Fewest source files a folder needs before a map is built |
+| `activity` | `"collapsed"` | `collapsed`: one status line while it works, ↓ or → shows the calls, ↑ or ← hides them; `full`: every call printed as before |
 
 Sessions are stored in the same folder; `/resume` lists the ones for the
 current repository.
@@ -139,6 +140,7 @@ current repository.
 | `/<skill-name> <request>` | Run a request with that skill's full instructions loaded |
 | `/map`, `/map build`, `/map update`, `/map on`, `/map off` | Code map of this repository |
 | `/tasks`, `/tasks show <id>`, `/tasks cancel <id>` | Background tasks |
+| `/calls` | Show every call of the last turn |
 | `/verify <command>`, `/verify off`, `/verify` | Set, clear or show the check command |
 | `/loop <N>(s\|m\|h) <prompt>` | Repeat a prompt until Ctrl+C |
 | `/attach <path>` | Attach a file to the next message |
@@ -297,6 +299,26 @@ and your line is kept as `> …`, so everything AbsolutCoder prints stays above
 the prompt. Three environment variables change it: `NO_COLOR` (no
 colour), `AC_NO_ANIM` (no animation), `AC_ASCII` (plain `#` characters for
 fonts without block characters). Piped output gets a plain first line.
+
+## While it works
+
+On a terminal a turn shows one line at the bottom instead of a line per call:
+
+```
+⠋ Lemme cook… 1m 04s · 14 calls · tool: edit_file(src/app.py)   ↓ show calls
+```
+
+Press ↓ or → to list the latest calls under it, and ↑ or ← to fold them away
+again; the arrow keys work the same on Windows, macOS and Linux. What the model
+writes still appears above the line. When the turn ends the line becomes a
+summary such as `⏺ Cooked for 1m 12s · 14 calls · /calls to see them`, and
+`/calls` prints every call of that turn. Set `"activity": "full"` to print each
+call as it happens; piped output always does.
+
+Screenshots and other images the model reads stay in the conversation only
+until the model has seen them. After that each one is replaced by a short note
+(the model can read the file again), which keeps the session file small and
+saves tokens on every later request.
 
 ## Check loop
 

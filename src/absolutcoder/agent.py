@@ -16,6 +16,7 @@ from langgraph.graph.state import CompiledStateGraph
 from absolutcoder.codemap import CODE_MAP_RULE, CodeMap, make_map_tools
 from absolutcoder.config import Config
 from absolutcoder.git_policy import execute_needs_approval, protect_context_file
+from absolutcoder.history import SeenImagesMiddleware
 from absolutcoder.models import ModelFactory, build_model, construct_model, provider_error
 from absolutcoder.shell import GuardedShellBackend, RepoFilesystemBackend
 from absolutcoder.skills import GLOBAL_ROUTE, PROJECT_SOURCE, global_skills_dir, skill_sources
@@ -188,7 +189,7 @@ def build_agent(
             code_map=bool(map_tools),
         ),
         "tools": [*extra_tools, *map_tools],
-        "middleware": [TodoListMiddleware()],
+        "middleware": [TodoListMiddleware(), SeenImagesMiddleware()],
         "subagents": build_specs(
             _with_shell_line(roster, shell_kind),
             backend=routed,
