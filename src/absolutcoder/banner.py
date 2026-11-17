@@ -117,26 +117,29 @@ def frame_lines(t: float, *, block: str = "█") -> list[str]:
     return ["".join(block if cell else " " for cell in row).rstrip() for row in frame_cells(t)]
 
 
-# The mid-size wordmark, for windows too narrow for the full one. Each glyph is
-# drawn on a grid of square pixels, two pixel rows to a text row (half blocks).
+# The small wordmark, the default header. Each glyph is drawn on a grid of
+# square pixels, two pixel rows to a text row (half blocks). The letters stand
+# upright, since a one-cell lean per row breaks strokes this small; only the
+# accent mark keeps the slant.
 MID_PIXEL_ROWS = 6
 MID_ROWS = MID_PIXEL_ROWS // 2
 MID_RAW = {
-    "A": [".#.", "#.#", "#.#", "###", "#.#", "#.#"],
-    "b": ["#..", "#..", "##.", "#.#", "#.#", "##."],
-    "s": ["...", "...", ".##", "##.", ".##", "##."],
-    "o": ["...", "...", ".#.", "#.#", "#.#", ".#."],
+    "A": [".##.", "#..#", "#..#", "####", "#..#", "#..#"],
+    "b": ["#...", "#...", "###.", "#..#", "#..#", "###."],
+    "s": ["....", "....", ".###", "##..", "..##", "###."],
+    "o": ["....", "....", ".##.", "#..#", "#..#", ".##."],
     "l": ["#", "#", "#", "#", "#", "#"],
-    "u": ["...", "...", "#.#", "#.#", "#.#", ".##"],
-    "t": ["...", ".#.", "###", ".#.", ".#.", ".##"],
-    "C": [".##", "#..", "#..", "#..", "#..", ".##"],
-    "d": ["..#", "..#", ".##", "#.#", "#.#", ".##"],
-    "e": ["...", "...", ".##", "#.#", "##.", ".##"],
+    "u": ["....", "....", "#..#", "#..#", "#..#", ".###"],
+    "t": ["...", ".#.", "###", ".#.", ".#.", "..#"],
+    "C": [".###", "#...", "#...", "#...", "#...", ".###"],
+    "d": ["...#", "...#", ".###", "#..#", "#..#", ".###"],
+    "e": ["....", "....", ".##.", "####", "#...", ".###"],
     "r": ["...", "...", "#.#", "##.", "#..", "#.."],
 }
 MID_MARK = ["##"] * MID_PIXEL_ROWS
-MID_MARK_GAP = 2
+MID_MARK_GAP = 3
 MID_SLIDE = 4
+MID_LETTER_LEAN = 0  # columns per text row the letters lean; the mark leans LEAN
 
 
 def _mid_slots() -> tuple[list[int], int]:
@@ -149,12 +152,12 @@ def _mid_slots() -> tuple[list[int], int]:
 
 
 MID_SLOTS, _MID_END = _mid_slots()
-MID_WIDTH: int = _MID_END - GAP + LEAN * (MID_ROWS - 1) + 1
+MID_WIDTH: int = _MID_END - GAP + MID_LETTER_LEAN * (MID_ROWS - 1) + 1
 
 
-def _mid_stamp(pixels: list[list[str | None]], glyph: list[str], x0: int, paint: str) -> None:
+def _mid_stamp(pixels: list[list[str | None]], glyph: list[str], x0: int, paint: str, lean: int) -> None:
     for r, row in enumerate(glyph):
-        shift = LEAN * (MID_ROWS - 1 - r // 2)  # lean by text row, so each cell's two pixels align
+        shift = lean * (MID_ROWS - 1 - r // 2)  # lean by text row, so each cell's two pixels align
         for c, char in enumerate(row):
             column = x0 + c + shift
             if char == "#" and 0 <= column < MID_WIDTH:
@@ -166,14 +169,14 @@ def mid_frame_cells(t: float) -> list[list[tuple[str, str] | None]]:
 
     pixels: list[list[str | None]] = [[None] * MID_WIDTH for _ in range(MID_PIXEL_ROWS)]
     mark_x = INDENT - js_round((1 - ease_out(t / MARK_DUR)) * MID_SLIDE)
-    _mid_stamp(pixels, MID_MARK, mark_x, "accent")
+    _mid_stamp(pixels, MID_MARK, mark_x, "accent", LEAN)
     for i, letter in enumerate(WORD):
         start = LETTER_START + i * STAGGER
         if t < start:
             continue
         p = (t - start) / LETTER_DUR
         x0 = MID_SLOTS[i] - js_round((1 - ease_out(p)) * MID_SLIDE)
-        _mid_stamp(pixels, MID_RAW[letter], x0, "accent" if p < 1 else "ink")
+        _mid_stamp(pixels, MID_RAW[letter], x0, "accent" if p < 1 else "ink", MID_LETTER_LEAN)
     cells: list[list[tuple[str, str] | None]] = []
     for r in range(MID_ROWS):
         top, bottom = pixels[2 * r], pixels[2 * r + 1]

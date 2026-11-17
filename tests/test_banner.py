@@ -244,13 +244,13 @@ def test_show_holds_the_output_lock():
     assert seen and all(seen)
 
 
-_MID_BOTTOM = "  ██  █ █ █▄▀ ▄█▀ ▀▄▀ █ ▀▄█  █▄ ▀▄▄ ▀▄▀ ▀▄█ ▀█▄ █"
+_MID_BOTTOM = "  ██   █  █ █▄▄▀ ▄▄█▀ ▀▄▄▀ █ ▀▄▄█  ▀▄ ▀▄▄▄ ▀▄▄▀ ▀▄▄█ ▀▄▄▄ █"
 
 
 def test_small_wordmark_rests_on_three_rows_within_its_width():
     lines = banner.mid_frame_lines(math.inf)
     assert len(lines) == banner.MID_ROWS == 3
-    assert banner.MID_WIDTH == 54
+    assert banner.MID_WIDTH == 62
     assert max(len(line) for line in lines) <= banner.MID_WIDTH
     assert lines[-1] == _MID_BOTTOM
 
