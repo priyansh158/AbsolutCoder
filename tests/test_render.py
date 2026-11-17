@@ -372,7 +372,9 @@ def test_token_line_sums_main_and_worker():
     main = AIMessage(content="answer", id="m1", usage_metadata=_usage(1200, 50, cached=1000))
     worker = AIMessage(content="found", id="w1", usage_metadata=_usage(300, 40))
     renderer.feed(_msg(worker, ns=WORKER_NS, agent="explore"))
+    renderer.feed(_upd("model", [worker], ns=WORKER_NS))
     renderer.feed(_msg(main))
+    renderer.feed(_upd("model", [main]))
     renderer.finish(_snapshot(main))
     assert renderer.usage == {"input": 1500, "cached": 1000, "output": 90, "calls": 2}
     assert _token_lines(output) == ["tokens: 1,500 in (1,000 cached), 90 out, 2 model calls"]
@@ -426,6 +428,8 @@ def test_singular_model_call():
 
 def test_interrupted_prints_tokens_after_interrupted():
     renderer, output = _renderer(True)
+    worker = AIMessage(content="", id="w1", usage_metadata=_usage(10, 2))
+    renderer.feed(_upd("model", [worker], ns=WORKER_NS))  # a completed call before the interrupt
     renderer.feed(_msg(AIMessageChunk(content="half", id="m1", usage_metadata=_usage(10, 2))))
     renderer.interrupted()
     assert output.getvalue().splitlines() == [
@@ -436,12 +440,60 @@ def test_interrupted_prints_tokens_after_interrupted():
     _clean(renderer)
 
 
-def test_message_without_id_counts_each_time_and_internal_calls_count():
+def test_message_without_id_counts_each_time_and_streamed_internal_calls_do_not_count():
     renderer, _output = _renderer(False)
     anonymous = AIMessage(content="x", usage_metadata=_usage(10, 1))
     renderer.feed(_upd("model", [anonymous]))
     renderer.feed(_upd("model", [anonymous]))
     summary = AIMessageChunk(content="s", id="s1", usage_metadata=_usage(100, 5))
     renderer.feed(_msg(summary, node="SummarizationMiddleware.before_model"))
-    assert renderer.usage == {"input": 120, "cached": 0, "output": 7, "calls": 3}
+    assert renderer.usage == {"input": 20, "cached": 0, "output": 2, "calls": 2}
+    _clean(renderer)
+
+
+def test_usage_counted_once_when_chunk_and_final_ids_differ():
+    renderer, output = _renderer(True)
+    renderer.feed(_msg(AIMessageChunk(content="Hel", id="lc_run--abc")))
+    renderer.feed(_msg(AIMessageChunk(content="lo", id="lc_run--abc")))
+    renderer.feed(
+        _msg(AIMessageChunk(content="", id="lc_run--abc", usage_metadata=_usage(1000, 50, cached=800)))
+    )
+    done = AIMessage(content="Hello", id="resp_123", usage_metadata=_usage(1000, 50, cached=800))
+    renderer.feed(_upd("model", [done]))
+    renderer.finish(_snapshot(done))
+    assert renderer.usage == {"input": 1000, "cached": 800, "output": 50, "calls": 1}
+    assert _token_lines(output) == ["tokens: 1,000 in (800 cached), 50 out, 1 model call"]
+    _clean(renderer)
+
+
+def test_worker_message_seen_in_both_streams_counts_once():
+    renderer, output = _renderer(False)
+    chunk = AIMessageChunk(content="found", id="lc_run--w", usage_metadata=_usage(300, 40))
+    renderer.feed(_msg(chunk, ns=WORKER_NS, agent="explore"))
+    worker = AIMessage(content="found", id="chatcmpl-w", usage_metadata=_usage(300, 40))
+    renderer.feed(_upd("model", [worker], ns=WORKER_NS))
+    renderer.feed(_upd("model", [worker], ns=WORKER_NS))
+    assert renderer.usage == {"input": 300, "cached": 0, "output": 40, "calls": 1}
+    _clean(renderer)
+
+
+def test_malformed_usage_does_not_hide_the_message():
+    renderer, output = _renderer(False)
+    message = AIMessage(content="still shown", id="m1")
+    message.usage_metadata = {"input_tokens": "lots"}
+    renderer.feed(_upd("model", [message]))
+    renderer.finish(_snapshot(message))
+    assert "still shown" in output.getvalue().splitlines()
+    assert renderer.usage["calls"] == 1
+    assert renderer.usage["input"] == 0
+    _clean(renderer)
+
+
+def test_cached_is_clamped_to_input():
+    renderer, output = _renderer(False)
+    message = AIMessage(content="a", id="m1", usage_metadata=_usage(100, 5, cached=900))
+    renderer.feed(_upd("model", [message]))
+    renderer.finish(_snapshot(message))
+    assert renderer.usage == {"input": 100, "cached": 100, "output": 5, "calls": 1}
+    assert _token_lines(output) == ["tokens: 100 in (100 cached), 5 out, 1 model call"]
     _clean(renderer)
