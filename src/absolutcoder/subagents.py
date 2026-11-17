@@ -184,6 +184,21 @@ def skill_text(repo: Path) -> str:
     return "\n\n".join(part for part in (DESIGN_RULES, skill_paths_note(repo), always_text(repo)) if part)
 
 
+WORKER_EFFICIENCY_LINE = (
+    "Work in as few round trips as you can: read every file you need in one message, and change "
+    "a file with one edit_file call per area of change, or rewrite it with write_file when you "
+    "change most of it."
+)
+
+
+def with_efficiency_line(d: AgentDef) -> AgentDef:
+    """A role that edits files is told to batch its reads and edits."""
+
+    if "edit" not in d.groups:
+        return d
+    return replace(d, prompt=d.prompt.rstrip("\n") + "\n\n" + WORKER_EFFICIENCY_LINE + "\n")
+
+
 def roster_prompt(defs: list[AgentDef]) -> str:
     lines = ["Workers you can start with the task tool:"]
     lines.extend(f"- {d.name}: {d.description}" for d in defs)
@@ -220,7 +235,7 @@ def build_specs(
             specs.append({"name": d.name, "description": d.description, "runnable": runnable})
         else:
             spec = _declarative_spec(
-                with_map_rule(with_skill_text(d, repo), map_tools),
+                with_map_rule(with_skill_text(with_efficiency_line(d), repo), map_tools),
                 model,
                 backend,
                 tools=role_map_tools(d, map_tools),

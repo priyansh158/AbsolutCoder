@@ -35,6 +35,7 @@ from absolutcoder.subagents import (  # noqa: F401 - SECRET_PATHS is re-exported
     secret_permissions,
     skill_text,
     web_runnable,
+    with_efficiency_line,
     with_map_rule,
     with_skill_text,
 )
@@ -75,6 +76,14 @@ BACKGROUND_PARAGRAPH = (
     "background tasks are given to you at the start of a later turn; check_task and list_tasks "
     "let you look earlier; cancel_task stops one."
 )
+EFFICIENCY_PARAGRAPH = (
+    "Work in as few round trips as you can. Read every file you need in one message. Change a "
+    "file with one edit_file call per area of change; when you change most of a file, rewrite it "
+    "with write_file instead of making many small edits. When a task has independent parts, start "
+    "several task calls in one message so the workers run at the same time, and put what you "
+    "already know in each worker's brief (file contents you read, decisions you made) so it does "
+    "not read them again."
+)
 _TASK_TOOL_NAME = "start_task"
 NON_INTERACTIVE_LINE = "Nobody can answer questions in this run; decide and say what you assumed."
 COMMIT_MESSAGE_LINE = "Write commit messages with one or more -m options; each is taken as you wrote it."
@@ -108,6 +117,7 @@ def _main_system_prompt(
     roster = roster_prompt(agents) + "\n" + _REPORT_GUIDANCE
     prompt = SYSTEM_PROMPT.replace(" " + _DELEGATION, "\n\n" + roster)
     prompt = prompt.rstrip("\n") + "\n\n" + shell_line(shell_kind) + " " + COMMIT_MESSAGE_LINE + "\n\n" + UNTRUSTED_PARAGRAPH + "\n"
+    prompt += "\n" + EFFICIENCY_PARAGRAPH + "\n"
     if background:
         prompt += "\n" + BACKGROUND_PARAGRAPH + "\n"
     if not interactive:
@@ -239,7 +249,10 @@ def build_role_graph(
     routed = workspace_backend(root, backend, shell_preference=config.shell)
     map_tools = _map_tools(code_map)
     definition = with_map_rule(
-        with_skill_text(_with_shell_line([role], routed.default.shell_kind)[0], root), map_tools
+        with_skill_text(
+            with_efficiency_line(_with_shell_line([role], routed.default.shell_kind)[0]), root
+        ),
+        map_tools,
     )
     permissions = role_permissions(role)
     kwargs = {

@@ -791,3 +791,49 @@ def test_role_graph_gets_skills_and_write_ban(tmp_path, monkeypatch):
     assert "skills" not in reading
     assert "ROLE GRAPH RULE" not in reading["system_prompt"]
     assert ban in [(r.operations, r.paths, r.mode) for r in reading["permissions"]]
+
+
+def test_main_prompt_asks_for_fewer_round_trips(tmp_path):
+    from absolutcoder.agent import EFFICIENCY_PARAGRAPH, _main_system_prompt
+
+    assert EFFICIENCY_PARAGRAPH.startswith("Work in as few round trips as you can. ")
+    assert "start several task calls in one message" in EFFICIENCY_PARAGRAPH
+    assert _main_system_prompt(builtin_agents(), "bash").count(EFFICIENCY_PARAGRAPH) == 1
+    texts = _system_texts(_skill_repo(tmp_path), ["explore", "plan", "general-purpose", "web-researcher"])
+    assert EFFICIENCY_PARAGRAPH in texts["main"]
+
+
+def test_only_editing_workers_get_the_efficiency_line(tmp_path):
+    from absolutcoder.agent import EFFICIENCY_PARAGRAPH
+    from absolutcoder.subagents import WORKER_EFFICIENCY_LINE
+
+    assert "task call" not in WORKER_EFFICIENCY_LINE
+    texts = _system_texts(_skill_repo(tmp_path), ["explore", "plan", "general-purpose", "web-researcher"])
+    assert texts["general-purpose"].count(WORKER_EFFICIENCY_LINE) == 1
+    assert EFFICIENCY_PARAGRAPH not in texts["general-purpose"]
+    for role in ("explore", "plan", "web-researcher"):
+        assert WORKER_EFFICIENCY_LINE not in texts[role], role
+
+
+def test_custom_editing_role_and_role_graph_get_the_efficiency_line(tmp_path, monkeypatch):
+    import absolutcoder.agent as agent_module
+    from absolutcoder.agent import build_role_graph
+    from absolutcoder.subagents import WORKER_EFFICIENCY_LINE, AgentDef, with_efficiency_line
+
+    custom = AgentDef(name="fixer", description="Fixes.", prompt="You fix.", groups=("read", "edit"), source="repo")
+    reader = AgentDef(name="reader", description="Reads.", prompt="You read.", groups=("read",), source="repo")
+    assert with_efficiency_line(custom).prompt == "You fix.\n\n" + WORKER_EFFICIENCY_LINE + "\n"
+    assert with_efficiency_line(reader) is reader
+    captured: dict[str, dict] = {}
+
+    def recorder(**kwargs):
+        captured[kwargs["name"]] = kwargs
+        return object()
+
+    monkeypatch.setattr(agent_module, "create_deep_agent", recorder)
+    config = Config(main_model="openai:main-test", subagent_model="openai:worker-test")
+    repo = _skill_repo(tmp_path)
+    for role in (custom, reader):
+        build_role_graph(repo, config, None, role, model_factory=role_models({}, default=_ok_model()))
+    assert captured["fixer"]["system_prompt"].count(WORKER_EFFICIENCY_LINE) == 1
+    assert WORKER_EFFICIENCY_LINE not in captured["reader"]["system_prompt"]
