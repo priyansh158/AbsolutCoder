@@ -203,6 +203,17 @@ def test_read_only_exclude_file_does_not_raise(tmp_path, git_repo):
         os.chmod(exclude, stat.S_IREAD | stat.S_IWRITE)
 
 
+def test_non_utf8_exclude_file_is_left_alone(tmp_path, git_repo):
+    repo = git_repo(tmp_path / "repo")
+    exclude = repo / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    before = b"# r\xe9sum\xe9 files\n*.log\n"
+    exclude.write_bytes(before)
+    protect_context_file(repo)  # must not raise UnicodeDecodeError
+    assert exclude.read_bytes() == before
+    assert (repo / "AbsolutCoder.md").is_file()
+
+
 def test_missing_reported_git_directory_creates_nothing(tmp_path, monkeypatch):
     import absolutcoder.git_policy as git_policy
 

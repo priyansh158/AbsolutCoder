@@ -2810,6 +2810,66 @@ def test_help_command_lists_commands(tmp_path):
     assert order == listed
 
 
+def test_ctrl_c_during_the_header_carries_on_to_the_prompt(tmp_path, monkeypatch):
+    from absolutcoder import banner
+
+    def interrupted(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(banner, "show", interrupted)
+    prompts: list[str] = []
+
+    def ask(prompt=""):
+        prompts.append(prompt)
+        return "/exit"
+
+    repl, _output = _terminal_repl(tmp_path, input_fn=ask)
+    repl.loop()  # returns normally, no traceback
+    assert prompts == ["absolut> "]
+
+
+def _one_shot(tmp_path, monkeypatch, task):
+    from absolutcoder.repl import run_cli
+
+    monkeypatch.chdir(tmp_path)
+    seen: list = []
+
+    def responder(messages):
+        seen.append(list(messages))
+        return AIMessage(content="one-shot answer")
+
+    def factory(repo_path, config, background=True, overrides=None):
+        repo = tmp_path / "repo"
+        repo.mkdir(exist_ok=True)
+        return _loop_repl(repo, responder)[0]
+
+    config = Config(main_model="openai:main-test", subagent_model="openai:worker-test")
+    code = run_cli(SimpleNamespace(task=task, attach=[]), config, repl_factory=factory)
+    human = _humans(seen[-1])[-1] if seen else None
+    texts = [block["text"] for block in human.content] if human is not None else []
+    return code, texts
+
+
+def test_one_shot_run_honours_a_skill_command(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    _global_skill("demo", "UNIQUE-BODY-MARKER steps")
+    code, texts = _one_shot(tmp_path, monkeypatch, "/demo make a page")
+    assert code == 0
+    assert texts == [
+        "[Instructions of the demo skill, loaded because the user typed /demo]\nUNIQUE-BODY-MARKER steps",
+        "make a page",
+    ]
+
+
+def test_one_shot_run_passes_other_slash_words_through(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    _global_skill("model", "MODEL-SKILL-BODY")  # a skill named like a built-in command
+    for task in ("/nothing-here do it", "/model pick one"):
+        code, texts = _one_shot(tmp_path, monkeypatch, task)
+        assert code == 0, task
+        assert texts == [task], task
+
+
 def test_one_shot_run_shows_no_header(tmp_path, monkeypatch):
     from absolutcoder.repl import run_cli
 

@@ -35,7 +35,14 @@ from absolutcoder.sessions import (
     update_session,
 )
 from absolutcoder.shell import GuardedShellBackend, ShellNotFound
-from absolutcoder.skills import global_skills_dir, install_skill, list_skills, remove_skill, skill_body
+from absolutcoder.skills import (
+    SkillInfo,
+    global_skills_dir,
+    install_skill,
+    list_skills,
+    remove_skill,
+    skill_body,
+)
 from absolutcoder.tasks import TaskManager, TaskRecord, make_task_tools
 from absolutcoder.webtools import make_web_tools
 
@@ -238,12 +245,15 @@ class Repl:
 
     def loop(self) -> None:
         if self.console.is_terminal:
-            banner.show(
-                self.console,
-                version=absolutcoder.__version__,
-                model=self.config.main_model,
-                cwd=_display_path(self.repo),
-            )
+            try:
+                banner.show(
+                    self.console,
+                    version=absolutcoder.__version__,
+                    model=self.config.main_model,
+                    cwd=_display_path(self.repo),
+                )
+            except KeyboardInterrupt:  # Ctrl+C at the edges of the header: go on to the prompt
+                self.console.print()
         else:
             self.console.print(f"AbsolutCoder. {_COMMANDS}")
         if self.config.verify_command:
@@ -749,23 +759,38 @@ class Repl:
         if command == "/help":
             self._help()
             return
-        name = command[1:]
-        skill = next((s for s in list_skills(self.repo) if s.name == name), None)
-        if command not in _BUILTIN_COMMANDS and skill is not None:
-            if not argument:
-                self._say(f"Usage: /{name} <request>")
-                return
-            body = skill_body(skill)
-            if not body:
-                self._say(f"Could not load the {name} skill.")
-                return
-            if skill.scope == "project":
-                self._say(f"Using the project's {name} skill.")
-            block = f"[Instructions of the {name} skill, loaded because the user typed /{name}]\n{body}"
-            self.run_task(argument, skill_block=block)
+        skill = self.skill_for_command(command)
+        if skill is not None:
+            self.run_skill(skill, argument)
             return
         self.console.print(_COMMANDS)
         self._say(_SKILL_COMMAND_LINE)
+
+    def skill_for_command(self, command: str) -> SkillInfo | None:
+        """The loaded skill ``/<name>`` names; None for a built-in command or an unknown name."""
+
+        if command in _BUILTIN_COMMANDS or not command.startswith("/"):
+            return None
+        name = command[1:]
+        return next((s for s in list_skills(self.repo) if s.name == name), None)
+
+    def run_skill(
+        self, skill: SkillInfo, request: str, paths: list[Path] | None = None
+    ) -> VerifyOutcome | None:
+        """Run ``request`` with the skill's full instructions loaded, as ``/<name> <request>`` does."""
+
+        name = skill.name
+        if not request:
+            self._say(f"Usage: /{name} <request>")
+            return None
+        body = skill_body(skill)
+        if not body:
+            self._say(f"Could not load the {name} skill.")
+            return None
+        if skill.scope == "project":
+            self._say(f"Using the project's {name} skill.")
+        block = f"[Instructions of the {name} skill, loaded because the user typed /{name}]\n{body}"
+        return self.run_task(request, paths, skill_block=block)
 
     def _help(self) -> None:
         self._say(_COMMANDS)
@@ -1063,7 +1088,7 @@ def run_cli(args, config: Config | None = None, *, repl_factory=Repl) -> int:
     try:
         if task:
             try:
-                outcome = repl.run_task(task, paths=attachments)
+                outcome = _run_one_shot(repl, task, attachments)
             except KeyboardInterrupt:
                 outcome, code = None, 130
             else:
@@ -1084,6 +1109,20 @@ def run_cli(args, config: Config | None = None, *, repl_factory=Repl) -> int:
         sys.stderr.flush()
         os._exit(code)
     return code
+
+
+def _run_one_shot(repl, task: str, attachments: list[Path]) -> VerifyOutcome | None:
+    """Run the one-shot task; ``/<skill-name> <request>`` runs as the loop runs it.
+
+    Any other leading ``/word`` (a built-in command or an unknown name) is a plain request.
+    """
+
+    words = task.strip().split(None, 1)
+    find = getattr(repl, "skill_for_command", None)
+    skill = find(words[0]) if find is not None and words and words[0].startswith("/") else None
+    if skill is not None:
+        return repl.run_skill(skill, words[1].strip() if len(words) > 1 else "", paths=attachments)
+    return repl.run_task(task, paths=attachments)
 
 
 def _one_shot_code(repl, outcome: VerifyOutcome | None) -> int:

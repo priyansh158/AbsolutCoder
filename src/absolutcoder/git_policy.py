@@ -178,8 +178,8 @@ def protect_context_file(repo: Path | str) -> None:
         return  # not inside a work tree, or git is missing
     try:
         _add_exclude_lines(exclude, (CONTEXT_FILENAME, CODE_MAP_DIR))
-    except OSError:
-        pass  # an unwritable exclude file must not stop the session
+    except (OSError, UnicodeDecodeError):
+        pass  # an unwritable or non-UTF-8 exclude file must not stop the session; it is left as is
     try:
         unstage_context_file(root)
     except (OSError, subprocess.SubprocessError):
