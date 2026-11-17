@@ -2583,3 +2583,91 @@ def test_close_closes_the_map(tmp_path, monkeypatch):
     assert repl.code_map.wait(10) == "ready"
     assert runner.commands("update") == []
     assert len(runner.commands("extract")) == 1
+
+
+# --- the terminal header and /help ---------------------------------------------
+
+_ANSI = __import__("re").compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+_HINT = "Type a task, or /help for commands."
+
+
+def _terminal_repl(tmp_path, *, input_fn=None):
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    output = io.StringIO()
+    repl = Repl(
+        repo,
+        Config(main_model="openai:main-test", subagent_model="openai:worker-test"),
+        chat_model=scripted_model(lambda _m: AIMessage(content="ok")),
+        model_factory=_worker(),
+        input_fn=input_fn,
+        console=Console(file=output, force_terminal=True, no_color=True, width=120, legacy_windows=False),
+    )
+    return repl, output
+
+
+def test_loop_shows_header_on_a_terminal_and_not_the_old_line(tmp_path, monkeypatch):
+    import math
+
+    from absolutcoder import banner
+
+    monkeypatch.setenv("AC_NO_ANIM", "1")
+    repl, output = _terminal_repl(tmp_path, input_fn=lambda _p="": "/exit")
+    repl.loop()
+    text = _ANSI.sub("", output.getvalue())
+    assert banner.frame_lines(math.inf)[-1] in text.splitlines()
+    assert "model openai:main-test" in text
+    assert _HINT in text
+    assert "AbsolutCoder. Commands:" not in text
+
+
+def test_header_names_the_repository_with_the_home_folder_as_tilde(tmp_path, monkeypatch):
+    from absolutcoder.repl import _display_path
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    assert _display_path(tmp_path / "code" / "app") == "~/code/app"
+    assert _display_path(tmp_path) == "~"
+    elsewhere = Path(tmp_path.anchor) / "elsewhere-not-home"
+    assert _display_path(elsewhere) == elsewhere.as_posix()
+
+
+def test_loop_keeps_plain_first_line_when_not_a_terminal(tmp_path):
+    repl, output = _plain_repl(tmp_path, input_fn=lambda _p="": "/exit")
+    repl.loop()
+    text = output.getvalue()
+    assert _lines(output)[0].startswith("AbsolutCoder. Commands:")
+    assert "█" not in text and "▰" not in text
+    assert _HINT not in text
+
+
+def test_help_command_lists_commands(tmp_path):
+    repl, output = _plain_repl(tmp_path)
+    repl.handle_line("/help")
+    lines = _lines(output)
+    start = next(i for i, line in enumerate(lines) if line.startswith("Commands:"))
+    assert "/help" in lines[start]
+    described = lines[start + 1 :]
+    for command in ("/model", "/skills", "/map", "/tasks", "/help"):
+        assert any(line.split()[:1] == [command] and len(line.split()) > 1 for line in described), command
+    order = [line.split()[0] for line in described]
+    listed = [name.strip() for name in lines[start].removeprefix("Commands:").split(",")]
+    assert order == listed
+
+
+def test_one_shot_run_shows_no_header(tmp_path, monkeypatch):
+    from absolutcoder.repl import run_cli
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AC_NO_ANIM", "1")
+    made: list = []
+
+    def factory(repo_path, config, background=True, overrides=None):
+        repl, output = _terminal_repl(tmp_path)
+        made.append(output)
+        return repl
+
+    config = Config(main_model="openai:main-test", subagent_model="openai:worker-test")
+    assert run_cli(SimpleNamespace(task="hi", attach=[]), config, repl_factory=factory) == 0
+    text = made[0].getvalue()
+    assert "ok" in text
+    assert "█" not in text and _HINT not in text

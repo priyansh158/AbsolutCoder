@@ -14,6 +14,8 @@ from langgraph.errors import GraphBubbleUp
 from langgraph.types import Command
 from rich.console import Console
 
+import absolutcoder
+from absolutcoder import banner
 from absolutcoder.agent import build_agent, build_role_graph
 from absolutcoder.agent_files import load_roster
 from absolutcoder.attachments import build_user_content
@@ -37,13 +39,29 @@ from absolutcoder.skills import global_skills_dir, install_skill, list_skills, r
 from absolutcoder.tasks import TaskManager, TaskRecord, make_task_tools
 from absolutcoder.webtools import make_web_tools
 
-_COMMANDS = "Commands: /model, /subagent, /auto, /resume, /attach, /agents, /tasks, /skills, /map, /verify, /loop, /exit, /quit"
+_COMMANDS = "Commands: /model, /subagent, /auto, /resume, /attach, /agents, /tasks, /skills, /map, /verify, /loop, /help, /exit, /quit"
+_HELP = (
+    ("/model", "<id>  switch the main model"),
+    ("/subagent", "<id>  switch the worker model"),
+    ("/auto", "[on|off]  run commands without asking"),
+    ("/resume", "[N]  resume an earlier session"),
+    ("/attach", "<path>  attach a file to the next message"),
+    ("/agents", "list the worker roles"),
+    ("/tasks", "[show <id> | cancel <id>]  list or manage background tasks"),
+    ("/skills", "[add <folder> | remove <name>]  list, add or remove global skills"),
+    ("/map", "[build|update|on|off]  code map of this repository"),
+    ("/verify", "<cmd|off>  check command run after every request"),
+    ("/loop", "<N>(s|m|h) <prompt>  repeat a prompt"),
+    ("/help", "show this list"),
+    ("/exit", "leave"),
+    ("/quit", "leave"),
+)
 _SKILLS_ADD_USAGE = "Usage: /skills add <folder>"
 _SKILLS_REMOVE_USAGE = "Usage: /skills remove <name>"
 _SKILLS_USAGE = "Usage: /skills [add <folder> | remove <name>]"
 _BUILTIN_COMMANDS = frozenset(
     {"/model", "/subagent", "/auto", "/resume", "/attach", "/agents", "/tasks", "/skills",
-     "/map", "/verify", "/loop", "/exit", "/quit"}
+     "/map", "/verify", "/loop", "/help", "/exit", "/quit"}
 )
 _MAP_USAGE = "Usage: /map [build|update|on|off]"
 _MAP_OFF_HINT = "map: off (use /map on)"
@@ -212,7 +230,15 @@ class Repl:
             )
 
     def loop(self) -> None:
-        self.console.print(f"AbsolutCoder. {_COMMANDS}")
+        if self.console.is_terminal:
+            banner.show(
+                self.console,
+                version=absolutcoder.__version__,
+                model=self.config.main_model,
+                cwd=_display_path(self.repo),
+            )
+        else:
+            self.console.print(f"AbsolutCoder. {_COMMANDS}")
         if self.config.verify_command:
             self._say(f"verify: {self.config.verify_command} (runs after every request; /verify off to stop)")
         while True:
@@ -711,6 +737,9 @@ class Repl:
         if command == "/map":
             self._map_command(argument)
             return
+        if command == "/help":
+            self._help()
+            return
         name = command[1:]
         skill = next((s for s in list_skills(self.repo) if s.name == name), None)
         if command not in _BUILTIN_COMMANDS and skill is not None:
@@ -725,6 +754,11 @@ class Repl:
             self.run_task(argument, skill_block=block)
             return
         self.console.print(_COMMANDS)
+
+    def _help(self) -> None:
+        self._say(_COMMANDS)
+        for name, description in _HELP:
+            self._say(f"  {name:<10} {description}")
 
     def _skills_command(self, argument: str) -> None:
         action, _, rest = argument.partition(" ")
@@ -1080,6 +1114,16 @@ def _interactive_loop(repl) -> None:
         repl.input_fn = make_input_fn(console)
     with background_output(console):
         repl.loop()
+
+
+def _display_path(path: Path) -> str:
+    """``path`` with forward slashes and the home folder written as ~."""
+
+    try:
+        relative = path.relative_to(Path.home())
+    except (ValueError, RuntimeError):  # not under home, or no home folder
+        return path.as_posix()
+    return "~" if relative == Path() else f"~/{relative.as_posix()}"
 
 
 def _task_line(record: TaskRecord) -> str:

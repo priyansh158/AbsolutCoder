@@ -16,6 +16,7 @@ In the terminal loop:
   /map [build|update|on|off]  code map of this repository
   /verify <cmd|off> check command run after every request
   /loop <N>(s|m|h) <prompt>   repeat a prompt    /exit, /quit    leave
+  /help             list these commands
 
 Settings live in config.json in ~/.absolutcoder (or in $ABSOLUTCODER_HOME when set).
 Model ids are provider:model, for example anthropic:claude-sonnet-4-5; a bare id means OpenAI.
