@@ -700,7 +700,8 @@ def test_console_records_plan_arrows_and_stop_at_typed_keys():
     assert plan_console_events([_key(0x30, True, "à"), _key(down, True)]) == ([], 0)  # à is a character, not an arrow
     assert plan_console_events([_key(0x0D, True, "\r")]) == ([], 0)  # Enter
     assert plan_console_events([ConsoleEvent(MOUSE_EVENT), _key(down, True)]) == ([], 0)
-    assert plan_console_events([ConsoleEvent(WINDOW_BUFFER_SIZE_EVENT)]) == ([], 0)
+    # A resize does not block arrows for the rest of the turn.
+    assert plan_console_events([ConsoleEvent(WINDOW_BUFFER_SIZE_EVENT), _key(down, True)]) == (["down"], 2)
     # The Enter key-up left by the prompt, and a modifier pressed alone, do not block arrows.
     assert plan_console_events([_key(0x0D, False, "\r"), _key(0x10, True), _key(down, True)]) == (["down"], 3)
     assert plan_console_events([_key(0x10, True, "A")]) == ([], 0)

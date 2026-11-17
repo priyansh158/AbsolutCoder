@@ -164,15 +164,17 @@ def plan_console_events(events: Sequence[ConsoleEvent]) -> tuple[list[str], int]
 
     Taken: arrow keys (reported on key-down), key-up records (prompt_toolkit
     ignores them, and the Enter that submitted the prompt leaves one behind),
-    a modifier pressed alone, and focus and menu records. The first record of
-    anything else (a typed character such as ``à``, Enter, a mouse or window
-    event) stops the plan: it and everything after it stay for the next prompt.
+    a modifier pressed alone, and focus, menu and window-size records
+    (prompt_toolkit reads the size itself and ignores those records; Windows
+    Terminal sends them when the window is resized). The first record of
+    anything else (a typed character such as ``à``, Enter, a mouse event) stops
+    the plan: it and everything after it stay for the next prompt.
     """
 
     keys: list[str] = []
     taken = 0
     for event in events:
-        if event.event_type in (FOCUS_EVENT, MENU_EVENT):
+        if event.event_type in (FOCUS_EVENT, MENU_EVENT, WINDOW_BUFFER_SIZE_EVENT):
             taken += 1
             continue
         if event.event_type != KEY_EVENT:
