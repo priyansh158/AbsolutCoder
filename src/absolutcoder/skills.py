@@ -43,6 +43,7 @@ class SkillInfo:
     description: str
     scope: str  # "global" | "project"
     folder: Path
+    kept_always: bool = False  # set by install_skill: an existing always.md was carried over
 
 
 def global_skills_dir() -> Path:
@@ -163,7 +164,8 @@ def skill_sources(repo: Path) -> list[tuple[str, str]]:
     """deepagents skill sources, global first so the project wins on a shared name."""
 
     sources: list[tuple[str, str]] = []
-    if global_skills_dir().is_dir():
+    # A global folder with no valid skill in it is treated as absent.
+    if _skills_in(global_skills_dir(), "global"):
         sources.append((GLOBAL_ROUTE, "Global"))
     if _project_skills_dir(repo).is_dir():
         sources.append((PROJECT_SOURCE, "Project"))
@@ -197,7 +199,7 @@ def always_text(repo: Path) -> str:
         text = _read_always(skill.folder)
         if text is None:
             continue
-        text = text.strip()
+        text = text.replace("<skill-dir>", skill.folder.as_posix()).strip()
         if len(text) > ALWAYS_LIMIT:
             text = text[:ALWAYS_LIMIT] + "\n[truncated]"
         blocks.append(f"## Always-on rules from the {skill.folder.name} skill\n{text}")
@@ -205,20 +207,26 @@ def always_text(repo: Path) -> str:
 
 
 def skill_paths_note(repo: Path) -> str:
-    """Where the skill folders are on disk, so a skill's scripts run with real paths."""
+    """Where the skill folders are: the path file tools use, and the folder on disk for shell commands."""
 
-    parts: list[str] = []
+    virtual: list[str] = []
+    on_disk: list[str] = []
     for path, _label in skill_sources(repo):
         if path == GLOBAL_ROUTE:
-            parts.append(f"global skills are in {global_skills_dir().as_posix()}/<name>")
+            virtual.append(f"{GLOBAL_ROUTE}<name>/… (global)")
+            on_disk.append(f"{global_skills_dir().as_posix()}/<name> (global)")
         else:
-            parts.append(f"project skills are in {_project_skills_dir(repo).as_posix()}/<name>")
-    if not parts:
+            virtual.append(f"{PROJECT_SOURCE}<name>/… (project)")
+            on_disk.append(f"{_project_skills_dir(repo).as_posix()}/<name> (project)")
+    if not virtual:
         return ""
     return (
-        "Skill folders on disk: "
-        + "; ".join(parts)
-        + ". Where a skill's text says <skill-dir>, use that folder, and run a skill's scripts with those real paths."
+        "Skill folders: read a skill's files with the file tools at "
+        + " or ".join(virtual)
+        + ". In shell commands use the folder on disk: "
+        + " or ".join(on_disk)
+        + ". Where a skill's text says <skill-dir>, use the first form for file tools and the "
+        "second for shell commands."
     )
 
 
@@ -256,6 +264,8 @@ def install_skill(source: Path) -> SkillInfo:
 
     The copy is made in a staging folder outside the skills folder and swapped
     in only when complete; a failed install leaves the previous copy in place.
+    When the previous copy has an ``always.md`` (perhaps written by hand) and
+    ``source`` has none, it is carried into the new copy and ``kept_always`` is set.
     """
 
     source = Path(source)
@@ -281,6 +291,7 @@ def install_skill(source: Path) -> SkillInfo:
             if leftover.exists():
                 shutil.rmtree(leftover)
         shutil.copytree(source, staging, ignore=_ignore)
+        kept_always = _carry_always(destination, staging)
         destination.parent.mkdir(parents=True, exist_ok=True)
         had_old = destination.exists()
         if had_old:
@@ -293,7 +304,23 @@ def install_skill(source: Path) -> SkillInfo:
             raise
     finally:
         shutil.rmtree(incoming, ignore_errors=True)
-    return SkillInfo(name=name, description=data["description"], scope="global", folder=destination)
+    return SkillInfo(
+        name=name,
+        description=data["description"],
+        scope="global",
+        folder=destination,
+        kept_always=kept_always,
+    )
+
+
+def _carry_always(destination: Path, staging: Path) -> bool:
+    """Copy the installed copy's plain ``always.md`` into ``staging`` when the new copy has none."""
+
+    old = destination / "always.md"
+    if (staging / "always.md").exists() or not _plain_child(old, destination) or not old.is_file():
+        return False
+    shutil.copy2(old, staging / "always.md")
+    return True
 
 
 def remove_skill(name: str) -> bool:

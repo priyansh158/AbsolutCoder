@@ -1512,7 +1512,7 @@ def test_help_lists_tasks_command(tmp_path):
     repl, output = _plain_repl(tmp_path)
     try:
         repl.handle_line("/nope")
-        assert "/tasks" in output.getvalue().splitlines()[-1]
+        assert "/tasks" in output.getvalue().splitlines()[-2]
     finally:
         repl.close()
 
@@ -1990,8 +1990,77 @@ def test_unknown_slash_is_not_a_skill(tmp_path):
 
     repl, output = _skill_repl(tmp_path, responder)
     repl.handle_line("/nonexistent do x")
-    assert _lines(output)[-1].startswith("Commands:")
+    assert _lines(output)[-2].startswith("Commands:")
+    assert _lines(output)[-1] == _SKILL_COMMAND_LINE
     assert turns == []
+
+
+_SKILL_COMMAND_LINE = "/<skill-name> <request> runs a request with that skill's full instructions."
+
+
+def test_skills_add_and_remove_report_os_errors(tmp_path, monkeypatch):
+    import absolutcoder.repl as repl_module
+
+    def locked(*_args, **_kwargs):
+        raise PermissionError(13, "Access is denied", "C:/skills/demo")
+
+    turns: list[int] = []
+
+    def responder(messages):
+        turns.append(1)
+        return AIMessage(content="still here")
+
+    repl, output = _skill_repl(tmp_path, responder)
+    rebuilds: list[int] = []
+    monkeypatch.setattr(repl, "_rebuild_after_skill_change", lambda: rebuilds.append(1))
+    monkeypatch.setattr(repl_module, "install_skill", locked)
+    monkeypatch.setattr(repl_module, "remove_skill", locked)
+    source = _write_skill(tmp_path / "outside" / "demo")
+    repl.handle_line(f"/skills add {source}")
+    repl.handle_line("/skills remove demo")
+    lines = _lines(output)
+    error = str(PermissionError(13, "Access is denied", "C:/skills/demo"))
+    assert f"Could not add skill: {error}" in lines
+    assert f"Could not remove skill: {error}" in lines
+    assert "Traceback" not in output.getvalue()
+    assert rebuilds == []
+    repl.handle_line("a turn after the errors")
+    assert turns == [1]
+    assert "still here" in _lines(output)
+
+
+def test_skills_add_says_when_it_kept_the_always_file(tmp_path):
+    from absolutcoder.skills import global_skills_dir
+
+    repl, output = _plain_repl(tmp_path)
+    source = _write_skill(tmp_path / "outside" / "demo")
+    installed = f"Installed demo into {global_skills_dir()} (global: loads in every project)."
+    repl.handle_line(f"/skills add {source}")
+    assert _lines(output)[-1] == installed
+    (global_skills_dir() / "demo" / "always.md").write_text("My rule.", encoding="utf-8")
+    repl.handle_line(f"/skills add {source}")
+    assert installed + " Kept the existing always.md." in _lines(output)
+    assert (global_skills_dir() / "demo" / "always.md").read_text(encoding="utf-8") == "My rule."
+
+
+def test_project_skill_slash_says_whose_skill_it_is(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    seen: list[str] = []
+
+    def responder(messages):
+        seen.append(_flatten(messages))
+        return AIMessage(content="ok")
+
+    repl, output = _skill_repl(tmp_path, responder)
+    _write_skill(tmp_path / "repo" / ".absolutcoder" / "skills" / "local", "local", "PROJECT-BODY")
+    _global_skill("shared", "GLOBAL-BODY")
+    repl.handle_line("/local do it")
+    lines = _lines(output)
+    assert "Using the project's local skill." in lines
+    assert lines.index("Using the project's local skill.") < lines.index("ok")
+    assert "PROJECT-BODY" in seen[-1]
+    repl.handle_line("/shared do it")
+    assert not any("Using the project's shared" in line for line in _lines(output))
 
 
 def test_one_shot_prompt_says_nobody_can_answer(tmp_path, monkeypatch):
@@ -2732,7 +2801,8 @@ def test_help_command_lists_commands(tmp_path):
     lines = _lines(output)
     start = next(i for i, line in enumerate(lines) if line.startswith("Commands:"))
     assert "/help" in lines[start]
-    described = lines[start + 1 :]
+    assert lines[-1] == _SKILL_COMMAND_LINE
+    described = lines[start + 1 : -1]
     for command in ("/model", "/skills", "/map", "/tasks", "/help"):
         assert any(line.split()[:1] == [command] and len(line.split()) > 1 for line in described), command
     order = [line.split()[0] for line in described]

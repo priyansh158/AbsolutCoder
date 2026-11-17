@@ -56,6 +56,7 @@ _HELP = (
     ("/exit", "leave"),
     ("/quit", "leave"),
 )
+_SKILL_COMMAND_LINE = "/<skill-name> <request> runs a request with that skill's full instructions."
 _SKILLS_ADD_USAGE = "Usage: /skills add <folder>"
 _SKILLS_REMOVE_USAGE = "Usage: /skills remove <name>"
 _SKILLS_USAGE = "Usage: /skills [add <folder> | remove <name>]"
@@ -758,15 +759,19 @@ class Repl:
             if not body:
                 self._say(f"Could not load the {name} skill.")
                 return
+            if skill.scope == "project":
+                self._say(f"Using the project's {name} skill.")
             block = f"[Instructions of the {name} skill, loaded because the user typed /{name}]\n{body}"
             self.run_task(argument, skill_block=block)
             return
         self.console.print(_COMMANDS)
+        self._say(_SKILL_COMMAND_LINE)
 
     def _help(self) -> None:
         self._say(_COMMANDS)
         for name, description in _HELP:
             self._say(f"  {name:<10} {description}")
+        self._say(_SKILL_COMMAND_LINE)
 
     def _skills_command(self, argument: str) -> None:
         action, _, rest = argument.partition(" ")
@@ -779,10 +784,13 @@ class Repl:
                 return
             try:
                 info = install_skill(Path(rest).expanduser())
-            except ValueError as error:
+            except (ValueError, OSError) as error:  # OSError: a locked file or open folder
                 self._say(f"Could not add skill: {error}")
                 return
-            self._say(f"Installed {info.name} into {global_skills_dir()} (global: loads in every project).")
+            kept = " Kept the existing always.md." if info.kept_always else ""
+            self._say(
+                f"Installed {info.name} into {global_skills_dir()} (global: loads in every project).{kept}"
+            )
             self._rebuild_after_skill_change()
             return
         if action == "remove":
@@ -791,7 +799,7 @@ class Repl:
                 return
             try:
                 removed = remove_skill(rest)
-            except ValueError as error:
+            except (ValueError, OSError) as error:
                 self._say(f"Could not remove skill: {error}")
                 return
             if not removed:

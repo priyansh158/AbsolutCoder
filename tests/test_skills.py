@@ -76,7 +76,7 @@ def test_skill_sources_order_and_absence(repo):
     assert skill_sources(repo) == []
     _project_dir(repo).mkdir(parents=True)
     assert skill_sources(repo) == [(PROJECT_SOURCE, "Project")]
-    global_skills_dir().mkdir(parents=True)
+    _skill(global_skills_dir(), "alpha")
     assert skill_sources(repo) == [(GLOBAL_ROUTE, "Global"), (PROJECT_SOURCE, "Project")]
     _project_dir(repo).rmdir()
     assert skill_sources(repo) == [(GLOBAL_ROUTE, "Global")]
@@ -115,24 +115,96 @@ def test_always_text_survives_a_project_override(repo):
     assert always_text(repo) == "## Always-on rules from the shared skill\nGlobal rule."
 
 
-def test_skill_dir_note_names_real_folders(repo):
-    assert skill_paths_note(repo) == ""
+def test_empty_global_folder_is_treated_as_absent(repo):
     global_skills_dir().mkdir(parents=True)
+    assert skill_sources(repo) == []
+    assert skill_paths_note(repo) == ""
+    (global_skills_dir() / "broken").mkdir()
+    (global_skills_dir() / "broken" / "SKILL.md").write_text("# no frontmatter\n", encoding="utf-8")
+    assert skill_sources(repo) == []
+    _skill(global_skills_dir(), "alpha")
+    assert skill_sources(repo) == [(GLOBAL_ROUTE, "Global")]
+
+
+def test_skill_dir_note_names_virtual_and_real_folders(repo):
+    assert skill_paths_note(repo) == ""
+    _skill(global_skills_dir(), "alpha")
     _project_dir(repo).mkdir(parents=True)
     note = skill_paths_note(repo)
     global_dir = global_skills_dir().as_posix()
     project_dir = repo.as_posix() + "/.absolutcoder/skills"
     assert note == (
-        f"Skill folders on disk: global skills are in {global_dir}/<name>; "
-        f"project skills are in {project_dir}/<name>. Where a skill's text says <skill-dir>, "
-        "use that folder, and run a skill's scripts with those real paths."
+        "Skill folders: read a skill's files with the file tools at "
+        "/.absolutcoder-global/skills/<name>/… (global) or /.absolutcoder/skills/<name>/… (project). "
+        f"In shell commands use the folder on disk: {global_dir}/<name> (global) or "
+        f"{project_dir}/<name> (project). Where a skill's text says <skill-dir>, use the first "
+        "form for file tools and the second for shell commands."
     )
     assert "\\" not in note
     _project_dir(repo).rmdir()
     assert skill_paths_note(repo) == (
-        f"Skill folders on disk: global skills are in {global_dir}/<name>. Where a skill's "
-        "text says <skill-dir>, use that folder, and run a skill's scripts with those real paths."
+        "Skill folders: read a skill's files with the file tools at "
+        "/.absolutcoder-global/skills/<name>/… (global). "
+        f"In shell commands use the folder on disk: {global_dir}/<name> (global). Where a "
+        "skill's text says <skill-dir>, use the first form for file tools and the second for "
+        "shell commands."
     )
+    remove_skill("alpha")
+    _project_dir(repo).mkdir(parents=True)
+    assert skill_paths_note(repo) == (
+        "Skill folders: read a skill's files with the file tools at "
+        "/.absolutcoder/skills/<name>/… (project). "
+        f"In shell commands use the folder on disk: {project_dir}/<name> (project). Where a "
+        "skill's text says <skill-dir>, use the first form for file tools and the second for "
+        "shell commands."
+    )
+
+
+def test_always_text_replaces_skill_dir_with_the_folder_on_disk(repo):
+    folder = _skill(global_skills_dir(), "demo")
+    (folder / "always.md").write_text(
+        "Run node <skill-dir>/scripts/a.mjs, then read <skill-dir>/b.md.", encoding="utf-8"
+    )
+    real = folder.as_posix()
+    assert "\\" not in real
+    assert always_text(repo) == (
+        f"## Always-on rules from the demo skill\nRun node {real}/scripts/a.mjs, then read {real}/b.md."
+    )
+
+
+def test_skill_dir_is_replaced_before_the_cap(repo):
+    folder = _skill(global_skills_dir(), "demo")
+    (folder / "always.md").write_text("<skill-dir>" + "x" * (ALWAYS_LIMIT - 11), encoding="utf-8")
+    text = always_text(repo).split("\n", 1)[1]
+    assert text.startswith(folder.as_posix())
+    assert text.endswith("\n[truncated]")
+    assert len(text) == ALWAYS_LIMIT + len("\n[truncated]")
+
+
+def test_reinstall_keeps_a_hand_written_always_file(tmp_path):
+    source = _skill(tmp_path / "src", "demo", "First version.")
+    info = install_skill(source)
+    assert info.kept_always is False
+    target = global_skills_dir() / "demo"
+    (target / "always.md").write_text("My own rule.", encoding="utf-8")
+    (source / "SKILL.md").write_text(
+        "---\nname: demo\ndescription: Second version.\n---\nnew\n", encoding="utf-8"
+    )
+    info = install_skill(source)
+    assert info.kept_always is True
+    assert (info.name, info.description, info.scope, info.folder) == (
+        "demo",
+        "Second version.",
+        "global",
+        target,
+    )
+    assert (target / "always.md").read_text(encoding="utf-8") == "My own rule."
+    assert "new" in (target / "SKILL.md").read_text(encoding="utf-8")
+
+    (source / "always.md").write_text("Shipped rule.", encoding="utf-8")
+    info = install_skill(source)  # the source's own always.md wins
+    assert info.kept_always is False
+    assert (target / "always.md").read_text(encoding="utf-8") == "Shipped rule."
 
 
 def test_install_skill_copies_and_validates(tmp_path):
@@ -194,7 +266,7 @@ def test_hostile_yaml_is_skipped_without_raising(repo, frontmatter):
     assert [s.name for s in list_skills(repo)] == ["good"]
     assert "HOSTILE RULE" not in always_text(repo)
     assert skill_sources(repo) == [(GLOBAL_ROUTE, "Global")]
-    assert skill_paths_note(repo).startswith("Skill folders on disk: ")
+    assert skill_paths_note(repo).startswith("Skill folders: ")
 
 
 def test_failed_install_keeps_the_previous_copy(tmp_path, monkeypatch):

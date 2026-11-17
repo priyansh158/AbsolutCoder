@@ -724,10 +724,10 @@ def test_always_text_reaches_main_and_editing_roles_only(tmp_path):
     block = "## Always-on rules from the demo skill\nALWAYS RULE ONE"
     assert block in texts["main"]
     assert block in texts["general-purpose"]
-    assert "Skill folders on disk" in texts["general-purpose"]
+    assert "Skill folders: read a skill's files" in texts["general-purpose"]
     for role in ("explore", "plan", "web-researcher"):
         assert "ALWAYS RULE ONE" not in texts[role], role
-        assert "Skill folders on disk" not in texts[role], role
+        assert "Skill folders: read a skill's files" not in texts[role], role
 
 
 def test_editing_worker_sees_skills(tmp_path):
@@ -748,7 +748,7 @@ def test_no_skills_means_no_route_and_no_text(tmp_path):
     for role, text in texts.items():
         assert "Skills System" not in text, role
         assert "Always-on rules" not in text, role
-        assert "Skill folders on disk" not in text, role
+        assert "Skill folders: read a skill's files" not in text, role
     assert UNTRUSTED_PARAGRAPH in texts["main"]
 
 
