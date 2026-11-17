@@ -547,3 +547,277 @@ def test_ctrl_c_in_collapsed_mode_prints_summary_then_interrupted(tmp_path, monk
     assert keys.events == ["start", "stop"]
     assert lines[-1] == "interrupted"
     assert lines[-2].startswith("⏺ Cooked for ")
+
+
+# --- fix round 1 -------------------------------------------------------------------
+
+
+def _chunk(text, message_id="m1"):
+    from langchain_core.messages import AIMessageChunk
+
+    message = AIMessageChunk(content=text, id=message_id)
+    return {"type": "messages", "ns": (), "data": (message, {"langgraph_node": "model"})}
+
+
+class StopInterrupted(FakeKeys):
+    """A listener whose first stop() is cut short by Ctrl+C (inside its join)."""
+
+    def __init__(self):
+        super().__init__()
+        self.raised = False
+
+    def stop(self):
+        super().stop()
+        if not self.raised:
+            self.raised = True
+            raise KeyboardInterrupt
+
+
+def test_ctrl_c_while_the_listener_stops_still_stops_the_live_region():
+    console, output = _terminal()
+    keys = StopInterrupted()
+    renderer = StreamRenderer(console, clock=FakeClock())
+    assert renderer.start(activity="collapsed", key_listener=keys)
+    region = renderer._live_region
+    assert region.is_started
+    with pytest.raises(KeyboardInterrupt):
+        renderer.finish(_snapshot())
+    assert not region.is_started  # stopped in spite of the interrupt
+    assert region._refresh_thread is None
+    renderer.interrupted()  # today's interrupt path afterwards: summary, then "interrupted"
+    assert _printed(output)[-2:] == ["⏺ Cooked for 0s", "interrupted"]
+
+
+def test_live_region_is_kept_for_a_retry_when_its_own_stop_is_interrupted():
+    renderer, _output, _keys = _collapsed()
+    region = renderer._live_region
+    real_stop = type(region).stop
+    calls = {"n": 0}
+
+    def flaky_stop():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise KeyboardInterrupt
+        real_stop(region)
+
+    region.stop = flaky_stop
+    with pytest.raises(KeyboardInterrupt):
+        renderer.stop_view()
+    assert renderer._live_region is region  # not forgotten: the next stop finds it
+    renderer.stop_view()
+    assert renderer._live_region is None and not region.is_started
+
+
+def test_collapsed_partial_text_is_printed_once_on_interrupt():
+    renderer, output, _keys = _collapsed()
+    for piece in ("Half an ", "answer"):
+        renderer.feed(_chunk(piece))
+    assert "Half an answer" not in _printed(output)  # nothing streamed while collapsed
+    renderer.interrupted()
+    assert _printed(output) == ["⏺ Cooked for 0s", "Half an answer", "interrupted"]
+
+
+def test_collapsed_partial_text_is_printed_on_a_stream_error():
+    renderer, output, _keys = _collapsed()
+    renderer.feed(_chunk("cut off"))
+    renderer.abort()
+    assert _printed(output) == ["⏺ Cooked for 0s", "cut off"]
+
+
+def test_collapsed_completed_message_prints_its_text_once():
+    renderer, output, _keys = _collapsed()
+    for piece in ("Whole ", "answer"):
+        renderer.feed(_chunk(piece, "m1"))
+    renderer.feed(_upd("model", [AIMessage(content="Whole answer", id="final-id")]))
+    renderer.interrupted()
+    assert _printed(output).count("Whole answer") == 1
+
+
+def test_a_repeated_drawing_error_is_recorded_once():
+    renderer, _output, _keys = _collapsed()
+
+    def broken(width):
+        raise ValueError("bad draw")
+
+    renderer._status_lines = broken
+    for _ in range(50):
+        renderer.status_lines(80)
+    renderer.stop_view()
+    assert len(renderer.errors) == 1
+
+
+def test_a_start_time_of_zero_counts():
+    clock = FakeClock(0.0)
+    renderer, output, _keys = _collapsed(clock=clock)
+    clock.now = 75.0
+    renderer.finish(_snapshot())
+    assert "⏺ Cooked for 1m 15s" in _printed(output)
+
+
+class FakeMsvcrt:
+    """Characters waiting in the console; getwch on an empty queue would block for ever."""
+
+    def __init__(self, chars):
+        self.chars = list(chars)
+
+    def kbhit(self):
+        return bool(self.chars)
+
+    def getwch(self):
+        if not self.chars:
+            raise AssertionError("getwch would block: no key is waiting")
+        return self.chars.pop(0)
+
+
+def test_windows_reader_handles_a_lone_prefix_character():
+    from absolutcoder.keys import read_windows_keys
+
+    assert read_windows_keys(FakeMsvcrt("à")) == []  # a typed à: no wait for a second character
+    assert read_windows_keys(FakeMsvcrt("\xe0P")) == ["down"]
+    assert read_windows_keys(FakeMsvcrt("\x00H")) == ["up"]
+    assert read_windows_keys(FakeMsvcrt("q")) == []
+    queue = FakeMsvcrt("\xe0Ka")
+    assert read_windows_keys(queue) == ["left"]
+    assert queue.chars == ["a"]
+
+
+def test_windows_listener_thread_reads_through_an_injected_console():
+    import threading
+
+    from absolutcoder.keys import WindowsKeys
+
+    class OneByOne(FakeMsvcrt):
+        """à arrives alone; the arrow's two halves arrive together a moment later."""
+
+        def __init__(self):
+            super().__init__("")
+            self.batches = [["à"], ["\xe0", "M"]]
+            self.gap = False  # one empty poll between batches: the next key comes later
+
+        def kbhit(self):
+            if not self.chars and self.batches:
+                if self.gap:
+                    self.gap = False
+                    return False
+                self.chars = self.batches.pop(0)
+                self.gap = True
+            return bool(self.chars)
+
+    got: list[str] = []
+    seen = threading.Event()
+    listener = WindowsKeys(msvcrt=OneByOne())
+
+    def on_key(key):
+        got.append(key)
+        seen.set()
+
+    listener.start(on_key)
+    assert seen.wait(2)
+    listener.stop()
+    assert got == ["right"]
+    assert listener._thread is None
+
+
+def test_posix_listener_only_in_the_foreground(monkeypatch):
+    import absolutcoder.keys as keys_module
+
+    class TTY:
+        def isatty(self):
+            return True
+
+        def fileno(self):
+            return 0
+
+    made = []
+
+    class StubPosix:
+        def __init__(self):
+            made.append(self)
+
+    monkeypatch.setattr(keys_module.sys, "stdin", TTY())
+    monkeypatch.setattr(keys_module.sys, "platform", "linux")
+    monkeypatch.setattr(keys_module, "PosixKeys", StubPosix)
+    monkeypatch.setattr(keys_module.os, "getpgrp", lambda: 42, raising=False)
+    monkeypatch.setattr(keys_module.os, "tcgetpgrp", lambda fd: 42, raising=False)
+    assert isinstance(keys_module.default_key_listener(), StubPosix)
+    monkeypatch.setattr(keys_module.os, "tcgetpgrp", lambda fd: 7, raising=False)  # `absolut ... &`
+    assert isinstance(keys_module.default_key_listener(), NoKeys)
+
+    def no_terminal(fd):
+        raise OSError("not a terminal")
+
+    monkeypatch.setattr(keys_module.os, "tcgetpgrp", no_terminal, raising=False)
+    assert isinstance(keys_module.default_key_listener(), NoKeys)
+    assert len(made) == 1
+
+
+def test_hitl_rejection_from_after_model_still_prints():
+    console, output = _plain_console()
+    renderer = StreamRenderer(console, live=False)
+    renderer.feed(_upd("model", [_call("execute", {"command": "rm -rf x"}, "c1")]))
+    rejected = ToolMessage(content="User rejected the command.", tool_call_id="c1", name="execute", id="r1", status="error")
+    renderer.feed(_upd("HumanInTheLoopMiddleware.after_model", [rejected]))
+    assert "  error: execute: User rejected the command." in _text(output).splitlines()
+
+
+def test_a_trimmed_result_is_never_a_result_line_whatever_node_sends_it():
+    from absolutcoder.history import IMAGES_TRIMMED_KEY
+
+    console, output = _plain_console()
+    renderer = StreamRenderer(console, live=False)
+    trimmed = ToolMessage(
+        content=[{"type": "text", "text": "[image ...]"}], tool_call_id="old", name="read_file", id="t-old",
+        additional_kwargs={IMAGES_TRIMMED_KEY: True},
+    )
+    renderer.feed(_upd("SeenImagesMiddleware.before_model", [trimmed]))
+    renderer.feed(_upd("some.other_node", [trimmed]))
+    assert output.getvalue() == "" and renderer.call_log == []
+
+
+def test_trimmed_image_is_not_new_activity_in_the_next_turn(tmp_path):
+    import base64
+
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from absolutcoder.agent import build_agent
+
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+    )
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "shot.png").write_bytes(png)
+
+    def respond(messages):
+        humans = [m for m in messages if getattr(m, "type", None) == "human"]
+        if len(humans) == 1 and "read_file" not in tool_names_since_last_human(messages):
+            return tool_call("read_file", {"file_path": "/shot.png"}, "read-1")
+        return AIMessage(content=f"answer {len(humans)}")
+
+    agent = build_agent(
+        repo,
+        Config(main_model="openai:main-test", subagent_model="openai:worker-test", auto_run=True),
+        InMemorySaver(),
+        chat_model=scripted_model(respond),
+        model_factory=role_models({}, default=scripted_model(lambda _m: AIMessage(content="ok"))),
+    )
+    config = {"configurable": {"thread_id": "two-turns"}}
+    renderers = []
+    for text in ("look at the screenshot", "and now?"):
+        console, output = _plain_console()
+        renderer = StreamRenderer(console, live=False)
+        for part in agent.stream(
+            {"messages": [{"role": "user", "content": text}]},
+            config,
+            stream_mode=["messages", "updates"],
+            subgraphs=True,
+            version="v2",
+        ):
+            renderer.feed(part)
+        renderer.finish(agent.get_state(config))
+        renderers.append((renderer, output))
+    first, second = renderers
+    assert first[0].call_log == ["  tool: read_file(/shot.png)", "  done: read_file"]
+    assert second[0].call_log == []
+    assert _text(second[1]).splitlines() == ["answer 2"]
+    assert second[0].errors == []

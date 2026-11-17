@@ -315,10 +315,13 @@ summary such as `⏺ Cooked for 1m 12s · 14 calls · /calls to see them`, and
 `/calls` prints every call of that turn. Set `"activity": "full"` to print each
 call as it happens; piped output always does.
 
-Screenshots and other images the model reads stay in the conversation only
-until the model has seen them. After that each one is replaced by a short note
-(the model can read the file again), which keeps the session file small and
-saves tokens on every later request.
+Screenshots and other images the model reads with `read_file` (or that another
+tool returns) stay in the conversation only until the model has seen them.
+After that each one is replaced by a short note (the model can read the file
+again), which keeps the session file small and saves tokens on every later
+request. Images you attach to a message, and video frames, are kept as they
+are. Replacing an image changes an earlier message once, so that one request
+misses the prompt cache.
 
 ## Check loop
 

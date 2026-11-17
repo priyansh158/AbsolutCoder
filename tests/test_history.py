@@ -9,6 +9,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from absolutcoder.agent import build_agent, build_role_graph
 from absolutcoder.config import Config
 from absolutcoder.history import (
+    IMAGES_TRIMMED_KEY,
     PLACEHOLDER,
     SeenImagesMiddleware,
     is_image_block,
@@ -95,6 +96,7 @@ def test_text_and_other_blocks_are_kept_and_metadata_survives():
     assert (trimmed.id, trimmed.tool_call_id, trimmed.name, trimmed.status) == (
         "tool-msg-1", "call-1", "screenshot", "success"
     )
+    assert trimmed.additional_kwargs == {"read_file_path": "/shots/a.png", IMAGES_TRIMMED_KEY: True}
     unnamed = ToolMessage(content=[{"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}}], tool_call_id="c", name="snap", id="t")
     assert without_images(unnamed).content == [{"type": "text", "text": _note("snap")}]
     assert without_images(ToolMessage(content="text only", tool_call_id="c", id="t")) is None

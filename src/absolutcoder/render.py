@@ -18,10 +18,12 @@ from langchain_core.messages import AIMessage, RemoveMessage, ToolMessage
 from rich.console import Console
 from rich.text import Text
 
+from absolutcoder.history import IMAGES_TRIMMED_KEY
 from absolutcoder.keys import KeyListener, default_key_listener
 from absolutcoder.prompting import ACCENT
 
 ACTIVITY_MODES = ("collapsed", "full")
+_TRIMMED_IMAGES_NODE = "SeenImagesMiddleware."  # history.SeenImagesMiddleware's graph nodes
 COOK_LABEL = "Lemme cook…"
 SHOW_HINT = "↓ show calls"
 HIDE_HINT = "↑ hide calls"
@@ -201,6 +203,8 @@ class StreamRenderer:
         self._call_count = 0
         self._error_count = 0
         self._pending_error: Exception | None = None  # raised while drawing, shown later
+        self._drawing_failed = False
+        self._unshown_text = ""  # main text streamed while collapsed, not on screen yet
         self._spinner = None
         self.errors: list[Exception] = []
         self.tools_used: set[str] = set()  # names of the tools called this turn, main loop and workers
@@ -286,9 +290,17 @@ class StreamRenderer:
         self._collapsed = False
 
     def abort(self) -> None:
-        """The turn stopped on an error: end the view and any open line, then the summary."""
+        """The turn stopped on an error: end the view and any open line, the summary, then cut-off text."""
 
         self._end_view()
+        self._show_unshown_text()
+
+    def _show_unshown_text(self) -> None:
+        """Print main text that streamed while collapsed but whose message never completed."""
+
+        text, self._unshown_text = self._unshown_text.strip(), ""
+        if text:
+            self._print_text(None, text)
 
     def status_lines(self, width: int | None = None) -> list[Text]:
         """The live region's lines: the status line, then the newest log lines when expanded."""
@@ -340,8 +352,8 @@ class StreamRenderer:
             return
         with self._view_lock:
             region = self._live_region
-            if region is None:
-                return
+            if region is None or not region.is_started:
+                return  # a refresh after stop() would draw the region again, for good
             try:
                 region.refresh()
             except Exception as error:  # noqa: BLE001 - drawing must never break a turn
@@ -381,22 +393,32 @@ class StreamRenderer:
             return True
 
     def _close_view(self) -> None:
-        """Stop the key listener, then the live region (which erases itself). Never raises."""
+        """Stop the key listener, then the live region (which erases itself).
+
+        Ordinary errors are recorded, never raised. Ctrl+C while the listener
+        stops still stops the region before it propagates, and the region is
+        forgotten only once its own stop() has finished, so a later call can
+        stop it if that was interrupted too.
+        """
 
         with self._view_lock:
-            region, self._live_region = self._live_region, None
             keys = self._keys if self._keys_running else None
             self._keys_running = False
-        if keys is not None:
-            try:
-                keys.stop()
-            except Exception as error:  # noqa: BLE001
-                self._record_later(error)
-        if region is not None:
-            try:
-                region.stop()
-            except Exception as error:  # noqa: BLE001
-                self._record_later(error)
+        try:
+            if keys is not None:
+                try:
+                    keys.stop()
+                except Exception as error:  # noqa: BLE001
+                    self._record_later(error)
+        finally:
+            with self._view_lock:  # no key refresh can run between stop() and forgetting it
+                region = self._live_region
+                if region is not None:
+                    try:
+                        region.stop()
+                    except Exception as error:  # noqa: BLE001
+                        self._record_later(error)
+                    self._live_region = None
 
     def _end_view(self) -> None:
         """Stop the view, end any open line, and print the summary once if the view was used."""
@@ -407,7 +429,8 @@ class StreamRenderer:
         if not self._cooking or self._summary_shown:
             return
         self._summary_shown = True
-        elapsed = self._clock() - (self._started_at or self._clock())
+        now = self._clock()
+        elapsed = now - (now if self._started_at is None else self._started_at)
         text = f"{SUMMARY_MARK} Cooked for {format_elapsed(elapsed)}"
         if self._call_count:
             text += f" · {_count(self._call_count, 'call')} · {CALLS_HINT}"
@@ -416,6 +439,9 @@ class StreamRenderer:
     def _record_later(self, error: Exception) -> None:
         """Record an error raised while drawing; its line is printed from the main thread."""
 
+        if self._drawing_failed:
+            return  # the same error on every refresh: one record is enough
+        self._drawing_failed = True
         self.errors.append(error)
         if len(self.errors) == 1:
             self._pending_error = error
@@ -450,6 +476,7 @@ class StreamRenderer:
 
     def finish(self, snapshot) -> None:
         self._end_view()
+        self._unshown_text = ""  # every message completed; the snapshot below has the answer
         values = getattr(snapshot, "values", None)
         messages = values.get("messages", []) if isinstance(values, dict) else []
         for message in reversed(messages or []):
@@ -467,6 +494,7 @@ class StreamRenderer:
 
     def interrupted(self) -> None:
         self._end_view()
+        self._show_unshown_text()
         self._print("interrupted")
         self._print_usage()
 
@@ -492,10 +520,16 @@ class StreamRenderer:
             if isinstance(name, str) and name:
                 self._labels[ns] = name
             return  # worker text is never streamed
-        if not self.live or self._collapsed or metadata.get("langgraph_node") != MODEL_NODE:
-            # The collapsed view prints whole messages only: a partial line would break it.
+        if metadata.get("langgraph_node") != MODEL_NODE:
             return
         if metadata.get("lc_source") == "summarization" or not isinstance(message, AIMessage):
+            return
+        if self._collapsed:
+            # The collapsed view prints whole messages only (a partial line would break
+            # it); the text is kept so an interrupted message is not lost.
+            self._unshown_text += _chunk_text(message.content)
+            return
+        if not self.live:
             return
         text = _chunk_text(message.content)
         if not text:
@@ -517,6 +551,8 @@ class StreamRenderer:
             messages = output.get("messages")
             if not isinstance(messages, list):
                 messages = [messages] if messages is not None else []
+            if str(node).startswith(_TRIMMED_IMAGES_NODE):
+                continue  # earlier results with their images trimmed: history, not activity
             rewrite = any(isinstance(m, RemoveMessage) for m in messages)
             if rewrite and node != TOOLS_NODE:
                 continue  # a history replay (patching, summarisation), not new activity
@@ -542,6 +578,7 @@ class StreamRenderer:
             self._on_call(ns, call)
 
     def _on_main_text(self, message: AIMessage) -> None:
+        self._unshown_text = ""  # the completed message is shown (or already was) below
         text = message_text(message.content)
         shown = (
             (message.id and message.id in self._shown_ids)
@@ -630,6 +667,9 @@ class StreamRenderer:
             self._activity(f"  tool: {name}({summarize_call(name, args)})")
 
     def _on_result(self, ns: tuple, message: ToolMessage) -> None:
+        extra = message.additional_kwargs if isinstance(message.additional_kwargs, dict) else {}
+        if extra.get(IMAGES_TRIMMED_KEY):
+            return  # a result shown in an earlier call, rewritten without its images
         if message.id:
             if message.id in self._shown_results:
                 return

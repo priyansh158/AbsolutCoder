@@ -15,6 +15,7 @@ from typing import Any
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage, ToolMessage
 
+IMAGES_TRIMMED_KEY = "absolutcoder_images_trimmed"  # set on a replaced message; the display skips it
 PLACEHOLDER = "[image from {source} was shown to you earlier; read the file again to see it]"
 _IMAGE_TYPES = frozenset({"image", "image_url"})
 _DATA_KEYS = ("base64", "data")
@@ -71,7 +72,7 @@ def without_images(message: ToolMessage) -> ToolMessage | None:
         name=message.name,
         status=message.status,
         artifact=message.artifact,
-        additional_kwargs=dict(message.additional_kwargs or {}),
+        additional_kwargs={**(message.additional_kwargs or {}), IMAGES_TRIMMED_KEY: True},
         response_metadata=dict(message.response_metadata or {}),
     )
 

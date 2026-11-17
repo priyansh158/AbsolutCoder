@@ -157,12 +157,28 @@ class _ThreadListener:
     def _run(self, on_key: Callable[[str], None], stop: threading.Event) -> None: ...
 
 
+def read_windows_keys(msvcrt) -> list[str]:  # noqa: ANN001 - the msvcrt module or a stand-in
+    """Read one waiting key with ``getwch``; never waits for a key that is not there.
+
+    The arrow prefix ``"\\xe0"`` is also the character ``à``: the second half is
+    read only when it is already waiting, so a typed ``à`` is just a dropped key.
+    """
+
+    if not msvcrt.kbhit():
+        return []
+    char = msvcrt.getwch()
+    if char in _WINDOWS_PREFIXES and msvcrt.kbhit():
+        char += msvcrt.getwch()
+    return decode_windows(char)
+
+
 class WindowsKeys(_ThreadListener):
     """Poll ``msvcrt.kbhit`` every 50 ms; read with ``getwch`` (no echo)."""
 
-    def __init__(self) -> None:
+    def __init__(self, msvcrt=None) -> None:  # noqa: ANN001 - injectable for tests
         super().__init__()
-        import msvcrt  # noqa: PLC0415 - Windows only
+        if msvcrt is None:
+            import msvcrt  # noqa: PLC0415 - Windows only
 
         self._msvcrt = msvcrt
 
@@ -172,12 +188,10 @@ class WindowsKeys(_ThreadListener):
             if not msvcrt.kbhit():
                 stop.wait(POLL_SECONDS)
                 continue
-            char = msvcrt.getwch()
-            if char in _WINDOWS_PREFIXES:
-                char += msvcrt.getwch()
+            keys = read_windows_keys(msvcrt)
             if stop.is_set():
                 return
-            self._emit(on_key, decode_windows(char))
+            self._emit(on_key, keys)
 
 
 class PosixKeys(_ThreadListener):
@@ -229,6 +243,15 @@ class PosixKeys(_ThreadListener):
             self._emit(on_key, decoder.feed(data))
 
 
+def _in_foreground(fd: int) -> bool:
+    """Whether this process group owns the terminal ``fd``; False when that cannot be told."""
+
+    try:
+        return os.tcgetpgrp(fd) == os.getpgrp()
+    except (OSError, AttributeError):
+        return False
+
+
 def default_key_listener() -> KeyListener:
     """The listener for this platform; a no-op one without a keyboard to read."""
 
@@ -237,6 +260,8 @@ def default_key_listener() -> KeyListener:
             return NoKeys()
         if sys.platform == "win32":
             return WindowsKeys()
+        if not _in_foreground(sys.stdin.fileno()):
+            return NoKeys()  # a background job (`absolut ... &`) touching the tty would be stopped
         return PosixKeys()
     except Exception:  # noqa: BLE001 - an import error or an odd stdin: the view still works
         return NoKeys()
