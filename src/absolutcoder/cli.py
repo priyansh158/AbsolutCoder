@@ -11,6 +11,7 @@ In the terminal loop:
   /auto [on|off]    run commands without asking  /resume [N]     resume an earlier session
   /attach <path>    attach a file to the next message
   /agents           list the worker roles        /tasks          list background tasks
+  /calls            show every call of the last turn (while it works: down arrow shows them)
   /skills           list, add or remove global skills
   /<skill-name> <request>     run a request with that skill's instructions loaded
   /map [build|update|on|off]  code map of this repository

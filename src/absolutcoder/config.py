@@ -43,6 +43,7 @@ class Config:
     verify_timeout: int = 1800  # seconds the check command may run
     code_map: str = "auto"  # "auto" | "off"
     code_map_min_files: int = 20  # fewer code files than this: no code map
+    activity: str = "collapsed"  # "collapsed" (one status line while it works) | "full"
 
 
 _PROVIDER_FIELDS = {f.name for f in fields(ProviderSettings)}
@@ -54,6 +55,7 @@ _POSITIVE_INTS = (
     "code_map_min_files",
 )
 _CODE_MAP_MODES = ("auto", "off")
+_ACTIVITY_MODES = ("collapsed", "full")
 
 
 def load_config(path: Path | str) -> Config:
@@ -76,6 +78,9 @@ def load_config(path: Path | str) -> Config:
     code_map = payload.get("code_map", defaults.code_map)
     if code_map not in _CODE_MAP_MODES:
         raise ValueError("code_map must be 'auto' or 'off'")
+    activity = payload.get("activity", defaults.activity)
+    if activity not in _ACTIVITY_MODES:
+        raise ValueError("activity must be 'collapsed' or 'full'")
     providers: dict[str, ProviderSettings] = {}
     for name, value in (payload.get("providers") or {}).items():
         if not isinstance(value, dict):
@@ -92,6 +97,7 @@ def load_config(path: Path | str) -> Config:
         shell=payload.get("shell", defaults.shell),
         verify_command=payload.get("verify_command", defaults.verify_command),
         code_map=code_map,
+        activity=activity,
         **counts,
     )
 

@@ -22,6 +22,7 @@ from absolutcoder.attachments import build_user_content
 from absolutcoder.codemap import CodeMap
 from absolutcoder.config import Config, config_path, resolve_model, save_config
 from absolutcoder.git_policy import PolicyDenied, TurnFlags, protect_context_file
+from absolutcoder.keys import KeyListener
 from absolutcoder.loops import VerifyOutcome, parse_interval, run_interval_loop, run_until_verified
 from absolutcoder.models import ModelFactory, ProviderMissing, missing_keys
 from absolutcoder.prompting import MAIN_PROMPT, background_output, make_input_fn
@@ -46,7 +47,7 @@ from absolutcoder.skills import (
 from absolutcoder.tasks import TaskManager, TaskRecord, make_task_tools
 from absolutcoder.webtools import make_web_tools
 
-_COMMANDS = "Commands: /model, /subagent, /auto, /resume, /attach, /agents, /tasks, /skills, /map, /verify, /loop, /help, /exit, /quit"
+_COMMANDS = "Commands: /model, /subagent, /auto, /resume, /attach, /agents, /tasks, /calls, /skills, /map, /verify, /loop, /help, /exit, /quit"
 _HELP = (
     ("/model", "<id>  switch the main model"),
     ("/subagent", "<id>  switch the worker model"),
@@ -55,6 +56,7 @@ _HELP = (
     ("/attach", "<path>  attach a file to the next message"),
     ("/agents", "list the worker roles"),
     ("/tasks", "[show <id> | cancel <id>]  list or manage background tasks"),
+    ("/calls", "show every call of the last turn"),
     ("/skills", "[add <folder> | remove <name>]  list, add or remove global skills"),
     ("/map", "[build|update|on|off]  code map of this repository"),
     ("/verify", "<cmd|off>  check command run after every request"),
@@ -68,8 +70,8 @@ _SKILLS_ADD_USAGE = "Usage: /skills add <folder>"
 _SKILLS_REMOVE_USAGE = "Usage: /skills remove <name>"
 _SKILLS_USAGE = "Usage: /skills [add <folder> | remove <name>]"
 _BUILTIN_COMMANDS = frozenset(
-    {"/model", "/subagent", "/auto", "/resume", "/attach", "/agents", "/tasks", "/skills",
-     "/map", "/verify", "/loop", "/help", "/exit", "/quit"}
+    {"/model", "/subagent", "/auto", "/resume", "/attach", "/agents", "/tasks", "/calls",
+     "/skills", "/map", "/verify", "/loop", "/help", "/exit", "/quit"}
 )
 _MAP_USAGE = "Usage: /map [build|update|on|off]"
 _MAP_OFF_HINT = "map: off (use /map on)"
@@ -82,6 +84,7 @@ _CHANGING_TOOLS = frozenset({"write_file", "edit_file", "delete", "execute"})
 _LOOP_USAGE = "Usage: /loop <N>(s|m|h) <prompt>"
 _TASKS_USAGE = "Usage: /tasks [show <id> | cancel <id>]"
 _TASKS_OFF = "Background tasks are off in this mode."
+_NO_CALLS = "No calls in the last turn."
 _UPDATES_HEADER = "[Background task updates — reported by the program, not typed by the user]"
 _REJECTED = {"type": "reject", "message": "User rejected the command."}
 _NO_TERMINAL = "No terminal to ask on: the command was rejected. Use --auto to allow commands without asking."
@@ -134,6 +137,8 @@ class Repl:
         self.checkpointer = checkpoint_saver()
         self.turn_vet_log: list[dict] = []
         self._renderer: StreamRenderer | None = None
+        # Arrow keys for the collapsed activity view; None picks the platform's listener.
+        self.key_listener: KeyListener | None = None
         self.agents, warnings = load_roster(self.repo)
         # Built once and reused by every rebuild, so no rebuild leaves a client behind.
         self.web_tools = make_web_tools(max_chars=self.config.web_max_chars)
@@ -338,7 +343,7 @@ class Repl:
             self._requeue_undelivered(notices, updates, config)
             self.last_turn_failed = True
             if self._renderer is not None:
-                self._renderer.end_line()
+                self._renderer.abort()
             self.error_console.print(f"Error: {exc}", markup=False, highlight=False)
             return None
         finally:
@@ -660,6 +665,16 @@ class Repl:
         elif record.result:
             self._say(record.result)
 
+    def _calls_command(self) -> None:
+        """Print every call line of the last turn, as the full view would have shown them."""
+
+        log = self._renderer.call_log if self._renderer is not None else []
+        if not log:
+            self._say(_NO_CALLS)
+            return
+        for line in log:
+            self._say(line)
+
     def _say(self, text: str) -> None:
         self.console.print(text, markup=False, highlight=False)
 
@@ -742,6 +757,9 @@ class Repl:
             return
         if command == "/tasks":
             self._tasks_command(argument)
+            return
+        if command == "/calls":
+            self._calls_command()
             return
         if command == "/agents":
             for definition in self.agents:
@@ -965,26 +983,33 @@ class Repl:
 
     def _drive(self, payload, config):
         renderer = self._renderer = StreamRenderer(self.console)
-        while True:
-            parts = self.agent.stream(
-                payload,
-                config,
-                stream_mode=["messages", "updates"],
-                subgraphs=True,
-                version="v2",
-            )
-            for part in parts:
-                renderer.feed(part)
-            snapshot = self.agent.get_state(config)
-            interrupts = _pending_interrupts(snapshot)
-            if not interrupts:
-                renderer.finish(snapshot)
-                return snapshot
-            if not all(getattr(item, "id", None) for item in interrupts):
-                # Command(resume={id: ...}) cannot address it; re-streaming would loop forever.
-                raise RuntimeError("Cannot resume: an approval request has no id.")
-            renderer.end_line()
-            payload = Command(resume=_resume_map(interrupts, self._decisions(interrupts)))
+        try:
+            renderer.start(activity=self.config.activity, key_listener=self.key_listener)
+            while True:
+                parts = self.agent.stream(
+                    payload,
+                    config,
+                    stream_mode=["messages", "updates"],
+                    subgraphs=True,
+                    version="v2",
+                )
+                for part in parts:
+                    renderer.feed(part)
+                snapshot = self.agent.get_state(config)
+                interrupts = _pending_interrupts(snapshot)
+                if not interrupts:
+                    renderer.finish(snapshot)
+                    return snapshot
+                if not all(getattr(item, "id", None) for item in interrupts):
+                    # Command(resume={id: ...}) cannot address it; re-streaming would loop forever.
+                    raise RuntimeError("Cannot resume: an approval request has no id.")
+                renderer.end_line()
+                # The prompt needs a clean screen and every keystroke: no live region, no key reader.
+                with renderer.paused():
+                    decisions = self._decisions(interrupts)
+                payload = Command(resume=_resume_map(interrupts, decisions))
+        finally:
+            renderer.stop_view()  # the caller prints the summary on an error or Ctrl+C
 
     def _decisions(self, interrupts, *, question: Callable[[str], str] | None = None) -> dict[str, dict]:
         """Ask y/n for each requested command; ``question(command)`` is the line shown first."""
@@ -1038,6 +1063,13 @@ class Repl:
         return None
 
     def _ask(self, prompt: str) -> str:
+        renderer = self._renderer
+        if renderer is None:
+            return self._read(prompt)
+        with renderer.paused():  # a no-op once the turn's view has ended
+            return self._read(prompt)
+
+    def _read(self, prompt: str) -> str:
         try:
             return self.input_fn(prompt)
         except TypeError:

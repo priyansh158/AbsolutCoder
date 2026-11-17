@@ -88,3 +88,19 @@ def test_bad_code_map_settings_are_config_errors(tmp_path):
 def test_model_ids_must_be_strings(tmp_path, key):
     with pytest.raises(ValueError, match=key):
         load_config(_write(tmp_path, **{key: 5}))
+
+
+def test_activity_defaults_to_collapsed_and_round_trips(tmp_path):
+    assert Config(main_model="openai:a", subagent_model="openai:b").activity == "collapsed"
+    assert load_config(_write(tmp_path)).activity == "collapsed"  # an old file loads unchanged
+    assert load_config(_write(tmp_path, activity="full")).activity == "full"
+    path = tmp_path / "saved.json"
+    save_config(path, Config(main_model="openai:a", subagent_model="openai:b", activity="full"))
+    assert json.loads(path.read_text(encoding="utf-8"))["activity"] == "full"
+    assert load_config(path).activity == "full"
+
+
+@pytest.mark.parametrize("value", ["compact", "", None, 1, True])
+def test_bad_activity_is_a_config_error(tmp_path, value):
+    with pytest.raises(ValueError, match="activity must be 'collapsed' or 'full'"):
+        load_config(_write(tmp_path, activity=value))

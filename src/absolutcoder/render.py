@@ -9,10 +9,27 @@ from __future__ import annotations
 
 import json
 import threading
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from weakref import WeakKeyDictionary
 
 from langchain_core.messages import AIMessage, RemoveMessage, ToolMessage
 from rich.console import Console
+from rich.text import Text
+
+from absolutcoder.keys import KeyListener, default_key_listener
+from absolutcoder.prompting import ACCENT
+
+ACTIVITY_MODES = ("collapsed", "full")
+COOK_LABEL = "Lemme cook…"
+SHOW_HINT = "↓ show calls"
+HIDE_HINT = "↑ hide calls"
+SUMMARY_MARK = "⏺"
+CALLS_HINT = "/calls to see them"
+REFRESHES_PER_SECOND = 10
+_EXPAND_KEYS = frozenset({"down", "right"})
+_COLLAPSE_KEYS = frozenset({"up", "left"})
 
 _OUTPUT_LOCKS: WeakKeyDictionary[Console, threading.RLock] = WeakKeyDictionary()
 _OUTPUT_LOCKS_GUARD = threading.Lock()
@@ -113,13 +130,78 @@ def summarize_call(name: str, args: dict) -> str:
     return _one_line(text, 80)
 
 
-class StreamRenderer:
-    """Print the main model's text, tool calls and results, and worker activity."""
+def format_elapsed(seconds: float) -> str:
+    """``12s``, ``1m 04s`` or ``1h 02m 03s``."""
 
-    def __init__(self, console: Console, *, live: bool | None = None) -> None:
+    total = max(int(seconds), 0)
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
+def _count(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+def _clip(text: str, cells: int, style: str = "") -> Text:
+    """``text`` on one line, cut with an ellipsis to at most ``cells`` columns."""
+
+    line = Text(" ".join(str(text).split()), style=style, no_wrap=True, overflow="ellipsis")
+    line.truncate(max(cells, 1), overflow="ellipsis")
+    return line
+
+
+class _StatusView:
+    """The live region's renderable: rebuilt on every refresh so the spinner and clock move."""
+
+    def __init__(self, renderer: StreamRenderer) -> None:
+        self._renderer = renderer
+
+    def __rich_console__(self, console, options):  # noqa: ANN001, ANN204 - rich protocol
+        yield from self._renderer.status_lines(options.max_width)
+
+
+class StreamRenderer:
+    """Print the main model's text, tool calls and results, and worker activity.
+
+    After ``start(activity="collapsed")`` on a real terminal, tool calls,
+    results and worker lines go only to ``call_log`` while one live status
+    line (with a spinner) stays at the bottom; the arrow keys show and hide
+    the log. Main text is then printed as whole messages above that line.
+    Everywhere else every line is printed as it happens; ``call_log`` is
+    kept either way.
+    """
+
+    def __init__(
+        self,
+        console: Console,
+        *,
+        live: bool | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.console = console
         self._output = output_lock(console)
         self.live = console.is_terminal if live is None else live
+        self.call_log: list[str] = []  # every tool, result, task and worker line of this turn
+        self._clock = clock
+        self._view_lock = threading.RLock()
+        self._collapsed = False  # lines go to the log, not the screen
+        self._cooking = False  # the collapsed view was used this turn: a summary is due
+        self._summary_shown = False
+        self._live_region = None  # the running rich Live, if any
+        self._keys: KeyListener | None = None
+        self._keys_running = False
+        self._expanded = False
+        self._pause_depth = 0
+        self._started_at: float | None = None
+        self._call_count = 0
+        self._error_count = 0
+        self._pending_error: Exception | None = None  # raised while drawing, shown later
+        self._spinner = None
         self.errors: list[Exception] = []
         self.tools_used: set[str] = set()  # names of the tools called this turn, main loop and workers
         self._labels: dict[tuple, str] = {}
@@ -133,12 +215,227 @@ class StreamRenderer:
         self._last_text: str | None = None
         self._open_line = False
 
+    # --- the collapsed view ----------------------------------------------------
+
+    def start(self, *, activity: str = "collapsed", key_listener: KeyListener | None = None) -> bool:
+        """Begin the collapsed view when ``activity`` asks for it and this is a real terminal.
+
+        Returns whether it began. If the live region or the key listener cannot
+        start, the turn is shown in full, exactly as without this call.
+        """
+
+        if activity != "collapsed" or self._cooking:
+            return False
+        if not self.console.is_terminal or self.console.is_dumb_terminal:
+            return False
+        try:
+            self._keys = default_key_listener() if key_listener is None else key_listener
+            self._started_at = self._clock()
+        except Exception:  # noqa: BLE001 - no view: the turn is shown in full
+            return False
+        if not self._open_view():
+            return False
+        self._cooking = True
+        return True
+
+    @property
+    def collapsed(self) -> bool:
+        """Whether lines go to the call log instead of the screen right now."""
+
+        return self._collapsed
+
+    @property
+    def expanded(self) -> bool:
+        return self._expanded
+
+    def pause(self) -> None:
+        """Take the live region and key listener down, e.g. for a prompt; ``resume`` brings them back."""
+
+        with self._view_lock:
+            self._pause_depth += 1
+            first = self._pause_depth == 1
+        if first and self._collapsed:
+            self._close_view()
+
+    def resume(self, *, reopen: bool = True) -> None:
+        """Undo one ``pause``; the last one brings the view back unless ``reopen`` is false."""
+
+        with self._view_lock:
+            self._pause_depth = max(self._pause_depth - 1, 0)
+            last = self._pause_depth == 0
+        if last and reopen and self._collapsed and self._live_region is None:
+            if not self._open_view():
+                self._collapsed = False  # the rest of the turn is shown in full
+
+    @contextmanager
+    def paused(self) -> Iterator[None]:
+        """Pause for the body; an exception (Ctrl+C at the prompt) leaves the view down."""
+
+        self.pause()
+        completed = False
+        try:
+            yield
+            completed = True
+        finally:
+            self.resume(reopen=completed)
+
+    def stop_view(self) -> None:
+        """Stop the live region and key listener for good; safe to call more than once."""
+
+        self._close_view()
+        self._collapsed = False
+
+    def abort(self) -> None:
+        """The turn stopped on an error: end the view and any open line, then the summary."""
+
+        self._end_view()
+
+    def status_lines(self, width: int | None = None) -> list[Text]:
+        """The live region's lines: the status line, then the newest log lines when expanded."""
+
+        try:
+            return self._status_lines(self.console.width if width is None else width)
+        except Exception as error:  # noqa: BLE001 - drawing must never break a turn
+            self._record_later(error)
+            return [Text(COOK_LABEL, no_wrap=True)]
+
+    def _status_lines(self, width: int) -> list[Text]:
+        limit = max(width - 1, 1)
+        now = self._clock()
+        if self._spinner is None:
+            from rich.spinner import Spinner  # noqa: PLC0415 - only the live view needs it
+
+            self._spinner = Spinner("dots", style=ACCENT)
+        frame = self._spinner.render(now)
+        frame = frame if isinstance(frame, Text) else Text(str(frame))
+        started = self._started_at if self._started_at is not None else now
+        line = Text(no_wrap=True, overflow="ellipsis")
+        line.append_text(frame)
+        line.append(f" {COOK_LABEL} {format_elapsed(now - started)} · {_count(self._call_count, 'call')}")
+        if self._error_count:
+            line.append(f" · {_count(self._error_count, 'error')}", style="red")
+        hint = "   " + (HIDE_HINT if self._expanded else SHOW_HINT)
+        log = self.call_log
+        last = log[-1] if log else ""
+        room = limit - line.cell_len - len(" · ") - Text(hint).cell_len
+        if last and room >= 4:
+            line.append(" · ")
+            line.append_text(_clip(last, room, "dim"))
+        line.append(hint, style="dim")
+        line.truncate(limit, overflow="ellipsis")
+        lines = [line]
+        if self._expanded:
+            count = max(3, min(20, self.console.height - 6))
+            lines.extend(_clip(entry, limit, "dim") for entry in log[-count:])
+        return lines
+
+    def on_key(self, key: str) -> None:
+        """Arrow down/right shows the call log, up/left hides it; redrawn at once."""
+
+        if key in _EXPAND_KEYS:
+            self._expanded = True
+        elif key in _COLLAPSE_KEYS:
+            self._expanded = False
+        else:
+            return
+        with self._view_lock:
+            region = self._live_region
+            if region is None:
+                return
+            try:
+                region.refresh()
+            except Exception as error:  # noqa: BLE001 - drawing must never break a turn
+                self._record_later(error)
+
+    def _open_view(self) -> bool:
+        """Start the live region and the key listener; on any failure neither runs."""
+
+        from rich.live import Live  # noqa: PLC0415
+
+        with self._view_lock:
+            region = None
+            try:
+                region = Live(
+                    _StatusView(self),
+                    console=self.console,
+                    transient=True,
+                    auto_refresh=True,
+                    refresh_per_second=REFRESHES_PER_SECOND,
+                    redirect_stdout=False,  # the console already writes through sys.stdout
+                    redirect_stderr=False,
+                )
+                region.start()
+                self._live_region = region
+                if self._keys is not None:
+                    self._keys.start(self.on_key)
+                    self._keys_running = True
+            except Exception:  # noqa: BLE001 - no view: the turn is shown in full
+                self._live_region = None
+                if region is not None:
+                    try:
+                        region.stop()
+                    except Exception:  # noqa: BLE001
+                        pass
+                return False
+            self._collapsed = True
+            return True
+
+    def _close_view(self) -> None:
+        """Stop the key listener, then the live region (which erases itself). Never raises."""
+
+        with self._view_lock:
+            region, self._live_region = self._live_region, None
+            keys = self._keys if self._keys_running else None
+            self._keys_running = False
+        if keys is not None:
+            try:
+                keys.stop()
+            except Exception as error:  # noqa: BLE001
+                self._record_later(error)
+        if region is not None:
+            try:
+                region.stop()
+            except Exception as error:  # noqa: BLE001
+                self._record_later(error)
+
+    def _end_view(self) -> None:
+        """Stop the view, end any open line, and print the summary once if the view was used."""
+
+        self.stop_view()
+        self.end_line()
+        self._flush_pending_error()
+        if not self._cooking or self._summary_shown:
+            return
+        self._summary_shown = True
+        elapsed = self._clock() - (self._started_at or self._clock())
+        text = f"{SUMMARY_MARK} Cooked for {format_elapsed(elapsed)}"
+        if self._call_count:
+            text += f" · {_count(self._call_count, 'call')} · {CALLS_HINT}"
+        self._print(text, style="dim")
+
+    def _record_later(self, error: Exception) -> None:
+        """Record an error raised while drawing; its line is printed from the main thread."""
+
+        self.errors.append(error)
+        if len(self.errors) == 1:
+            self._pending_error = error
+
+    def _flush_pending_error(self) -> None:
+        error, self._pending_error = self._pending_error, None
+        if error is not None:
+            try:
+                self._print(f"display error: {type(error).__name__}: {error}")
+            except Exception:  # noqa: BLE001 - the console itself failed
+                pass
+
     # --- public ---------------------------------------------------------------
 
     def feed(self, part: dict) -> None:
         """Render one part; never raises. A renderer bug is recorded in ``errors``."""
 
         try:
+            if self._pending_error is not None:
+                self._flush_pending_error()
             if not isinstance(part, dict):
                 return
             ns = part.get("ns") or ()
@@ -152,6 +449,7 @@ class StreamRenderer:
             self._record(error)
 
     def finish(self, snapshot) -> None:
+        self._end_view()
         values = getattr(snapshot, "values", None)
         messages = values.get("messages", []) if isinstance(values, dict) else []
         for message in reversed(messages or []):
@@ -168,7 +466,7 @@ class StreamRenderer:
         self._print_usage()
 
     def interrupted(self) -> None:
-        self.end_line()
+        self._end_view()
         self._print("interrupted")
         self._print_usage()
 
@@ -194,7 +492,8 @@ class StreamRenderer:
             if isinstance(name, str) and name:
                 self._labels[ns] = name
             return  # worker text is never streamed
-        if not self.live or metadata.get("langgraph_node") != MODEL_NODE:
+        if not self.live or self._collapsed or metadata.get("langgraph_node") != MODEL_NODE:
+            # The collapsed view prints whole messages only: a partial line would break it.
             return
         if metadata.get("lc_source") == "summarization" or not isinstance(message, AIMessage):
             return
@@ -320,14 +619,15 @@ class StreamRenderer:
         if name:
             self.tools_used.add(name)
         args = call.get("args") if isinstance(call.get("args"), dict) else {}
+        self._call_count += 1
         if ns:
-            self._line(f"  [{self._label(ns)}] tool: {name}({summarize_call(name, args)})")
+            self._activity(f"  [{self._label(ns)}] tool: {name}({summarize_call(name, args)})")
         elif name == "task":
             role = args.get("subagent_type", "worker")
             description = _one_line(str(args.get("description", "")), 100)
-            self._line(f"  task [{role}]: {description}")
+            self._activity(f"  task [{role}]: {description}")
         else:
-            self._line(f"  tool: {name}({summarize_call(name, args)})")
+            self._activity(f"  tool: {name}({summarize_call(name, args)})")
 
     def _on_result(self, ns: tuple, message: ToolMessage) -> None:
         if message.id:
@@ -338,14 +638,15 @@ class StreamRenderer:
         name = message.name or str(call.get("name", "")) or "tool"
         if not ns and name == "task":
             args = call.get("args") if isinstance(call.get("args"), dict) else {}
-            self._line(f"  task [{args.get('subagent_type', 'worker')}] finished")
+            self._activity(f"  task [{args.get('subagent_type', 'worker')}] finished")
             return
         prefix = f"[{self._label(ns)}] " if ns else ""
         if message.status == "error":
+            self._error_count += 1
             lines = message_text(message.content).splitlines() or [""]
-            self._line(f"  {prefix}error: {name}: {_one_line(lines[0], 120)}")
+            self._activity(f"  {prefix}error: {name}: {_one_line(lines[0], 120)}")
         else:
-            self._line(f"  {prefix}done: {name}")
+            self._activity(f"  {prefix}done: {name}")
 
     # --- output -----------------------------------------------------------------
 
@@ -368,6 +669,18 @@ class StreamRenderer:
             self._line(text)
             self._last_text = text
 
+    def _activity(self, text: str) -> None:
+        """A tool, result, task or worker line: logged always, printed unless collapsed."""
+
+        self.call_log.append(text)
+        if not self._collapsed:
+            self._line(text)
+            return
+        with self._output:
+            # As _line does: the logged line ends the text a repeated answer is compared with.
+            self._streamed = ""
+            self._last_text = None
+
     def _line(self, text: str) -> None:
         with self._output:
             self.end_line()
@@ -377,9 +690,9 @@ class StreamRenderer:
             self._last_text = None
             self._print(text)
 
-    def _print(self, text: str) -> None:
+    def _print(self, text: str, *, style: str | None = None) -> None:
         with self._output:
             # Off a terminal (a pipe or a file) a whole line is never hard-wrapped.
             soft_wrap = not self.console.is_terminal
-            self.console.print(text, markup=False, highlight=False, soft_wrap=soft_wrap)
+            self.console.print(text, markup=False, highlight=False, soft_wrap=soft_wrap, style=style)
 
