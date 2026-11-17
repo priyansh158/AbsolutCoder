@@ -730,6 +730,18 @@ def test_always_text_reaches_main_and_editing_roles_only(tmp_path):
         assert "Skill folders: read a skill's files" not in texts[role], role
 
 
+def test_design_rules_are_built_in_for_main_and_editing_roles_only(tmp_path):
+    repo = _skill_repo(tmp_path)
+    assert not _global_dir().exists()
+    texts = _system_texts(repo, ["explore", "plan", "general-purpose", "web-researcher"])
+    heading = "## Built-in design rules for web UI"
+    assert heading in texts["main"]
+    assert heading in texts["general-purpose"]
+    assert "Never `transition: all`." in texts["main"]
+    for role in ("explore", "plan", "web-researcher"):
+        assert heading not in texts[role], role
+
+
 def test_editing_worker_sees_skills(tmp_path):
     repo = _skill_repo(tmp_path)
     _write_skill(_global_dir(), "demo", "Global demo skill.")

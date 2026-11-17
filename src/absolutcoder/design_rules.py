@@ -1,4 +1,14 @@
-These rules hold whenever you write or change web UI (HTML, CSS, JSX, TSX, Vue, Svelte, Astro). They are the floor of the Hallmark design skill. The full Hallmark design flow runs only when the user names Hallmark.
+"""Built-in design rules that keep the UI AbsolutCoder writes from looking machine-made.
+
+They are added to the prompt of the main model and of every worker role that
+edits files, in every project, so they apply whoever writes the UI.
+"""
+
+from __future__ import annotations
+
+DESIGN_RULES = """## Built-in design rules for web UI
+
+These rules hold whenever you write or change web UI (HTML, CSS, JSX, TSX, Vue, Svelte, Astro). They keep the result from looking machine-generated.
 
 In an existing project, follow its own conventions first (its framework, tokens, class names and component library); apply these rules to what you add, and never restyle or rewrite files the task did not ask you to touch.
 
@@ -19,8 +29,4 @@ In an existing project, follow its own conventions first (its framework, tokens,
 
 Games, canvas apps and app or tool screens: skip rules 12 to 14. Rule 4 does not apply to a game board, canvas or fixed app shell that must clip or fill the viewport. In rule 7, a game or app that cannot work without scripting needs only a short visible message when scripting is off. In rule 11, emoji may be game pieces or content, never interface icons.
 
-After you write or change UI files, if `node` is available, check only the files you wrote or changed:
-
-`node "<skill-dir>/scripts/sloplint.mjs" <file> [<file> ...] --tier floor`
-
-Fix each `FAIL` in those files and run it again. Exceptions: `FAIL 20` (no Hallmark stamp) applies only to a full Hallmark run, and a `FAIL` for a rule waived above does not apply; say which you left and why. If `node` is missing or the script cannot run, say so and rely on the rules above.
+Before you hand back UI work, check the files you wrote or changed against these rules and fix what breaks them."""

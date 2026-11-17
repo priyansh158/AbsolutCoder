@@ -1504,7 +1504,8 @@ def test_main_prompt_mentions_background_tasks_only_with_the_tools(tmp_path, mon
         repl, _output = _task_repl(tmp_path, lambda _m: AIMessage(content="ok"), {}, background=background)
         repl.close()
     assert BACKGROUND_PARAGRAPH.startswith("Background tasks: start_task starts a worker")
-    assert prompts[0].rstrip("\n").endswith("\n\n" + BACKGROUND_PARAGRAPH)
+    assert "\n\n" + BACKGROUND_PARAGRAPH + "\n\n" in prompts[0]  # its own paragraph, before the design rules
+    assert prompts[0].index(BACKGROUND_PARAGRAPH) < prompts[0].index("## Built-in design rules for web UI")
     assert BACKGROUND_PARAGRAPH not in prompts[1]
 
 

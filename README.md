@@ -1,9 +1,10 @@
-# AbsolutCoder
+<h1 align="center"><img src="docs/banner.gif" alt="AbsolutCoder" width="100%"></h1>
 
 A terminal coding assistant. It plans work, reads and edits files in the
 repository you start it in, runs shell commands you approve, delegates to
 worker roles in parallel, can search and read the web, and commits with your
-own git identity.
+own git identity. Anti-AI design rules are built in, so the interfaces it
+writes don't look machine-made.
 
 It runs on OpenAI out of the box and on any other model provider you configure.
 
@@ -27,7 +28,6 @@ Then set the API key for your provider and run `absolut`.
 | Keep the key | `setx OPENAI_API_KEY "..."`, then open a new window | add the `export` line to `~/.zshrc` or `~/.bashrc` |
 | Shell that runs commands | Git for Windows' bash; `cmd` when Git is not installed | `bash` from your PATH; `/bin/sh` when there is none |
 | Settings, sessions, global skills | `C:\Users\<you>\.absolutcoder` | `~/.absolutcoder` |
-| Node for the Hallmark rules (18+) | `winget install OpenJS.NodeJS.LTS` | `brew install node`, or your package manager |
 | Terminal | Windows Terminal or the VS Code terminal | Terminal.app, iTerm2 or the VS Code terminal |
 
 ### Windows
@@ -227,34 +227,28 @@ repository's own skills cannot add text to every request.
 The file tools cannot write to the global skills folder. The shell can, so keep
 approvals on in repositories you do not trust.
 
-### Hallmark
+## Anti-AI design rules, built in
 
-If the Hallmark design skill is installed as a global skill, its core rules
-apply to every web page or interface AbsolutCoder writes: colours and fonts as
-tokens, no `transition: all`, visible focus styles, reduced-motion fallbacks,
-no invented metrics, and so on. After writing UI files the model checks them
-with Hallmark's lint script when Node is available.
+Generated interfaces tend to share the same tells: purple-to-blue gradients,
+cards inside cards, emoji as icons, invented metrics and testimonials, labels
+in tracked capitals. AbsolutCoder ships with 14 design rules against them. The
+main model and every worker that edits files follow them whenever they write
+web UI (HTML, CSS, JSX, TSX, Vue, Svelte, Astro), with nothing to install.
 
-The full Hallmark design flow (theme, layout, review) runs only when you ask
-for it:
+- Colours and fonts go through tokens; no literal values scattered in CSS.
+- Motion uses `transform` and `opacity` only, never `transition: all`, and has
+  a reduced-motion fallback.
+- Every control has a visible focus style.
+- Nothing is invented: no fake numbers, quotes or logo walls.
+- Pages keep the headline and main action above the fold, and stay readable at
+  any width.
+- In an existing project its own conventions come first; the rules apply to
+  what is added, and files the task didn't touch are left alone.
+- Page-only rules are relaxed for games, canvas apps and app screens.
 
-```
-/hallmark make a landing page for a bakery
-```
-
-To set it up on a machine:
-
-1. `/skills add <path to the hallmark skill folder>`
-2. Copy `extras/hallmark/always.md` from this repository into
-   `~/.absolutcoder/skills/hallmark/`. This file is the always-on rule text;
-   the Hallmark skill does not ship one. Edit it to change the rules.
-3. Optionally change the `description` in the copied `SKILL.md` so the model
-   starts the full flow only when you name Hallmark.
-
-Re-adding the skill later to update it keeps your `always.md`.
-
-Hallmark's scripts need Node 18 or newer. Its screenshot checks also need
-Chrome and `puppeteer`; without them it falls back to its static checks.
+The model checks the files it wrote against the rules before it hands back.
+The rules add about 650 tokens to each request from those models, most of
+them cached.
 
 ## Code map
 
@@ -290,7 +284,7 @@ occasional call that summarises a long history. To see what the code map saves
 on a question, ask it once normally and once after `/map off`, compare the two
 lines, then run `/map on` again. One run each way is a rough comparison.
 
-A one-shot run takes a skill too: `absolut "/hallmark make a landing page"`.
+A one-shot run takes a skill too: `absolut "/<skill-name> <request>"`.
 
 ## The header
 
@@ -341,3 +335,6 @@ python -m pytest -q
 ```
 
 The tests run offline with scripted models.
+
+`python scripts/make_banner_gif.py` redraws `docs/banner.gif` from the header's
+own frames; it needs Pillow (`pip install pillow`).

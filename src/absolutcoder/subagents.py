@@ -16,6 +16,7 @@ from langchain_core.tools import BaseTool
 from absolutcoder.codemap import CODE_MAP_RULE_WORKER
 from absolutcoder.config import Config
 from absolutcoder.models import ModelFactory, construct_model, provider_error
+from absolutcoder.design_rules import DESIGN_RULES
 from absolutcoder.skills import always_text, skill_paths_note, skill_sources
 from absolutcoder.webtools import make_web_tools, wrap_untrusted
 
@@ -170,20 +171,17 @@ def role_skill_sources(d: AgentDef, repo: Path | None) -> list[tuple[str, str]]:
 
 
 def with_skill_text(d: AgentDef, repo: Path | None) -> AgentDef:
-    """A role that edits files gets the skill-folders note and always-on rules in its prompt."""
+    """A role that edits files gets the design rules, skill-folders note and always-on rules."""
 
     if repo is None or "edit" not in d.groups:
         return d
-    extra = skill_text(repo)
-    if not extra:
-        return d
-    return replace(d, prompt=d.prompt.rstrip("\n") + "\n\n" + extra + "\n")
+    return replace(d, prompt=d.prompt.rstrip("\n") + "\n\n" + skill_text(repo) + "\n")
 
 
 def skill_text(repo: Path) -> str:
-    """The skill-folders note and the always-on rules, each only when non-empty."""
+    """The built-in design rules, then the skill-folders note and always-on rules when present."""
 
-    return "\n\n".join(part for part in (skill_paths_note(repo), always_text(repo)) if part)
+    return "\n\n".join(part for part in (DESIGN_RULES, skill_paths_note(repo), always_text(repo)) if part)
 
 
 def roster_prompt(defs: list[AgentDef]) -> str:
