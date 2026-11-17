@@ -206,13 +206,25 @@ for it:
 /hallmark make a landing page for a bakery
 ```
 
+To set it up on a machine:
+
+1. `/skills add <path to the hallmark skill folder>`
+2. Copy `extras/hallmark/always.md` from this repository into
+   `~/.absolutcoder/skills/hallmark/`. This file is the always-on rule text;
+   the Hallmark skill does not ship one. Edit it to change the rules.
+3. Optionally change the `description` in the copied `SKILL.md` so the model
+   starts the full flow only when you name Hallmark.
+
+Re-adding the skill later to update it keeps your `always.md`.
+
 Hallmark's scripts need Node 18 or newer. Its screenshot checks also need
 Chrome and `puppeteer`; without them it falls back to its static checks.
 
 ## Code map
 
-In a folder with at least 20 source files, AbsolutCoder builds a map of the
-code in the background when it starts, using Graphify. The model is told to ask
+In a git repository with at least 20 source files, AbsolutCoder builds a map
+of the code in the background when it starts, using Graphify, and refreshes an
+existing one. The model is told to ask
 the map where things are (`code_map_query`, `code_map_path`,
 `code_map_explain`) before it searches or reads files, and then to read only
 the files the map points to. The map is refreshed after any turn that changed
@@ -222,8 +234,10 @@ files.
   model providers: no model is called and nothing leaves your machine.
 - It lives in `graphify-out/` in the repository, which is added to the
   repository's git exclude file.
-- `/map` shows its state. `/map build` builds one in a small folder,
-  `/map update` refreshes it, `/map off` and `/map on` switch it.
+- `/map` shows its state. `/map build` builds or rebuilds one anywhere,
+  including a small folder or one that is not a repository; `/map update`
+  refreshes it. `/map off` and `/map on` switch it, and the choice is saved
+  for every project.
 - It helps when the model has to understand existing code. It does nothing for
   a new, nearly empty project.
 
@@ -235,9 +249,12 @@ After each turn a line reports what it cost:
 tokens: 12,480 in (10,112 cached), 936 out, 7 model calls
 ```
 
-It counts every model call in the turn, including workers. To see what the
-code map saves on a question, ask it once normally and once after `/map off`,
-and compare the two lines.
+It counts every model call in the turn, including workers, except the
+occasional call that summarises a long history. To see what the code map saves
+on a question, ask it once normally and once after `/map off`, compare the two
+lines, then run `/map on` again. One run each way is a rough comparison.
+
+A one-shot run takes a skill too: `absolut "/hallmark make a landing page"`.
 
 ## The header
 
