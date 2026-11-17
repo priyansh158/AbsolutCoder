@@ -13,7 +13,7 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage
 from langchain_core.tools import BaseTool
 
-from absolutcoder.codemap import CODE_MAP_RULE
+from absolutcoder.codemap import CODE_MAP_RULE_WORKER
 from absolutcoder.config import Config
 from absolutcoder.models import ModelFactory, construct_model, provider_error
 from absolutcoder.skills import always_text, skill_paths_note, skill_sources
@@ -210,7 +210,7 @@ def build_specs(
     parent's, which is how ``execute`` approvals reach general-purpose.
     With ``repo``, roles that edit files get its skills and skill text.
     Roles with the ``read`` group get ``map_tools`` (the code map tools) and,
-    with them, ``CODE_MAP_RULE`` in their prompt.
+    with them, ``CODE_MAP_RULE_WORKER`` in their prompt.
     """
 
     specs: list[dict] = []
@@ -278,7 +278,7 @@ def with_map_rule(d: AgentDef, map_tools: Sequence[BaseTool] | None) -> AgentDef
 
     if not role_map_tools(d, map_tools):
         return d
-    return replace(d, prompt=d.prompt.rstrip("\n") + "\n\n" + CODE_MAP_RULE + "\n")
+    return replace(d, prompt=d.prompt.rstrip("\n") + "\n\n" + CODE_MAP_RULE_WORKER + "\n")
 
 
 def _declarative_spec(d: AgentDef, model, backend, *, tools: Sequence[BaseTool] = ()) -> dict:

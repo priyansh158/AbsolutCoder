@@ -65,8 +65,10 @@ _BUILTIN_COMMANDS = frozenset(
 )
 _MAP_USAGE = "Usage: /map [build|update|on|off]"
 _MAP_OFF_HINT = "map: off (use /map on)"
-_MAP_BUILT_HINT = "map: ready (already built; /map update refreshes it)"
+_MAP_TURNED_OFF = "map: off (saved for every project; /map on turns it back)"
 _MAP_SMALL_HINT = "map: too small (/map build builds it anyway)"
+_MAP_NOT_REPO_HINT = "map: not a repository (/map build builds it anyway)"
+_MAP_UNAVAILABLE = "map: unavailable (pip install graphifyy)"
 # A turn that called one of these may have changed files, so the code map is refreshed.
 _CHANGING_TOOLS = frozenset({"write_file", "edit_file", "delete", "execute"})
 _LOOP_USAGE = "Usage: /loop <N>(s|m|h) <prompt>"
@@ -145,9 +147,9 @@ class Repl:
     def _start(self, background: bool, warnings: list[str]) -> None:
         """The rest of ``__init__``: tasks, the first build, then the session row."""
 
-        earlier_map = False
+        start_status = None
         if self.code_map is not None:
-            earlier_map = self.code_map.status() == "ready"
+            start_status = self.code_map.status()
             self.code_map.ensure()
         # The manager and its tools exist before the first build so every build,
         # and every rebuild, gets the same tool objects; it learns the session id
@@ -184,8 +186,12 @@ class Repl:
         self.thread_id = self.session.id
         self.agent = agent
         self._report_roster(warnings)
-        if earlier_map:
+        if start_status == "ready":
             self._print_status_line("map: ready")
+            # Files may have changed outside the tool since the map was built.
+            self._refresh_map()
+        elif start_status == "unavailable":
+            self._print_status_line(_MAP_UNAVAILABLE)
 
     # --- settings: saved vs effective ------------------------------------------
     #
@@ -517,7 +523,11 @@ class Repl:
 
     def _map_line(self, code_map: CodeMap) -> str:
         status = code_map.status()
-        return _MAP_SMALL_HINT if status == "too small" else f"map: {status}"
+        if status == "too small":
+            return _MAP_SMALL_HINT
+        if status == "not a repository":
+            return _MAP_NOT_REPO_HINT
+        return f"map: {status}"
 
     def _map_command(self, argument: str) -> None:
         action = argument.lower()
@@ -531,7 +541,7 @@ class Repl:
                 self.code_map.close()
                 self.code_map = None
             if self._swap_graph():
-                self._say("map: off")
+                self._say(_MAP_TURNED_OFF)
             return
         if action == "on":
             self.config = replace(self.config, code_map="auto")
@@ -555,12 +565,10 @@ class Repl:
                 self._say(f"map: {status}")
             else:
                 self._say("map: updating" if started else "map: could not update")
-        else:  # build
+        else:  # build: always a full build, over a ready map too
             before = code_map.status()
             code_map.ensure(force=True)
-            if before == "ready":
-                self._say(_MAP_BUILT_HINT)
-            elif before in {"building", "unavailable"}:
+            if before in {"building", "unavailable"}:
                 self._say(f"map: {before}")  # nothing new starts; a started build reports itself
             if before not in {"ready", "building"} and code_map.usable():
                 self._swap_graph()

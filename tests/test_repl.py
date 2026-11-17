@@ -2017,7 +2017,7 @@ def test_one_shot_prompt_says_nobody_can_answer(tmp_path, monkeypatch):
 
 # --- the code map in the loop ---------------------------------------------------------
 
-from absolutcoder.codemap import CODE_MAP_RULE, MAP_TOOL_NAMES, CodeMap  # noqa: E402
+from absolutcoder.codemap import CODE_MAP_RULE, CODE_MAP_RULE_WORKER, MAP_TOOL_NAMES, CodeMap  # noqa: E402
 from tests.test_codemap import Runner, _builds_graph  # noqa: E402
 
 UPDATE = ["py", "-m", "graphify", "update", "."]
@@ -2056,9 +2056,13 @@ def _map_repl(
     made=None,
     map_class=CodeMap,
     repl_kwargs=None,
+    in_work_tree=None,
     **config_fields,
 ):
-    """A Repl in a folder with ``count`` code files and a code map on a fake runner."""
+    """A Repl in a folder with ``count`` code files and a code map on a fake runner.
+
+    The folder counts as inside a git work tree unless ``in_work_tree`` says otherwise.
+    """
 
     repo = tmp_path / "repo"
     repo.mkdir(parents=True, exist_ok=True)
@@ -2066,9 +2070,10 @@ def _map_repl(
         (repo / f"m{i}.py").write_text(f"x{i} = {i}\n", encoding="utf-8")
     runner = Runner(_builds_graph)
     made = [] if made is None else made
+    check = in_work_tree or (lambda _path: True)
 
     def factory(path, **kwargs):
-        code_map = map_class(path, runner=runner, python="py", **kwargs)
+        code_map = map_class(path, runner=runner, python="py", in_work_tree=check, **kwargs)
         made.append(code_map)
         return code_map
 
@@ -2136,7 +2141,8 @@ def test_map_rule_only_when_a_map_exists(tmp_path, monkeypatch):
             repl.code_map.wait(10)
             assert repl.run_turn("explore") is not None
             assert (CODE_MAP_RULE in _system_text(seen_main[0])) is wanted, count
-            assert (CODE_MAP_RULE in _system_text(seen_explore[0])) is wanted, count
+            assert (CODE_MAP_RULE_WORKER in _system_text(seen_explore[0])) is wanted, count
+            assert CODE_MAP_RULE not in _system_text(seen_explore[0]), count
             assert bound and all(("code_map_query" in names) is wanted for names in bound), count
             if not wanted:
                 assert not any(line.startswith("map:") for line in _lines(output))
@@ -2166,7 +2172,7 @@ def test_code_map_off_adds_no_tools_or_rule(tmp_path, monkeypatch):
         assert made == []
         repl.run_turn("explore")
         assert CODE_MAP_RULE not in _system_text(seen_main[0])
-        assert CODE_MAP_RULE not in _system_text(seen_explore[0])
+        assert CODE_MAP_RULE_WORKER not in _system_text(seen_explore[0])
         assert bound and not any(_has_map_tools(names) for names in bound)
         assert not any(line.startswith("map:") for line in _lines(output))
         assert runner.calls == []
@@ -2256,7 +2262,7 @@ def test_map_commands(tmp_path, monkeypatch):
 
         first = repl.code_map
         repl.handle_line("/map off")
-        assert _lines(output)[-1] == "map: off"
+        assert _lines(output)[-1] == "map: off (saved for every project; /map on turns it back)"
         assert json.loads(config_path().read_text(encoding="utf-8"))["code_map"] == "off"
         assert repl.saved_config.code_map == "off"
         assert repl.code_map is None
@@ -2375,9 +2381,12 @@ def test_map_hints_for_ready_and_small_maps(tmp_path, monkeypatch):
     repl, output, runner, _made = _map_repl(tmp_path)
     try:
         assert repl.code_map.wait(10) == "ready"
-        repl.handle_line("/map build")
-        assert _lines(output)[-1] == "map: ready (already built; /map update refreshes it)"
-        assert len(runner.commands("extract")) == 1
+        before = len(_lines(output))
+        repl.handle_line("/map build")  # a ready map is rebuilt in full
+        assert repl.code_map.wait(10) == "ready"
+        assert _lines(output)[before:] == ["map: building…", "map: ready"]
+        assert runner.commands("extract")[-1][3:] == ["extract", ".", "--code-only", "--force"]
+        assert len(runner.commands("extract")) == 2
     finally:
         repl.close()
     small, output, _runner, _made = _map_repl(tmp_path / "small", count=3)
@@ -2567,7 +2576,8 @@ def test_background_role_graph_gets_the_rule_and_tools(tmp_path, monkeypatch):
         assert repl.code_map.wait(10) == "ready"
         repl.tasks.start("explore", "look around", flags=TurnFlags())
         assert repl.tasks.wait("t1", timeout=TIMEOUT).status == "done"
-        assert CODE_MAP_RULE in _system_text(seen[-1])
+        assert CODE_MAP_RULE_WORKER in _system_text(seen[-1])
+        assert CODE_MAP_RULE not in _system_text(seen[-1])
         assert bound and all(name in bound[-1] for name in MAP_TOOL_NAMES)
     finally:
         repl.close()
@@ -2583,6 +2593,82 @@ def test_close_closes_the_map(tmp_path, monkeypatch):
     assert repl.code_map.wait(10) == "ready"
     assert runner.commands("update") == []
     assert len(runner.commands("extract")) == 1
+
+
+def test_second_session_refreshes_an_existing_map_once(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    first, _output, _runner, _made = _map_repl(tmp_path)
+    try:
+        assert first.code_map.wait(10) == "ready"
+    finally:
+        first.close()
+    again, _output, runner, _made = _map_repl(tmp_path)
+    try:
+        assert again.code_map.wait(10) == "ready"
+        assert runner.commands("update") == [UPDATE]
+        assert runner.commands("extract") == []
+    finally:
+        again.close()
+
+
+def test_no_automatic_map_outside_a_repository(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    bound: list = []
+    repl, output, runner, _made = _map_repl(tmp_path, bound=bound, in_work_tree=lambda _p: False)
+    try:
+        assert repl.code_map.wait(10) == "not a repository"
+        assert runner.calls == []
+        assert not any(line.startswith("map:") for line in _lines(output))
+        repl.run_turn("hello")
+        assert not _has_map_tools(bound[-1])
+        repl.handle_line("/map")
+        assert _lines(output)[-1] == "map: not a repository (/map build builds it anyway)"
+        repl.handle_line("/map build")
+        assert repl.code_map.wait(10) == "ready"
+        assert runner.commands("extract") == [["py", "-m", "graphify", "extract", ".", "--code-only"]]
+        assert "map: building…" in _lines(output)
+        repl.run_turn("hello")
+        assert all(name in bound[-1] for name in MAP_TOOL_NAMES)
+    finally:
+        repl.close()
+
+
+def test_inside_a_repository_the_map_builds_at_start(tmp_path, monkeypatch):
+    _no_web(monkeypatch)
+    repl, output, runner, _made = _map_repl(tmp_path, in_work_tree=lambda _p: True)
+    try:
+        assert repl.code_map.wait(10) == "ready"
+        assert runner.commands("extract") == [["py", "-m", "graphify", "extract", ".", "--code-only"]]
+        assert "map: ready" in _lines(output)
+    finally:
+        repl.close()
+
+
+def test_map_unavailable_is_reported_once_at_start(tmp_path, monkeypatch):
+    import absolutcoder.codemap as codemap_module
+
+    _no_web(monkeypatch)
+    real = codemap_module.find_spec
+    monkeypatch.setattr(
+        codemap_module, "find_spec", lambda name: None if name == "graphify" else real(name)
+    )
+    line = "map: unavailable (pip install graphifyy)"
+    for mode, expected in (("auto", 1), ("off", 0)):
+        repo = tmp_path / mode
+        repo.mkdir()
+        output = io.StringIO()
+        repl = Repl(
+            repo,
+            Config(main_model="openai:main-test", subagent_model="openai:worker-test", code_map=mode),
+            chat_model=scripted_model(lambda _m: AIMessage(content="ok")),
+            model_factory=_worker(),
+            console=Console(file=output, force_terminal=False, no_color=True, width=200),
+        )
+        try:
+            repl.run_turn("hello")
+            assert _lines(output).count(line) == expected, mode
+        finally:
+            repl.close()
 
 
 # --- the terminal header and /help ---------------------------------------------
