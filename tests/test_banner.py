@@ -242,3 +242,51 @@ def test_show_holds_the_output_lock():
     fake = FakeTime()
     banner.show(console, environ={}, sleep=sleep, clock=fake.clock)
     assert seen and all(seen)
+
+
+_MID_BOTTOM = "  ██  █  █ █▄▄▀ ▄▄▄▀ ▀▄▄▀ █ ▀▄▄█  █▄ ▀▄▄▄ ▀▄▄▀ ▀▄▄█ ▀▄▄▄ █"
+
+
+def test_mid_size_wordmark_rests_on_four_rows_within_its_width():
+    lines = banner.mid_frame_lines(math.inf)
+    assert len(lines) == banner.MID_ROWS == 4
+    assert banner.MID_WIDTH == 64
+    assert max(len(line) for line in lines) <= banner.MID_WIDTH
+    assert lines[-1] == _MID_BOTTOM
+
+
+def test_mid_size_letters_arrive_one_at_a_time():
+    early = banner.mid_frame_lines(LETTER_START + 1)
+    late = banner.mid_frame_lines(math.inf)
+    assert max(len(line) for line in early) < max(len(line) for line in late)
+    assert banner.mid_frame_lines(TOTAL) == late
+
+
+def test_width_picks_the_one_line_mid_size_or_full_wordmark():
+    def shown(width, **env):
+        console, output = _console(terminal=False, width=width)
+        banner.show(console, version="0.1.0", model="m", cwd="~/x", animate=False, environ=env)
+        return output.getvalue()
+
+    assert "▰ AbsolutCoder" in shown(banner.MID_WIDTH)
+    mid = shown(banner.MID_WIDTH + 1)
+    assert _MID_BOTTOM in mid and "▰" not in mid
+    assert _MID_BOTTOM in shown(WIDTH)
+    assert banner.frame_lines(math.inf)[-1] in shown(WIDTH + 1)
+    assert "// AbsolutCoder" in shown(banner.MID_WIDTH + 1, AC_ASCII="1")
+
+
+def test_animated_mid_size_show_ends_on_the_resting_frame():
+    console = Console(file=io.StringIO(), force_terminal=True, no_color=True, width=70, legacy_windows=False)
+    now = [0.0]
+    banner.show(
+        console,
+        version="0.1.0",
+        animate=True,
+        environ={},
+        sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        clock=lambda: now[0],
+    )
+    plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", console.file.getvalue())
+    assert _MID_BOTTOM in plain
+    assert console.file.getvalue().count("\x1b[?25h") == 1

@@ -24,7 +24,7 @@ from absolutcoder.config import Config, config_path, resolve_model, save_config
 from absolutcoder.git_policy import PolicyDenied, TurnFlags, protect_context_file
 from absolutcoder.loops import VerifyOutcome, parse_interval, run_interval_loop, run_until_verified
 from absolutcoder.models import ModelFactory, ProviderMissing, missing_keys
-from absolutcoder.prompting import background_output, make_input_fn
+from absolutcoder.prompting import MAIN_PROMPT, background_output, make_input_fn
 from absolutcoder.render import StreamRenderer, output_lock
 from absolutcoder.sessions import (
     Session,
@@ -261,7 +261,7 @@ class Repl:
         while True:
             self.service_tasks()
             try:
-                line = self._ask("absolut> ")
+                line = self._ask(MAIN_PROMPT)
             except (EOFError, KeyboardInterrupt):
                 self.console.print()
                 self.close()

@@ -117,6 +117,86 @@ def frame_lines(t: float, *, block: str = "█") -> list[str]:
     return ["".join(block if cell else " " for cell in row).rstrip() for row in frame_cells(t)]
 
 
+# The mid-size wordmark, for windows too narrow for the full one. Each glyph is
+# drawn on a grid of square pixels, two pixel rows to a text row (half blocks).
+MID_PIXEL_ROWS = 8
+MID_ROWS = MID_PIXEL_ROWS // 2
+MID_RAW = {
+    "A": [".##.", "#..#", "#..#", "#..#", "####", "#..#", "#..#", "#..#"],
+    "b": ["#...", "#...", "#...", "###.", "#..#", "#..#", "#..#", "###."],
+    "s": ["....", "....", "....", ".###", "#...", ".##.", "...#", "###."],
+    "o": ["....", "....", "....", ".##.", "#..#", "#..#", "#..#", ".##."],
+    "l": ["#", "#", "#", "#", "#", "#", "#", "#"],
+    "u": ["....", "....", "....", "#..#", "#..#", "#..#", "#..#", ".###"],
+    "t": ["...", ".#.", ".#.", "###", ".#.", ".#.", ".#.", ".##"],
+    "C": [".###", "#...", "#...", "#...", "#...", "#...", "#...", ".###"],
+    "d": ["...#", "...#", "...#", ".###", "#..#", "#..#", "#..#", ".###"],
+    "e": ["....", "....", "....", ".##.", "#..#", "####", "#...", ".###"],
+    "r": ["...", "...", "...", "#.#", "##.", "#..", "#..", "#.."],
+}
+MID_MARK = ["##"] * MID_PIXEL_ROWS
+MID_MARK_GAP = 2
+MID_SLIDE = 4
+
+
+def _mid_slots() -> tuple[list[int], int]:
+    x = INDENT + len(MID_MARK[0]) + MID_MARK_GAP
+    slots = []
+    for letter in WORD:
+        slots.append(x)
+        x += _width(MID_RAW[letter]) + GAP
+    return slots, x
+
+
+MID_SLOTS, _MID_END = _mid_slots()
+MID_WIDTH: int = _MID_END - GAP + LEAN * (MID_ROWS - 1) + 1
+
+
+def _mid_stamp(pixels: list[list[str | None]], glyph: list[str], x0: int, paint: str) -> None:
+    for r, row in enumerate(glyph):
+        shift = LEAN * (MID_ROWS - 1 - r // 2)  # lean by text row, so each cell's two pixels align
+        for c, char in enumerate(row):
+            column = x0 + c + shift
+            if char == "#" and 0 <= column < MID_WIDTH:
+                pixels[r][column] = paint
+
+
+def mid_frame_cells(t: float) -> list[list[tuple[str, str] | None]]:
+    """MID_ROWS x MID_WIDTH at ``t`` ms; a cell is None or (half-block char, paint)."""
+
+    pixels: list[list[str | None]] = [[None] * MID_WIDTH for _ in range(MID_PIXEL_ROWS)]
+    mark_x = INDENT - js_round((1 - ease_out(t / MARK_DUR)) * MID_SLIDE)
+    _mid_stamp(pixels, MID_MARK, mark_x, "accent")
+    for i, letter in enumerate(WORD):
+        start = LETTER_START + i * STAGGER
+        if t < start:
+            continue
+        p = (t - start) / LETTER_DUR
+        x0 = MID_SLOTS[i] - js_round((1 - ease_out(p)) * MID_SLIDE)
+        _mid_stamp(pixels, MID_RAW[letter], x0, "accent" if p < 1 else "ink")
+    cells: list[list[tuple[str, str] | None]] = []
+    for r in range(MID_ROWS):
+        top, bottom = pixels[2 * r], pixels[2 * r + 1]
+        row: list[tuple[str, str] | None] = []
+        for upper, lower in zip(top, bottom, strict=True):
+            if upper and lower:
+                row.append(("█", lower))
+            elif upper:
+                row.append(("▀", upper))
+            elif lower:
+                row.append(("▄", lower))
+            else:
+                row.append(None)
+        cells.append(row)
+    return cells
+
+
+def mid_frame_lines(t: float) -> list[str]:
+    """Plain text rows of the mid-size frame at ``t`` ms, trailing spaces removed."""
+
+    return ["".join(cell[0] if cell else " " for cell in row).rstrip() for row in mid_frame_cells(t)]
+
+
 def facts_line(version: str | None, model: str | None, cwd: str | None) -> str | None:
     parts = []
     if version:
@@ -159,6 +239,16 @@ class _Painter:
             else:
                 text.append(self.block * count, style=self.style(ACCENT if paint == "accent" else "bold"))
             start = end + 1
+        return text
+
+    def mid_row(self, cells: list[tuple[str, str] | None]) -> Text:
+        text = Text()
+        last = max((i for i, cell in enumerate(cells) if cell), default=-1)
+        for cell in cells[: last + 1]:
+            if cell is None:
+                text.append(" ")
+            else:
+                text.append(cell[0], style=self.style(ACCENT if cell[1] == "accent" else "bold"))
         return text
 
     def compact(self, typed: int, *, mark: str, done: bool) -> Text:
@@ -207,8 +297,10 @@ def show(
         mark = "//" if ascii_only else "▰"
         facts = facts_line(version, model, cwd)
         try:
+            # Half blocks need a font with block characters, so ASCII mode skips the mid size.
+            mid = compact is None and not ascii_only and MID_WIDTH + 1 <= console.width < WIDTH + 1
             if compact is None:
-                compact = console.width < WIDTH + 1
+                compact = console.width < WIDTH + 1 and not mid
             if animate is None:
                 animate = (
                     console.is_terminal
@@ -217,10 +309,20 @@ def show(
                     and not console.is_dumb_terminal
                 )
             console.print(**_PRINT)
-            if compact:
+            if mid:
+
+                def mid_rows(t: float) -> list[Text]:
+                    return [painter.mid_row(cells) for cells in mid_frame_cells(t)]
+
+                if animate:
+                    _animated(console, sleep, clock, mid_rows, MID_ROWS)
+                else:
+                    for row in mid_rows(math.inf):
+                        console.print(row, **_PRINT)
+            elif compact:
                 _compact(console, painter, mark, animate, sleep)
             elif animate:
-                _animated(console, painter, sleep, clock)
+                _animated(console, sleep, clock, lambda t: [painter.row(cells) for cells in frame_cells(t)], H)
             else:
                 for cells in frame_cells(math.inf):
                     console.print(painter.row(cells), **_PRINT)
@@ -243,8 +345,14 @@ def _footer(console: Console, painter: _Painter, facts: str | None) -> None:
     console.print(**_PRINT)
 
 
-def _animated(console: Console, painter: _Painter, sleep: Callable[[float], None], clock: Callable[[], float]) -> None:
-    """Reserve H rows, then redraw them every FRAME ms until the resting frame."""
+def _animated(
+    console: Console,
+    sleep: Callable[[float], None],
+    clock: Callable[[], float],
+    rows: Callable[[float], list[Text]],
+    height: int,
+) -> None:
+    """Reserve ``height`` rows, then redraw them every FRAME ms until the resting frame."""
 
     below = 0  # rows the cursor is below the first reserved row
 
@@ -253,17 +361,17 @@ def _animated(console: Console, painter: _Painter, sleep: Callable[[float], None
         if below:
             console.control(Control.move_to_column(0, -below))
         below = 0
-        for cells in frame_cells(t):
-            console.print(painter.row(cells), end="", **_PRINT)
+        for row in rows(t):
+            console.print(row, end="", **_PRINT)
             console.control(_ERASE_TO_END)
             console.print(**_PRINT)
             below += 1
 
     console.control(Control.show_cursor(False))
     try:
-        for _ in range(H):
+        for _ in range(height):
             console.print(**_PRINT)
-        below = H
+        below = height
         start = clock()
         try:
             while True:
