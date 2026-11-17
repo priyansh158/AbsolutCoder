@@ -85,6 +85,8 @@ called with the Chat Completions API unless you add `"api": "responses"`.
 | `max_rounds` | `5` | Turns the check loop may take |
 | `web_max_chars` | `20000` | Most text returned from one web page |
 | `max_background_tasks` | `4` | Background tasks running at once |
+| `code_map` | `"auto"` | `auto` builds a code map of the repository; `off` disables it (`/map`) |
+| `code_map_min_files` | `20` | Fewest source files a folder needs before a map is built |
 
 Sessions are stored in the same folder; `/resume` lists the ones for the
 current repository.
@@ -95,7 +97,11 @@ current repository.
 |---|---|
 | `/model <id>`, `/subagent <id>` | Switch models |
 | `/auto [on\|off]` | Stop or resume asking before shell commands |
+| `/help` | List the commands |
 | `/agents` | List worker roles |
+| `/skills`, `/skills add <folder>`, `/skills remove <name>` | List, add or remove global skills |
+| `/<skill-name> <request>` | Run a request with that skill's full instructions loaded |
+| `/map`, `/map build`, `/map update`, `/map on`, `/map off` | Code map of this repository |
 | `/tasks`, `/tasks show <id>`, `/tasks cancel <id>` | Background tasks |
 | `/verify <command>`, `/verify off`, `/verify` | Set, clear or show the check command |
 | `/loop <N>(s\|m\|h) <prompt>` | Repeat a prompt until Ctrl+C |
@@ -160,8 +166,86 @@ You review code. Report problems; do not change files.
 `tools` takes groups: `read`, `search`, `edit`, `shell`, `web`. `web` cannot be
 combined with the others. `name` and `model` are optional.
 
-Skills in `<repo>/.absolutcoder/skills/<name>/SKILL.md` are offered to the main
-model.
+## Skills
+
+A skill is a folder with a `SKILL.md` (YAML frontmatter with `name` and
+`description`, then instructions) and any files those instructions use. The
+model sees each skill's name and description and reads the rest when a task
+calls for it.
+
+| Where | Loads in |
+|---|---|
+| `~/.absolutcoder/skills/<name>/` | Every project (global) |
+| `<repo>/.absolutcoder/skills/<name>/` | That repository; overrides a global skill of the same name |
+
+`/skills add <folder>` copies a skill into the global folder, `/skills remove
+<name>` deletes it, and `/skills` lists what is loaded. Typing
+`/<skill-name> <request>` runs the request with that skill's full instructions
+loaded up front.
+
+A global skill may also ship an `always.md` of at most 4,000 characters. Its
+text is added to the instructions of the main model and of every worker that
+can edit files, in every project. Only global skills can do this; a
+repository's own skills cannot add text to every request.
+
+The file tools cannot write to the global skills folder. The shell can, so keep
+approvals on in repositories you do not trust.
+
+### Hallmark
+
+If the Hallmark design skill is installed as a global skill, its core rules
+apply to every web page or interface AbsolutCoder writes: colours and fonts as
+tokens, no `transition: all`, visible focus styles, reduced-motion fallbacks,
+no invented metrics, and so on. After writing UI files the model checks them
+with Hallmark's lint script when Node is available.
+
+The full Hallmark design flow (theme, layout, review) runs only when you ask
+for it:
+
+```
+/hallmark make a landing page for a bakery
+```
+
+Hallmark's scripts need Node 18 or newer. Its screenshot checks also need
+Chrome and `puppeteer`; without them it falls back to its static checks.
+
+## Code map
+
+In a folder with at least 20 source files, AbsolutCoder builds a map of the
+code in the background when it starts, using Graphify. The model is told to ask
+the map where things are (`code_map_query`, `code_map_path`,
+`code_map_explain`) before it searches or reads files, and then to read only
+the files the map points to. The map is refreshed after any turn that changed
+files.
+
+- The map is built by parsing code locally. Graphify is run with no access to
+  model providers: no model is called and nothing leaves your machine.
+- It lives in `graphify-out/` in the repository, which is added to the
+  repository's git exclude file.
+- `/map` shows its state. `/map build` builds one in a small folder,
+  `/map update` refreshes it, `/map off` and `/map on` switch it.
+- It helps when the model has to understand existing code. It does nothing for
+  a new, nearly empty project.
+
+## Token use
+
+After each turn a line reports what it cost:
+
+```
+tokens: 12,480 in (10,112 cached), 936 out, 7 model calls
+```
+
+It counts every model call in the turn, including workers. To see what the
+code map saves on a question, ask it once normally and once after `/map off`,
+and compare the two lines.
+
+## The header
+
+On a terminal the interactive loop opens with the AbsolutCoder wordmark, drawn
+in block letters that slide in one at a time. Windows narrower than 93 columns
+get a one-line form. Three environment variables change it: `NO_COLOR` (no
+colour), `AC_NO_ANIM` (no animation), `AC_ASCII` (plain `#` characters for
+fonts without block characters). Piped output gets a plain first line.
 
 ## Check loop
 
