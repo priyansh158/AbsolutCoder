@@ -9,7 +9,7 @@ It runs on OpenAI out of the box and on any other model provider you configure.
 
 ## Install
 
-Python 3.12 or newer.
+Python 3.12 or newer, on Windows, macOS or Linux.
 
 ```
 pip install -e .
@@ -18,24 +18,41 @@ pip install -e ".[google]"      # optional: Google models
 pip install -e ".[ollama]"      # optional: Ollama models
 ```
 
+Then set the API key for your provider and run `absolut`.
+
+| | Windows | macOS and Linux |
+|---|---|---|
+| Install | `py -m pip install -e .` | `python3 -m pip install -e .` |
+| Set the key for this window | `$env:OPENAI_API_KEY = "..."` (PowerShell) | `export OPENAI_API_KEY=...` |
+| Keep the key | `setx OPENAI_API_KEY "..."`, then open a new window | add the `export` line to `~/.zshrc` or `~/.bashrc` |
+| Shell that runs commands | Git for Windows' bash; `cmd` when Git is not installed | `bash` from your PATH; `/bin/sh` when there is none |
+| Settings, sessions, global skills | `C:\Users\<you>\.absolutcoder` | `~/.absolutcoder` |
+| Node for the Hallmark rules (18+) | `winget install OpenJS.NodeJS.LTS` | `brew install node`, or your package manager |
+| Terminal | Windows Terminal or the VS Code terminal | Terminal.app, iTerm2 or the VS Code terminal |
+
+### Windows
+
+- Install [Git for Windows](https://git-scm.com/download/win). AbsolutCoder
+  uses its bash for shell commands, never WSL's. Without it, commands run
+  through `cmd`, which has had less testing.
+- If `absolut` is not found after installing, add Python's `Scripts` folder to
+  your PATH (pip prints its location when it installs).
+- The old console window (`conhost`) shows the header without animation.
+
 ### macOS and Linux
 
-Use `python3 -m pip install -e .` if `pip` is not on your PATH, and set the
-key with `export OPENAI_API_KEY=...` (add it to `~/.zshrc` to keep it).
+- To run commands through another shell, set `"shell"` in `config.json` to its
+  path. The `cmd` setting is Windows-only.
+- Each shell command runs in its own session. If a command times out, a server
+  or other child process it started can keep running; stop it yourself.
 
-- Shell commands run through `bash` from your PATH, or `/bin/sh` when there is
-  none. To use another shell, set `"shell"` in `config.json` to its path. The
-  `cmd` setting is Windows-only.
-- Settings, sessions and global skills live in `~/.absolutcoder`.
-- The Hallmark rules need Node 18 or newer (`brew install node`).
-- Each shell command runs in its own session. If a command times out, a
-  server or other child process it started can keep running; stop it yourself.
-- The header and the prompt box need a terminal with Unicode block characters
-  (Terminal.app and iTerm2 have them). Set `AC_ASCII=1` if they look wrong.
+### On every platform
 
-AbsolutCoder is developed and tested on Windows 11. The macOS and Linux paths
-are in the code but have not been run there yet; run `python3 -m pytest -q`
-after installing with `".[dev]"` to check your machine.
+- The header and the prompt box use Unicode block characters. Set `AC_ASCII=1`
+  if they look wrong in your terminal.
+- AbsolutCoder has been developed and tested on Windows 11. The macOS and Linux
+  code paths exist but have not been run there yet. To check your machine:
+  `pip install -e ".[dev]"`, then `python -m pytest -q`.
 
 ## Run
 
